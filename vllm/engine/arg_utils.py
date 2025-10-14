@@ -371,7 +371,7 @@ class EngineArgs:
     data_parallel_hybrid_lb: bool = False
     data_parallel_backend: str = ParallelConfig.data_parallel_backend
     enable_expert_parallel: bool = ParallelConfig.enable_expert_parallel
-    all2all_backend: str | None = ParallelConfig.all2all_backend
+    enable_elastic_ep: bool = ParallelConfig.enable_elastic_ep
     enable_dbo: bool = ParallelConfig.enable_dbo
     dbo_decode_token_threshold: int = ParallelConfig.dbo_decode_token_threshold
     dbo_prefill_token_threshold: int = ParallelConfig.dbo_prefill_token_threshold
@@ -734,40 +734,13 @@ class EngineArgs:
             help="Starting data parallel rank for secondary nodes.",
         )
         parallel_group.add_argument(
-            "--data-parallel-size-local",
-            "-dpl",
-            type=int,
-            help="Number of data parallel replicas to run on this node.",
-        )
+            "--enable-expert-parallel",
+            **parallel_kwargs["enable_expert_parallel"])
         parallel_group.add_argument(
-            "--data-parallel-address",
-            "-dpa",
-            type=str,
-            help="Address of data parallel cluster head-node.",
-        )
-        parallel_group.add_argument(
-            "--data-parallel-rpc-port",
-            "-dpp",
-            type=int,
-            help="Port for data parallel RPC communication.",
-        )
-        parallel_group.add_argument(
-            "--data-parallel-backend",
-            "-dpb",
-            type=str,
-            default="mp",
-            help='Backend for data parallel, either "mp" or "ray".',
-        )
-        parallel_group.add_argument(
-            "--data-parallel-hybrid-lb", **parallel_kwargs["data_parallel_hybrid_lb"]
-        )
-        parallel_group.add_argument(
-            "--enable-expert-parallel", **parallel_kwargs["enable_expert_parallel"]
-        )
-        parallel_group.add_argument(
-            "--all2all-backend", **parallel_kwargs["all2all_backend"]
-        )
-        parallel_group.add_argument("--enable-dbo", **parallel_kwargs["enable_dbo"])
+            "--enable-elastic-ep",
+            **parallel_kwargs["enable_elastic_ep"])
+        parallel_group.add_argument("--enable-dbo",
+                                    **parallel_kwargs["enable_dbo"])
         parallel_group.add_argument(
             "--dbo-decode-token-threshold",
             **parallel_kwargs["dbo_decode_token_threshold"],
@@ -1465,7 +1438,7 @@ class EngineArgs:
             data_parallel_backend=self.data_parallel_backend,
             data_parallel_hybrid_lb=self.data_parallel_hybrid_lb,
             enable_expert_parallel=self.enable_expert_parallel,
-            all2all_backend=self.all2all_backend,
+            enable_elastic_ep=self.enable_elastic_ep,
             enable_dbo=self.enable_dbo,
             dbo_decode_token_threshold=self.dbo_decode_token_threshold,
             dbo_prefill_token_threshold=self.dbo_prefill_token_threshold,

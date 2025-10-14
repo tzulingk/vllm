@@ -161,15 +161,13 @@ if TYPE_CHECKING:
     VLLM_MSGPACK_ZERO_COPY_THRESHOLD: int = 256
     VLLM_ALLOW_INSECURE_SERIALIZATION: bool = False
     VLLM_NIXL_SIDE_CHANNEL_HOST: str = "localhost"
-    VLLM_NIXL_SIDE_CHANNEL_PORT: int = 5600
-    VLLM_ALL2ALL_BACKEND: Literal[
-        "naive",
-        "pplx",
-        "deepep_high_throughput",
-        "deepep_low_latency",
-        "allgather_reducescatter",
-        "flashinfer_all2allv",
-    ] = "allgather_reducescatter"
+    VLLM_NIXL_SIDE_CHANNEL_PORT: int = 5557
+    VLLM_ALL2ALL_BACKEND: Literal["naive", "pplx",
+                                  "deepep_high_throughput",
+                                  "deepep_low_latency",
+                                  "nixl_deepep_low_latency",
+                                  "allgather_reducescatter"] = \
+                                  "allgather_reducescatter"
     VLLM_MAX_TOKENS_PER_EXPERT_FP4_MOE: int = 163840
     VLLM_TOOL_PARSE_REGEX_TIMEOUT_SECONDS: int = 1
     VLLM_SLEEP_WHEN_IDLE: bool = False
@@ -1177,19 +1175,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # - "pplx": use pplx kernels
     # - "deepep_high_throughput", use deepep high-throughput kernels
     # - "deepep_low_latency", use deepep low-latency kernels
-    # - "flashinfer_all2allv", use flashinfer alltoallv kernels for mnnvl
-    "VLLM_ALL2ALL_BACKEND": env_with_choices(
-        "VLLM_ALL2ALL_BACKEND",
-        "allgather_reducescatter",
-        [
-            "naive",
-            "pplx",
-            "deepep_high_throughput",
-            "deepep_low_latency",
-            "allgather_reducescatter",
-            "flashinfer_all2allv",
-        ],
-    ),
+    "VLLM_ALL2ALL_BACKEND":
+    env_with_choices("VLLM_ALL2ALL_BACKEND", "allgather_reducescatter",
+                     ["naive", "pplx",
+                     "deepep_high_throughput",
+                     "deepep_low_latency",
+                     "nixl_deepep_low_latency",
+                     "allgather_reducescatter"]),
+
     # Flashinfer MoE backend for vLLM's fused Mixture-of-Experts support.
     # Both require compute capability 10.0 or above.
     # Available options:
@@ -1360,48 +1353,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Name of the shared memory buffer used for object storage.
     # Only effective when mm_config.mm_processor_cache_type == "shm".
-    "VLLM_OBJECT_STORAGE_SHM_BUFFER_NAME": lambda: os.getenv(
-        "VLLM_OBJECT_STORAGE_SHM_BUFFER_NAME", "VLLM_OBJECT_STORAGE_SHM_BUFFER"
-    ),
-    # The size in MB of the buffers (NVL and RDMA) used by DeepEP
-    "VLLM_DEEPEP_BUFFER_SIZE_MB": lambda: int(
-        os.getenv("VLLM_DEEPEP_BUFFER_SIZE_MB", "1024")
-    ),
-    # The number of SMs to allocate for communication kernels when running DBO
-    # the rest of the SMs on the device will be allocated to compute
-    "VLLM_DBO_COMM_SMS": lambda: int(os.getenv("VLLM_DBO_COMM_SMS", "20")),
-    # Valid values are container,code_interpreter,web_search_preview
-    # ex GPT_OSS_SYSTEM_TOOL_MCP_LABELS=container,code_interpreter
-    "GPT_OSS_SYSTEM_TOOL_MCP_LABELS": env_list_with_choices(
-        "GPT_OSS_SYSTEM_TOOL_MCP_LABELS",
-        [],
-        ["container", "code_interpreter", "web_search_preview"],
-    ),
-    # Enable max_autotune & coordinate_descent_tuning in inductor_config
-    # to compile static shapes passed from compile_sizes in compilation_config
-    # If set to 1, enable max_autotune; By default, this is enabled (1)
-    "VLLM_ENABLE_INDUCTOR_MAX_AUTOTUNE": lambda: bool(
-        int(os.getenv("VLLM_ENABLE_INDUCTOR_MAX_AUTOTUNE", "1"))
-    ),
-    # If set to 1, enable coordinate_descent_tuning;
-    # By default, this is enabled (1)
-    "VLLM_ENABLE_INDUCTOR_COORDINATE_DESCENT_TUNING": lambda: bool(
-        int(os.getenv("VLLM_ENABLE_INDUCTOR_COORDINATE_DESCENT_TUNING", "1"))
-    ),
-    # Flag to enable NCCL symmetric memory allocation and registration
-    "VLLM_USE_NCCL_SYMM_MEM": lambda: bool(
-        int(os.getenv("VLLM_USE_NCCL_SYMM_MEM", "0"))
-    ),
-    # NCCL header path
-    "VLLM_NCCL_INCLUDE_PATH": lambda: os.environ.get("VLLM_NCCL_INCLUDE_PATH", None),
-    # Flag to enable FBGemm kernels on model execution
-    "VLLM_USE_FBGEMM": lambda: bool(int(os.getenv("VLLM_USE_FBGEMM", "0"))),
-    # GC debug config
-    # - VLLM_GC_DEBUG=0: disable GC debugger
-    # - VLLM_GC_DEBUG=1: enable GC debugger with gc.collect elpased times
-    # - VLLM_GC_DEBUG='{"top_objects":5}': enable GC debugger with
-    #                                      top 5 collected objects
-    "VLLM_GC_DEBUG": lambda: os.getenv("VLLM_GC_DEBUG", ""),
+    "VLLM_OBJECT_STORAGE_SHM_BUFFER_NAME":
+    lambda: os.getenv("VLLM_OBJECT_STORAGE_SHM_BUFFER_NAME",
+                      "VLLM_OBJECT_STORAGE_SHM_BUFFER"),
+
+    # NOTE(yongji): NIXL EP env variables
+    # temporarily register here for Ray to pass to downstream EngineCore actors
+    "NIXL_DEEPEP_MAX_NUM_RANKS":
+    lambda: int(os.getenv("NIXL_DEEPEP_MAX_NUM_RANKS", None)),
+    "NIXL_ETCD_ENDPOINTS":
+    lambda: os.getenv("NIXL_ETCD_ENDPOINTS", None),
+    "NIXL_UCX_IB_DEVICES":
+    lambda: os.getenv("NIXL_UCX_IB_DEVICES", None),
+    "NIXL_UCX_TCP_DEVICES":
+    lambda: os.getenv("NIXL_UCX_TCP_DEVICES", None),
 }
 
 # --8<-- [end:env-vars-definition]

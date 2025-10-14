@@ -14,12 +14,7 @@ ARG PYTHON_VERSION=3.12
 #
 # Example:
 # docker build --build-arg BUILD_BASE_IMAGE=registry.acme.org/mirror/nvidia/cuda:${CUDA_VERSION}-devel-ubuntu20.04
-
-# Important: We build with an old version of Ubuntu to maintain broad
-# compatibility with other Linux OSes. The main reason for this is that the
-# glibc version is baked into the distro, and binaries built with one glibc
-# version are not backwards compatible with OSes that use an earlier version.
-ARG BUILD_BASE_IMAGE=nvidia/cuda:${CUDA_VERSION}-devel-ubuntu20.04
+ARG BUILD_BASE_IMAGE=nvidia/cuda:${CUDA_VERSION}-devel-ubuntu22.04
 # TODO: Restore to base image after FlashInfer AOT wheel fixed
 ARG FINAL_BASE_IMAGE=nvidia/cuda:${CUDA_VERSION}-devel-ubuntu22.04
 

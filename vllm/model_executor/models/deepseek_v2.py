@@ -167,7 +167,21 @@ class DeepseekV2MoE(nn.Module):
         self.n_routed_experts: int = config.n_routed_experts
         self.n_shared_experts: int = config.n_shared_experts
 
-        self.is_sequence_parallel = parallel_config.use_sequence_parallel_moe
+        # The all_reduce at the end of attention (during o_proj) means that
+        # inputs are replicated across each rank of the tensor parallel group.
+        # If using expert-parallelism with DeepEP All2All ops, replicated
+        # tokens results in useless duplicate computation and communication.
+        #
+        # In this case, ensure the input to the experts is sequence parallel
+        # to avoid the excess work.
+        #
+        # Not needed for pplx-kernels as it can handle duplicate input tokens.
+        self.is_sequence_parallel = (envs.VLLM_ALL2ALL_BACKEND
+                                     in ("deepep_high_throughput",
+                                         "deepep_low_latency",
+                                         "nixl_deepep_low_latency")
+                                     and parallel_config.enable_expert_parallel
+                                     and self.tp_size > 1)
 
         if config.hidden_act != "silu":
             raise ValueError(
