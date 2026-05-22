@@ -339,6 +339,7 @@ class NixlEPAll2AllManager(All2AllManagerBase):
         super().__init__(cpu_group, tcp_store_group)
 
         self.max_num_ep_ranks = envs.VLLM_NIXL_EP_MAX_NUM_RANKS
+        self._mask_status_buf: torch.Tensor | None = None
 
     def _init_buffer(
         self,
@@ -370,6 +371,29 @@ class NixlEPAll2AllManager(All2AllManagerBase):
         ranks_to_connect = list(range(self.cpu_group.size()))
         buffer.connect_ranks(ranks_to_connect)
         NixlEPAll2AllManager._buffer = (buffer, self.cpu_group.size())
+
+    def query_mask(self) -> torch.Tensor | None:
+        """Read the current rank-mask from the NIXL EP buffer.
+
+        Returns a `[ep_size]` int tensor on CPU where `1` means the rank is
+        masked (dead) and `0` means active. Returns None and warns once if
+        the buffer has not yet been initialized (no dispatch / combine has
+        run on this manager).
+        """
+        if NixlEPAll2AllManager._buffer is None:
+            logger.warning_once(
+                "NixlEPAll2AllManager.query_mask() called before the NIXL EP "
+                "buffer was initialized; returning None. The first MoE "
+                "forward must run before a mask is available."
+            )
+            return None
+        _, ep_size = NixlEPAll2AllManager._buffer
+        if self._mask_status_buf is None or self._mask_status_buf.numel() != ep_size:
+            self._mask_status_buf = torch.zeros(
+                ep_size, dtype=torch.int32, device="cpu"
+            )
+        NixlEPAll2AllManager._buffer[0].query_mask_buffer(self._mask_status_buf)
+        return self._mask_status_buf
 
     def _update_buffer(self):
         assert NixlEPAll2AllManager._buffer is not None
