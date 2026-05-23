@@ -227,26 +227,39 @@ class FaultTolerantGlooGroup:
     ) -> tuple[torch.Tensor, bool]:
         """All-reduce over the currently-alive sub-group.
 
-        Returns ``(tensor, valid)``. ``valid=False`` means the local
-        rank is dead or the online collective itself failed (gloo
-        timeout / runtime). A rebuild failure surfaces as
-        :class:`RebuildTimeoutError`.
+        Args:
+            tensor: tensor to reduce in place.
+            op: reduction op.
+            active_mask: ``[total_world_size]`` truthy values for currently-alive
+                ranks. Caller fetches this from
+                :class:`PeerActiveStateManager`.
+            timeout_ms: per-call timeout, enforced via
+                :meth:`torch.distributed.Work.wait`.
+            rebuild_timeout_ms: budget for the rendezvous when a rebuild
+                is triggered. Currently advisory only --
+                :func:`stateless_init_torch_distributed_process_group`
+                does not accept a per-call timeout arg, so the effective
+                rebuild timeout is the PG-level gloo default (env var
+                ``VLLM_CPU_DISTRIBUTED_TIMEOUT_SECONDS``). TODO: thread
+                through if/when the helper grows a timeout parameter.
+
+        Returns:
+            ``(tensor, valid)``. ``valid=False`` means the local rank is
+            dead or the online collective itself failed (timeout / runtime
+            error). A rebuild failure surfaces as
+            :class:`RebuildTimeoutError`.
         """
         with self._lock:
             group = self._ensure_group(active_mask, rebuild_timeout_ms)
             if group is None:
                 return tensor, False
             try:
-                # NOTE: gloo's timeout is configured at process-group
-                # creation; the per-call timedelta below is only honored
-                # by some torch backends/versions. The PG-level timeout
-                # remains the effective upper bound.
-                dist.all_reduce(
-                    tensor,
-                    op=op,
-                    group=group,
-                    timeout=timedelta(milliseconds=timeout_ms),
-                )
+                # Per-call timeout is enforced via Work.wait(timeout=...).
+                # The high-level dist.all_reduce(...) signature does NOT
+                # accept a timeout kwarg; we use async_op=True and wait
+                # explicitly so a hung peer surfaces as TimeoutError here.
+                work = dist.all_reduce(tensor, op=op, group=group, async_op=True)
+                work.wait(timeout=timedelta(milliseconds=timeout_ms))
                 return tensor, True
             except (TimeoutError, RuntimeError) as e:
                 logger.warning(
