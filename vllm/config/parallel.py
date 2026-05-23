@@ -31,6 +31,42 @@ else:
 logger = init_logger(__name__)
 _NUMACTL_CPUSET_PATTERN = re.compile(r"^\d+(?:-\d+)?(?:,\d+(?:-\d+)?)*$")
 
+
+def _ft_or_raw_all_reduce(
+    tensor: torch.Tensor, op: ReduceOp, dp_group: ProcessGroup
+) -> None:
+    """All-reduce via the FT NIXL EP gloo wrapper when initialized; else raw.
+
+    Routes the three small control-plane DP collectives in this module
+    (``has_unfinished_dp`` / ``sync_dp_state`` / ``sync_kv_cache_memory_size``)
+    through :class:`FaultTolerantGlooGroup` so a dead DP peer doesn't
+    deadlock the survivors at the wave-sync. When neither
+    ``DPFTGlooManager.instance()`` nor ``PeerActiveStateManager.instance()``
+    is set (non-NIXL-EP deployments), falls back to ``torch.distributed``.
+
+    Imports are local to avoid pulling the elastic-EP module at config
+    import time.
+    """
+    from vllm.distributed.elastic_ep.ft_gloo import DPFTGlooManager
+    from vllm.distributed.elastic_ep.peer_state import PeerActiveStateManager
+
+    ft = DPFTGlooManager.instance()
+    state = PeerActiveStateManager.instance()
+    if ft is None or state is None:
+        torch.distributed.all_reduce(tensor, op=op, group=dp_group)
+        return
+
+    active_mask = state.active_ranks_cpu.tolist()
+    _, valid = ft.all_reduce(tensor, op=op, active_mask=active_mask)
+    if not valid:
+        logger.warning(
+            "FT NIXL EP: FT all_reduce returned valid=False at gen=%d; the "
+            "local rank may be masked dead or the online collective failed. "
+            "Tensor left as-is.",
+            ft.generation,
+        )
+
+
 ExpertPlacementStrategy = Literal["linear", "round_robin"]
 DistributedExecutorBackend = Literal["ray", "mp", "uni", "external_launcher"]
 DataParallelBackend = Literal["ray", "mp"]
@@ -665,7 +701,7 @@ class ParallelConfig:
         # dp rank 1: has_unfinished_seqs=False
         # aggregated: has_unfinished_seqs=True
         # so this is an OR operation, i.e. MAX in integers
-        torch.distributed.all_reduce(tensor, op=ReduceOp.MAX, group=dp_group)
+        _ft_or_raw_all_reduce(tensor, ReduceOp.MAX, dp_group)
         aggregated_has_unfinished = bool(tensor.item())
         return aggregated_has_unfinished
 
@@ -690,7 +726,7 @@ class ParallelConfig:
         tensor = torch.tensor(
             [int(has_unfinished), int(pending_pause)], dtype=torch.int32, device="cpu"
         )
-        torch.distributed.all_reduce(tensor, op=ReduceOp.SUM, group=dp_group)
+        _ft_or_raw_all_reduce(tensor, ReduceOp.SUM, dp_group)
         dp_size = dp_group.size()
         pause_count = tensor[1].item()
         has_unfinished_global = tensor[0].item() > 0 or pause_count % dp_size != 0
@@ -703,7 +739,7 @@ class ParallelConfig:
         tensor = torch.tensor([kv_cache_memory], dtype=torch.int64, device="cpu")
         # we cannot use broadcast for stateless dp group since it depends
         # on global rank
-        torch.distributed.all_reduce(tensor, op=ReduceOp.MIN, group=dp_group)
+        _ft_or_raw_all_reduce(tensor, ReduceOp.MIN, dp_group)
         return tensor.item()
 
     def compute_hash(self):

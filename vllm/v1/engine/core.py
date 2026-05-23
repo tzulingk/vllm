@@ -1708,6 +1708,26 @@ class DPEngineCoreProc(EngineCoreProc):
         dp_group, dp_store = parallel_config.stateless_init_dp_group(return_store=True)
         self.dp_group, self.dp_store = dp_group, dp_store
 
+        # FT NIXL EP: initialize the engine-layer mask state + FT gloo
+        # wrapper so cross-DP collectives can survive a peer death.
+        # Limited to the FT-capable EP backend to avoid disturbing other
+        # deployments. The 3 DP collectives in ParallelConfig look up
+        # DPFTGlooManager.instance() and fall back to raw dist.all_reduce
+        # when these managers are uninitialized.
+        if parallel_config.all2all_backend == "nixl_ep":
+            from vllm.distributed.elastic_ep.ft_gloo import DPFTGlooManager
+            from vllm.distributed.elastic_ep.peer_state import (
+                PeerActiveStateManager,
+            )
+
+            PeerActiveStateManager.init(ep_size=dp_size)
+            DPFTGlooManager.init(
+                store=dp_store,
+                master_addr=parallel_config.data_parallel_master_ip,
+                my_global_rank=dp_rank,
+                total_world_size=dp_size,
+            )
+
     def shutdown(self):
         super().shutdown()
         if dp_group := getattr(self, "dp_group", None):
