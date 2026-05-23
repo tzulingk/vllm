@@ -157,6 +157,73 @@ class Worker(WorkerBase):
         # pending non-blocking PP send work from the previous iteration
         self._pp_send_work: list[Handle] = []
 
+    def eplb_redistribute_for_dead_peers(self, dead_ep_ranks: list[int]) -> bool:
+        """Update EPLB placement after one or more EP peers die.
+
+        Called by ``EngineCore._maybe_check_ft_mask`` via ``collective_rpc``
+        once per detected mask change. Each surviving worker runs the same
+        deterministic algorithm against its own ``eplb_state`` (which
+        starts in sync across ranks), so the resulting placement table is
+        consistent across all survivors -- no cross-rank coordination needed.
+
+        Steps (matching PR #38862's recovery, minus the topology shrink):
+        1. ``mark_dead_columns_inplace`` zeros the dead ranks' columns in
+           ``physical_to_logical_map``.
+        2. ``reassign_missing_experts_inplace`` finds logical experts that
+           lost their last replica and reassigns the most-redundant
+           surviving slots to host them.
+        3. ``rebuild_derived_maps_inplace`` refreshes
+           ``logical_to_physical_map`` + ``logical_replica_count`` from the
+           updated ``physical_to_logical_map``.
+
+        Weight transfer (NCCL P2P / disk reload from PR #38862) is NOT
+        wired here yet -- this only updates the placement table. Deployments
+        with ``replica_count >= 2`` per expert retain a surviving copy of
+        every logical expert and the placement update alone suffices.
+
+        Returns True if anything was reassigned, False if no changes (e.g.
+        EPLB disabled, or every logical still has a replica).
+        """
+        from vllm.distributed.elastic_ep.eplb_redistribute import (
+            mark_dead_columns_inplace,
+            reassign_missing_experts_inplace,
+            rebuild_derived_maps_inplace,
+        )
+
+        if not dead_ep_ranks:
+            return False
+        eplb_state = getattr(self.model_runner, "eplb_state", None)
+        if eplb_state is None:
+            return False
+
+        model_config = self.model_runner.model_config
+        eplb_model_state = eplb_state.model_states.get(model_config.compute_hash())
+        if eplb_model_state is None:
+            return False
+
+        p2l = eplb_model_state.physical_to_logical_map
+        l2p = eplb_model_state.logical_to_physical_map
+        lrc = eplb_model_state.logical_replica_count
+        num_logical = lrc.shape[1]
+
+        from vllm.distributed import get_ep_group
+
+        try:
+            num_local_experts = p2l.shape[1] // get_ep_group().world_size
+        except Exception:
+            return False
+
+        mark_dead_columns_inplace(p2l, set(dead_ep_ranks), num_local_experts)
+        try:
+            changed = reassign_missing_experts_inplace(p2l, num_logical)
+        except RuntimeError:
+            # EPLB redundancy insufficient -- the demo can't recover
+            # placement-only; surface to the engine-core via False.
+            rebuild_derived_maps_inplace(p2l, l2p, lrc)
+            return False
+        rebuild_derived_maps_inplace(p2l, l2p, lrc)
+        return changed
+
     def query_nixl_ep_mask(self) -> torch.Tensor | None:
         """Return the current NIXL EP kernel mask, or None if N/A.
 

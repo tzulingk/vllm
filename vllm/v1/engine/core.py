@@ -521,6 +521,21 @@ class EngineCore:
             self.scheduler.finish_requests(
                 running_req_ids, RequestStatus.FINISHED_ERROR
             )
+
+        # Tell every surviving worker to update its EPLB placement table.
+        # No cross-worker coordination required -- each worker runs the
+        # same deterministic algorithm against its own (in-sync) eplb_state.
+        # Best-effort: failures are logged but don't tear down the engine.
+        try:
+            self.collective_rpc("eplb_redistribute_for_dead_peers", args=(newly_dead,))
+        except Exception as e:
+            logger.warning(
+                "FT NIXL EP: eplb_redistribute_for_dead_peers RPC failed: %s "
+                "(placement table not updated; subsequent forward passes "
+                "may route to dead slots).",
+                e,
+            )
+
         state.snapshot_active_to_last()
 
     def post_step(self, model_executed: bool) -> None:
