@@ -31,7 +31,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 import torch
-from torch.distributed import ProcessGroup, all_reduce
+from torch.distributed import ProcessGroup, ReduceOp, all_reduce
 
 from vllm.config import ModelConfig, ParallelConfig
 from vllm.distributed.parallel_state import (
@@ -826,7 +826,13 @@ class EplbState:
         cpu_group = getattr(parallel_state, "cpu_group", None)
         if cpu_group is not None and cpu_group.size() > 1:
             flag = torch.tensor((has_result,), dtype=torch.int32, device="cpu")
-            all_reduce(flag, group=cpu_group)
+            # FT NIXL EP: route the small flag check through the FT gloo
+            # wrapper when the DP FT singletons are initialized; falls back
+            # to raw all_reduce(group=cpu_group) otherwise. Lazy import to
+            # avoid a config-time circular pull.
+            from vllm.distributed.elastic_ep.ft_gloo import ft_or_raw_all_reduce
+
+            ft_or_raw_all_reduce(flag, ReduceOp.SUM, cpu_group)
             return int(flag.item()) == cpu_group.size()
 
         device_group = parallel_state.device_group
@@ -843,9 +849,24 @@ class EplbState:
     def _allreduce_list(self, tensor_list: list[torch.Tensor]) -> list[torch.Tensor]:
         """
         All-reduce a list of tensors.
+
+        When FT NIXL EP singletons are initialized, routes the reduction
+        through the FT gloo wrapper (with a GPU<->CPU bounce since gloo
+        is CPU-only). EP == DP (TP=1) is assumed for the demo; if the
+        ep_world_size and the FT gloo's total_world_size don't match,
+        falls back silently to the raw NCCL path.
         """
+        from vllm.distributed.elastic_ep.ft_gloo import (
+            DPFTGlooManager,
+            ft_or_raw_all_reduce,
+        )
+        from vllm.distributed.elastic_ep.peer_state import PeerActiveStateManager
+
         if len(tensor_list) == 1:
-            all_reduce(tensor_list[0], group=get_ep_group().device_group)
+            tensor = tensor_list[0]
+            if self._try_ft_allreduce_gpu_tensor(tensor):
+                return tensor_list
+            all_reduce(tensor, group=get_ep_group().device_group)
             return tensor_list
         assert all(t.dim() == 2 for t in tensor_list), "All tensors must be 2D."
         assert all(t.shape[1] == tensor_list[0].shape[1] for t in tensor_list), (
@@ -857,8 +878,19 @@ class EplbState:
         shapes = [t.shape for t in tensor_list]
         concat_tensor = torch.cat(tensor_list, dim=0)
 
+        ft = DPFTGlooManager.instance()
+        state = PeerActiveStateManager.instance()
         ep_group = get_ep_group().device_group
-        all_reduce(concat_tensor, group=ep_group)
+        if (
+            ft is not None
+            and state is not None
+            and state.active_ranks_cpu.numel() == ep_group.size()
+        ):
+            cpu_tensor = concat_tensor.detach().to("cpu")
+            ft_or_raw_all_reduce(cpu_tensor, ReduceOp.SUM, ep_group)
+            concat_tensor.copy_(cpu_tensor.to(concat_tensor.device))
+        else:
+            all_reduce(concat_tensor, group=ep_group)
 
         all_reduce_list = []
         offset = 0
@@ -866,6 +898,35 @@ class EplbState:
             all_reduce_list.append(concat_tensor[offset : offset + shape[0], :])
             offset += shape[0]
         return all_reduce_list
+
+    @staticmethod
+    def _try_ft_allreduce_gpu_tensor(tensor: torch.Tensor) -> bool:
+        """Attempt to all-reduce a single GPU tensor through FT gloo.
+
+        Returns True when the FT path ran (the input tensor is updated
+        in place). Returns False when FT singletons aren't initialized
+        or the size doesn't match -- caller falls back to the raw NCCL
+        collective on the EP device group.
+        """
+        from vllm.distributed.elastic_ep.ft_gloo import (
+            DPFTGlooManager,
+            ft_or_raw_all_reduce,
+        )
+        from vllm.distributed.elastic_ep.peer_state import PeerActiveStateManager
+
+        ft = DPFTGlooManager.instance()
+        state = PeerActiveStateManager.instance()
+        ep_group = get_ep_group().device_group
+        if (
+            ft is None
+            or state is None
+            or state.active_ranks_cpu.numel() != ep_group.size()
+        ):
+            return False
+        cpu_tensor = tensor.detach().to("cpu")
+        ft_or_raw_all_reduce(cpu_tensor, ReduceOp.SUM, ep_group)
+        tensor.copy_(cpu_tensor.to(tensor.device))
+        return True
 
     def _sync_load_pass(self) -> list[torch.Tensor]:
         """
