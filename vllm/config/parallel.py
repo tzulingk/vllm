@@ -35,36 +35,15 @@ _NUMACTL_CPUSET_PATTERN = re.compile(r"^\d+(?:-\d+)?(?:,\d+(?:-\d+)?)*$")
 def _ft_or_raw_all_reduce(
     tensor: torch.Tensor, op: ReduceOp, dp_group: ProcessGroup
 ) -> None:
-    """All-reduce via the FT NIXL EP gloo wrapper when initialized; else raw.
+    """Thin shim over
+    :func:`vllm.distributed.elastic_ep.ft_gloo.ft_or_raw_all_reduce`.
 
-    Routes the three small control-plane DP collectives in this module
-    (``has_unfinished_dp`` / ``sync_dp_state`` / ``sync_kv_cache_memory_size``)
-    through :class:`FaultTolerantGlooGroup` so a dead DP peer doesn't
-    deadlock the survivors at the wave-sync. When neither
-    ``DPFTGlooManager.instance()`` nor ``PeerActiveStateManager.instance()``
-    is set (non-NIXL-EP deployments), falls back to ``torch.distributed``.
-
-    Imports are local to avoid pulling the elastic-EP module at config
-    import time.
+    Local lazy import keeps ``vllm.config`` independent of the
+    elastic-EP package at module load time.
     """
-    from vllm.distributed.elastic_ep.ft_gloo import DPFTGlooManager
-    from vllm.distributed.elastic_ep.peer_state import PeerActiveStateManager
+    from vllm.distributed.elastic_ep.ft_gloo import ft_or_raw_all_reduce
 
-    ft = DPFTGlooManager.instance()
-    state = PeerActiveStateManager.instance()
-    if ft is None or state is None:
-        torch.distributed.all_reduce(tensor, op=op, group=dp_group)
-        return
-
-    active_mask = state.active_ranks_cpu.tolist()
-    _, valid = ft.all_reduce(tensor, op=op, active_mask=active_mask)
-    if not valid:
-        logger.warning(
-            "FT NIXL EP: FT all_reduce returned valid=False at gen=%d; the "
-            "local rank may be masked dead or the online collective failed. "
-            "Tensor left as-is.",
-            ft.generation,
-        )
+    ft_or_raw_all_reduce(tensor, op, dp_group)
 
 
 ExpertPlacementStrategy = Literal["linear", "round_robin"]

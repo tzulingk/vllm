@@ -20,6 +20,11 @@ from vllm.distributed.elastic_ep.ft_gloo import (
     DPFTGlooManager,
     FaultTolerantGlooGroup,
     RebuildTimeoutError,
+    ft_or_raw_all_reduce,
+)
+from vllm.distributed.elastic_ep.peer_state import (
+    PeerActiveStateManager,
+    apply_kernel_mask,
 )
 
 # ------------------------------ Test helpers ------------------------------ #
@@ -47,8 +52,10 @@ def _make_mock_work(should_raise: Exception | None = None) -> MagicMock:
 @pytest.fixture(autouse=True)
 def _reset_singleton():
     DPFTGlooManager.reset_instance()
+    PeerActiveStateManager.reset_instance()
     yield
     DPFTGlooManager.reset_instance()
+    PeerActiveStateManager.reset_instance()
 
 
 @pytest.fixture
@@ -318,3 +325,117 @@ def test_dpft_manager_reset_instance_destroys_and_clears(store, patched_destroy)
     DPFTGlooManager.reset_instance()
     assert DPFTGlooManager.instance() is None
     patched_destroy.assert_called()
+
+
+# --------------------------- ft_or_raw_all_reduce ------------------------- #
+
+
+def _fake_dp_group(size: int = 4) -> MagicMock:
+    pg = MagicMock(name="dp_group")
+    pg.size = MagicMock(return_value=size)
+    return pg
+
+
+def test_ft_or_raw_falls_back_to_raw_when_no_singletons():
+    """No FT singletons -> direct torch.distributed.all_reduce on dp_group."""
+    dp_group = _fake_dp_group()
+    tensor = torch.tensor([1], dtype=torch.int32)
+    with patch.object(ft_gloo_mod.dist, "all_reduce") as m_raw:
+        ft_or_raw_all_reduce(tensor, ReduceOp.MAX, dp_group)
+    m_raw.assert_called_once()
+    args, kwargs = m_raw.call_args
+    assert args[0] is tensor
+    assert kwargs.get("group") is dp_group
+
+
+def test_ft_or_raw_uses_ft_when_singletons_present(store):
+    PeerActiveStateManager.init(ep_size=4)
+    DPFTGlooManager.init(
+        store=store,
+        master_addr="127.0.0.1",
+        my_global_rank=0,
+        total_world_size=4,
+    )
+    dp_group = _fake_dp_group()
+
+    with (
+        patch.object(
+            ft_gloo_mod, "stateless_init_torch_distributed_process_group"
+        ) as m_init,
+        patch.object(ft_gloo_mod.dist, "all_reduce") as m_ar,
+    ):
+        m_init.return_value = _make_mock_pg("pg1")
+        m_ar.return_value = _make_mock_work()
+        tensor = torch.tensor([1], dtype=torch.int32)
+        ft_or_raw_all_reduce(tensor, ReduceOp.MAX, dp_group)
+
+        # FT was used: the stateless rebuild ran, all_reduce was issued
+        # on the rebuilt PG, NOT on the raw dp_group.
+        m_init.assert_called_once()
+        m_ar.assert_called_once()
+        _, kwargs = m_ar.call_args
+        assert kwargs.get("group") is not dp_group
+
+
+def test_ft_or_raw_passes_active_mask_from_peer_state(store):
+    state = PeerActiveStateManager.init(ep_size=4)
+    # Mark peer 2 dead via kernel-mask convention (1 = dead).
+    apply_kernel_mask(state, torch.tensor([0, 0, 1, 0], dtype=torch.int32))
+    DPFTGlooManager.init(
+        store=store,
+        master_addr="127.0.0.1",
+        my_global_rank=0,
+        total_world_size=4,
+    )
+
+    captured: list[tuple[int, int]] = []
+
+    def _capture_init(*, host, port, rank, world_size, backend):
+        captured.append((rank, world_size))
+        return _make_mock_pg(f"pg_ws{world_size}")
+
+    with (
+        patch.object(
+            ft_gloo_mod, "stateless_init_torch_distributed_process_group"
+        ) as m_init,
+        patch.object(ft_gloo_mod.dist, "all_reduce") as m_ar,
+    ):
+        m_init.side_effect = _capture_init
+        m_ar.return_value = _make_mock_work()
+        ft_or_raw_all_reduce(
+            torch.tensor([1], dtype=torch.int32), ReduceOp.MAX, _fake_dp_group()
+        )
+
+    # Rank 0 stays rank 0 of a 3-alive sub-group (peer 2 excluded).
+    assert captured == [(0, 3)]
+
+
+def test_ft_or_raw_valid_false_does_not_fallback_to_raw(store):
+    """Online failure must NOT fall back to raw (would hang on dead peer)."""
+    PeerActiveStateManager.init(ep_size=4)
+    DPFTGlooManager.init(
+        store=store,
+        master_addr="127.0.0.1",
+        my_global_rank=0,
+        total_world_size=4,
+    )
+    dp_group = _fake_dp_group()
+
+    with patch.object(
+        ft_gloo_mod, "stateless_init_torch_distributed_process_group"
+    ) as m_init:
+        m_init.return_value = _make_mock_pg("pg1")
+        # The FT collective itself fails (timeout).
+        with patch.object(ft_gloo_mod.dist, "all_reduce") as m_ar:
+            m_ar.return_value = _make_mock_work(should_raise=TimeoutError("hung peer"))
+            tensor = torch.tensor([7], dtype=torch.int32)
+            ft_or_raw_all_reduce(tensor, ReduceOp.MAX, dp_group)
+
+            # FT was attempted exactly once. No additional raw call to
+            # the original dp_group (which would deadlock on a real
+            # dead peer).
+            assert m_ar.call_count == 1
+            _, kwargs = m_ar.call_args
+            assert kwargs.get("group") is not dp_group
+            # Tensor is unchanged (degraded mode).
+            assert tensor.tolist() == [7]

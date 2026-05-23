@@ -285,6 +285,51 @@ class FaultTolerantGlooGroup:
             self._current_active_set = None
 
 
+def ft_or_raw_all_reduce(
+    tensor: torch.Tensor,
+    op: ReduceOp,
+    dp_group: ProcessGroup,
+) -> None:
+    """Route a DP collective through the FT wrapper, or fall back to raw.
+
+    Used by the three small control-plane DP collectives in
+    :mod:`vllm.config.parallel` (and any other caller that wants the
+    same fault-tolerant routing) to avoid duplicating the if-FT-else-raw
+    pattern at every call site.
+
+    Behavior:
+    * If both :class:`DPFTGlooManager` and
+      :class:`vllm.distributed.elastic_ep.peer_state.PeerActiveStateManager`
+      are initialized: fetch ``active_ranks_cpu`` from peer state, hand
+      it to ``DPFTGlooManager.instance().all_reduce(...)``. On
+      ``valid=False`` log a warning and leave the tensor as-is (caller's
+      downstream behavior is degraded-mode -- e.g. ``has_unfinished_dp``
+      returns its local value).
+    * Otherwise: invoke ``torch.distributed.all_reduce(group=dp_group)``
+      directly. Non-NIXL-EP deployments pay zero overhead.
+    """
+    # Import here to avoid an import cycle: peer_state is part of the
+    # same package, but importing it at module load would create a
+    # tightly-coupled circular chain through vllm.config consumers.
+    from vllm.distributed.elastic_ep.peer_state import PeerActiveStateManager
+
+    ft = DPFTGlooManager.instance()
+    state = PeerActiveStateManager.instance()
+    if ft is None or state is None:
+        dist.all_reduce(tensor, op=op, group=dp_group)
+        return
+
+    active_mask = state.active_ranks_cpu.tolist()
+    _, valid = ft.all_reduce(tensor, op=op, active_mask=active_mask)
+    if not valid:
+        logger.warning(
+            "FT NIXL EP: FT all_reduce returned valid=False at gen=%d; the "
+            "local rank may be masked dead or the online collective failed. "
+            "Tensor left as-is.",
+            ft.generation,
+        )
+
+
 class DPFTGlooManager:
     """Per-process singleton holder for the DP-group FT gloo wrapper.
 
