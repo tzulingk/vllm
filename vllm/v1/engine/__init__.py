@@ -236,6 +236,14 @@ class EngineCoreOutputs(
     # "old" wave, so the next wave needs to be started in other engines.
     start_wave: int | None = None
 
+    # FT NIXL EP: DP rank IDs currently considered dead from this
+    # engine's perspective (derived from PeerActiveStateManager.instance()).
+    # Empty when nothing is dead or when the FT machinery isn't active.
+    # The AsyncLLM dispatcher (vllm/v1/engine/core_client.py) unions these
+    # across engines and excludes any DP rank that any engine reports dead
+    # from the round-robin picker.
+    degraded_peers: set[int] | None = None
+
     def __post_init__(self):
         if self.timestamp == 0.0:
             self.timestamp = time.monotonic()

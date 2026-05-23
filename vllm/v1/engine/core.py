@@ -454,8 +454,34 @@ class EngineCore:
         # FT NIXL EP: end-of-forward mask check. No-op when the FT
         # singletons aren't initialized (non-NIXL-EP deployments).
         self._maybe_check_ft_mask()
+        self._attach_degraded_peers(engine_core_outputs)
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
+
+    def _attach_degraded_peers(
+        self, engine_core_outputs: dict[int, "EngineCoreOutputs"]
+    ) -> None:
+        """Stamp the current dead-peer set on every EngineCoreOutputs.
+
+        Read from ``PeerActiveStateManager.instance().active_ranks_cpu``;
+        a rank is reported "degraded" when ``active_ranks_cpu[i] == 0``.
+        The AsyncLLM dispatcher unions this across engines and avoids
+        scheduling new requests onto any DP rank any engine flagged.
+
+        No-op when the FT singletons aren't initialized.
+        """
+        from vllm.distributed.elastic_ep.peer_state import PeerActiveStateManager
+
+        state = PeerActiveStateManager.instance()
+        if state is None or not engine_core_outputs:
+            return
+        dead = {
+            i for i, alive in enumerate(state.active_ranks_cpu.tolist()) if not alive
+        }
+        if not dead:
+            return
+        for eco in engine_core_outputs.values():
+            eco.degraded_peers = dead
 
     def _maybe_check_ft_mask(self) -> None:
         """Poll the NIXL EP kernel mask and abort the batch on change.
