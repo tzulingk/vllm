@@ -1347,6 +1347,12 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             len(self.core_engines) * self.client_index
         ) // client_count
 
+        # FT NIXL EP: DP indices any engine has reported as dead via
+        # EngineCoreOutputs.degraded_peers. The picker below excludes these
+        # from the round-robin candidate set so new requests land only on
+        # surviving DP ranks.
+        self.dead_engine_indices: set[int] = set()
+
     def get_core_engine_for_request(self, request: EngineCoreRequest) -> EngineIdentity:
         # Engines are in rank order.
         if (eng_index := request.data_parallel_rank) is None and (
@@ -1359,15 +1365,37 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             num_engines = len(current_counts)
             min_score = sys.maxsize
             eng_index = 0
+            considered_any = False
             for i in range(num_engines):
                 # Start from client_index to help with balancing when engines
                 # are empty.
                 idx = (self.eng_start_index + i) % num_engines
+                # FT NIXL EP: skip any DP rank any engine has flagged dead.
+                # When every engine is degraded we still need to pick *some*
+                # destination -- preserve liveness by ignoring the filter
+                # in that pathological case.
+                if idx in self.dead_engine_indices:
+                    continue
                 waiting, running = current_counts[idx]
                 score = waiting * 4 + running
+                considered_any = True
                 if score < min_score:
                     min_score = score
                     eng_index = idx
+            if not considered_any:
+                # Every engine is marked dead; fall back to the original
+                # round-robin so the system at least makes forward progress.
+                logger.warning(
+                    "FT NIXL EP: every DP engine flagged dead -- ignoring "
+                    "dead_engine_indices for this dispatch."
+                )
+                for i in range(num_engines):
+                    idx = (self.eng_start_index + i) % num_engines
+                    waiting, running = current_counts[idx]
+                    score = waiting * 4 + running
+                    if score < min_score:
+                        min_score = score
+                        eng_index = idx
             # Increment local waiting count for better balancing between stats
             # updates from the coordinator (which happen every 100ms).
             current_counts[eng_index][0] += self.client_count
@@ -1395,6 +1423,21 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         if outputs.finished_requests and self.reqs_in_flight:
             for req_id in outputs.finished_requests:
                 self.reqs_in_flight.pop(req_id, None)
+        # FT NIXL EP: union the degraded_peers report into the local
+        # dead-engine set. Every engine sees the same kernel mask so
+        # reports converge quickly; we union (never narrow) so a stale
+        # "rank N is alive" never resurrects a known-dead rank without
+        # explicit recovery.
+        if outputs.degraded_peers:
+            new_dead = outputs.degraded_peers - self.dead_engine_indices
+            if new_dead:
+                self.dead_engine_indices |= new_dead
+                logger.warning(
+                    "FT NIXL EP: AsyncLLM dispatcher: DP rank(s) %s flagged "
+                    "dead by engine %d; subsequent requests will skip them.",
+                    sorted(new_dead),
+                    outputs.engine_index,
+                )
 
     @staticmethod
     async def eep_process_engine_core_notification(
