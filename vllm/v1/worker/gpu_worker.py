@@ -157,6 +157,38 @@ class Worker(WorkerBase):
         # pending non-blocking PP send work from the previous iteration
         self._pp_send_work: list[Handle] = []
 
+    def query_nixl_ep_mask(self) -> torch.Tensor | None:
+        """Return the current NIXL EP kernel mask, or None if N/A.
+
+        FT NIXL EP hook called once per forward step from the engine-core
+        (``EngineCore._maybe_check_ft_mask``) via ``collective_rpc``. The
+        engine-core ingests the mask into its ``PeerActiveState``; on
+        change, it aborts the just-executed batch with
+        ``FinishReason.ERROR``.
+
+        Returns a cloned ``[ep_size]`` int CPU tensor (1=dead, 0=alive)
+        so the engine-core sees a stable snapshot independent of the
+        manager's reusable read buffer.
+        """
+        from vllm.distributed import get_ep_group
+        from vllm.distributed.device_communicators.all2all import (
+            NixlEPAll2AllManager,
+        )
+
+        try:
+            ep_group = get_ep_group()
+        except Exception:
+            return None
+        if ep_group is None or getattr(ep_group, "device_communicator", None) is None:
+            return None
+        manager = getattr(ep_group.device_communicator, "all2all_manager", None)
+        if not isinstance(manager, NixlEPAll2AllManager):
+            return None
+        mask = manager.query_mask()
+        if mask is None:
+            return None
+        return mask.clone()
+
     def sleep(self, level: int = 1) -> None:
         from vllm.device_allocator.cumem import CuMemAllocator
 

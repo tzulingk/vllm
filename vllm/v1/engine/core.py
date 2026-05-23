@@ -451,7 +451,77 @@ class EngineCore:
             scheduler_output, model_output
         )
 
+        # FT NIXL EP: end-of-forward mask check. No-op when the FT
+        # singletons aren't initialized (non-NIXL-EP deployments).
+        self._maybe_check_ft_mask()
+
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
+
+    def _maybe_check_ft_mask(self) -> None:
+        """Poll the NIXL EP kernel mask and abort the batch on change.
+
+        Called once per forward pass from ``step``. Workflow:
+
+        1. ``collective_rpc("query_nixl_ep_mask")`` -- workers return the
+           NIXL EP buffer's mask (``1`` = dead). For TP > 1 every worker
+           reads the same class-level buffer, so any non-None result is
+           authoritative.
+        2. ``apply_kernel_mask`` ingests it into ``PeerActiveState``
+           (convention is inverted; state stores ``1`` = alive).
+        3. If ``is_active_equal_last() == False``, the just-executed batch
+           crossed a broken EP all-to-all -- finish every still-running
+           request with ``RequestStatus.FINISHED_ERROR`` and snapshot the
+           new mask.
+
+        Early-exit (no FT, no NIXL EP backend, mask not yet readable)
+        keeps non-FT deployments paying zero cost beyond the singleton
+        ``None`` check.
+        """
+        from vllm.distributed.elastic_ep.peer_state import (
+            PeerActiveStateManager,
+            apply_kernel_mask,
+        )
+
+        state = PeerActiveStateManager.instance()
+        if state is None:
+            return
+
+        try:
+            # Workers return Optional[torch.Tensor]; typed as Any to avoid
+            # pulling torch into this module's import surface.
+            masks: list[Any] = self.collective_rpc("query_nixl_ep_mask")
+        except Exception as e:
+            logger.warning(
+                "FT NIXL EP: collective_rpc(query_nixl_ep_mask) raised %s; "
+                "skipping mask check this step.",
+                e,
+            )
+            return
+
+        kernel_mask = next((m for m in masks if m is not None), None)
+        if kernel_mask is None:
+            return
+
+        apply_kernel_mask(state, kernel_mask)
+        if state.is_active_equal_last():
+            return
+
+        newly_dead = state.newly_dead_peers()
+        # `running` lives on the concrete Scheduler, not SchedulerInterface;
+        # gracefully handle alternative scheduler implementations.
+        running = getattr(self.scheduler, "running", [])
+        running_req_ids = [r.request_id for r in running]
+        logger.warning(
+            "FT NIXL EP: newly-dead EP peers %s detected at engine-core step "
+            "boundary; aborting %d running request(s) with FinishReason.ERROR.",
+            newly_dead,
+            len(running_req_ids),
+        )
+        if running_req_ids:
+            self.scheduler.finish_requests(
+                running_req_ids, RequestStatus.FINISHED_ERROR
+            )
+        state.snapshot_active_to_last()
 
     def post_step(self, model_executed: bool) -> None:
         # When using async scheduling we can't get draft token ids in advance,
