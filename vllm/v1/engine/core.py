@@ -461,12 +461,13 @@ class EngineCore:
     def _attach_degraded_peers(
         self, engine_core_outputs: dict[int, "EngineCoreOutputs"]
     ) -> None:
-        """Stamp the current dead-peer set on every EngineCoreOutputs.
+        """Stamp the current fully-dead-DP-rank set on every EngineCoreOutputs.
 
-        Read from ``PeerActiveStateManager.instance().active_ranks_cpu``;
-        a rank is reported "degraded" when ``active_ranks_cpu[i] == 0``.
-        The AsyncLLM dispatcher unions this across engines and avoids
-        scheduling new requests onto any DP rank any engine flagged.
+        Source: ``PeerActiveStateManager.instance().dp_dead_ranks()`` --
+        a DP rank is reported "degraded" only when **all** of its TP
+        siblings are dead (AND-reduce). DP ranks with one or more live
+        TP siblings still route correctly via NIXL EP's per-slot mask,
+        so the AsyncLLM dispatcher should NOT skip them.
 
         No-op when the FT singletons aren't initialized.
         """
@@ -475,9 +476,7 @@ class EngineCore:
         state = PeerActiveStateManager.instance()
         if state is None or not engine_core_outputs:
             return
-        dead = {
-            i for i, alive in enumerate(state.active_ranks_cpu.tolist()) if not alive
-        }
+        dead = state.dp_dead_ranks()
         if not dead:
             return
         for eco in engine_core_outputs.values():
@@ -1831,7 +1830,13 @@ class DPEngineCoreProc(EngineCoreProc):
                 PeerActiveStateManager,
             )
 
-            PeerActiveStateManager.init(ep_size=dp_size)
+            # PeerActiveState is EP-indexed: one bit per GPU = one bit
+            # per EP slot. For TP=1 this is dp_size; for TP>1 the state
+            # holds dp_size * tp_size bits and DP-level views are
+            # derived via dp_active_mask() / dp_dead_ranks().
+            tp_size = parallel_config.tensor_parallel_size
+            ep_size = dp_size * tp_size
+            PeerActiveStateManager.init(ep_size=ep_size, tp_size=tp_size)
             DPFTGlooManager.init(
                 store=dp_store,
                 master_addr=parallel_config.data_parallel_master_ip,

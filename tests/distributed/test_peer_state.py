@@ -147,3 +147,74 @@ def test_manager_reset_instance_clears_state():
     PeerActiveStateManager.reset_instance()
     assert PeerActiveStateManager.instance() is None
     assert PeerActiveStateManager.is_initialized() is False
+
+
+# ----------------------------- TP > 1 derivations ----------------------- #
+
+
+def test_manager_init_stores_tp_size():
+    state = PeerActiveStateManager.init(ep_size=8, tp_size=2)
+    assert state.tp_size == 2
+    assert state.ep_size == 8
+    assert state.dp_size == 4
+
+
+def test_manager_init_rejects_ep_not_multiple_of_tp():
+    with pytest.raises(ValueError, match="multiple of tp_size"):
+        PeerActiveStateManager.init(ep_size=5, tp_size=2)
+
+
+def test_dp_active_mask_tp1_identity():
+    state = PeerActiveStateManager.init(ep_size=4, tp_size=1)
+    apply_kernel_mask(state, torch.tensor([0, 1, 0, 0], dtype=torch.int32))
+    # TP=1 -> DP view matches the EP view bit for bit.
+    assert state.dp_active_mask() == [1, 0, 1, 1]
+
+
+def test_dp_active_mask_tp2_or_reduce_keeps_partial_dp_alive():
+    # 4 DP ranks, TP=2 -> 8 EP slots.
+    # Kill EP slot 4 (DP rank 2's first TP sibling). Slot 5 (DP rank 2's
+    # other sibling) stays alive -> DP rank 2 still alive for the
+    # cross-DP collective.
+    state = PeerActiveStateManager.init(ep_size=8, tp_size=2)
+    apply_kernel_mask(state, torch.tensor([0, 0, 0, 0, 1, 0, 0, 0], dtype=torch.int32))
+    assert state.dp_active_mask() == [1, 1, 1, 1]
+
+
+def test_dp_active_mask_tp2_drops_fully_dead_dp_rank():
+    # Kill both TP siblings of DP rank 1 (EP slots 2, 3).
+    state = PeerActiveStateManager.init(ep_size=8, tp_size=2)
+    apply_kernel_mask(state, torch.tensor([0, 0, 1, 1, 0, 0, 0, 0], dtype=torch.int32))
+    assert state.dp_active_mask() == [1, 0, 1, 1]
+
+
+def test_dp_dead_ranks_tp2_and_reduce_keeps_partial_alive():
+    # One sibling dead in DP rank 2 -> DP rank 2 is NOT in the dead set
+    # (the surviving sibling can still serve).
+    state = PeerActiveStateManager.init(ep_size=8, tp_size=2)
+    apply_kernel_mask(state, torch.tensor([0, 0, 0, 0, 1, 0, 0, 0], dtype=torch.int32))
+    assert state.dp_dead_ranks() == set()
+
+
+def test_dp_dead_ranks_tp2_full_kill_in_set():
+    state = PeerActiveStateManager.init(ep_size=8, tp_size=2)
+    apply_kernel_mask(state, torch.tensor([0, 0, 1, 1, 0, 0, 0, 0], dtype=torch.int32))
+    assert state.dp_dead_ranks() == {1}
+
+
+def test_dp_dead_ranks_tp4_partial_alive():
+    # 2 DP ranks, TP=4 -> 8 EP slots. Kill 3 of the 4 siblings of DP 0;
+    # DP 0 still has 1 alive -> not dead.
+    state = PeerActiveStateManager.init(ep_size=8, tp_size=4)
+    apply_kernel_mask(state, torch.tensor([1, 1, 1, 0, 0, 0, 0, 0], dtype=torch.int32))
+    assert state.dp_dead_ranks() == set()
+    assert state.dp_active_mask() == [1, 1]
+
+
+def test_newly_dead_peers_returns_ep_indexed():
+    """newly_dead_peers must report EP-level indices (not DP)."""
+    state = PeerActiveStateManager.init(ep_size=8, tp_size=2)
+    apply_kernel_mask(state, torch.tensor([0, 0, 0, 0, 1, 0, 0, 0], dtype=torch.int32))
+    # EP slot 4 died -- reporting MUST be EP-indexed for the EPLB
+    # redistribution to work.
+    assert state.newly_dead_peers() == [4]

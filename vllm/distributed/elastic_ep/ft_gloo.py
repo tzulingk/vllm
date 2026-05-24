@@ -319,7 +319,12 @@ def ft_or_raw_all_reduce(
         dist.all_reduce(tensor, op=op, group=dp_group)
         return
 
-    active_mask = state.active_ranks_cpu.tolist()
+    # PeerActiveState is EP-indexed (one bit per GPU). The DP FT gloo
+    # group is DP-indexed. dp_active_mask OR-reduces across each DP
+    # rank's TP siblings -- a DP rank is alive for the collective if
+    # any of its TP siblings can still drive it. For TP=1 this is an
+    # identity.
+    active_mask = state.dp_active_mask()
     _, valid = ft.all_reduce(tensor, op=op, active_mask=active_mask)
     if not valid:
         logger.warning(

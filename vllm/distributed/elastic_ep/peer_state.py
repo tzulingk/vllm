@@ -34,18 +34,48 @@ logger = init_logger(__name__)
 class PeerActiveState:
     """Snapshot of which EP peers are currently active.
 
+    The mask is **EP-indexed** (one bit per EP slot = one bit per GPU);
+    ``active_ranks.numel() == dp_size * tp_size``. DP-level views (for
+    cross-DP collectives + the AsyncLLM dispatcher) are derived from
+    the EP mask via :meth:`dp_active_mask` / :meth:`dp_dead_ranks`.
+
+    Why EP-indexed: the failure unit is a single GPU. For TP > 1, a
+    DP rank may have some TP siblings dead and some alive; the
+    surviving siblings must keep stepping so the cross-DP EP all-to-all
+    sees the DP rank as present. Tracking aliveness per EP slot lets
+    each consumer fold the right way:
+      - Cross-DP collectives (wave-sync, KV-mem-sync): DP rank ``d`` is
+        alive if **any** of its TP siblings is alive (OR-reduce).
+      - AsyncLLM request routing: DP rank ``d`` is dead only if **all**
+        of its TP siblings are dead (AND-reduce). New requests go to
+        DP ranks that still have at least one live sibling.
+
+    For TP=1 the EP index = DP index and the derivations are
+    identities.
+
     Attributes:
-        active_ranks: ``[ep_size]`` int32 tensor; ``1`` = alive, ``0`` = dead.
+        active_ranks: ``[ep_size]`` int32 tensor; ``1`` = alive, ``0`` =
+            dead.
         last_active_ranks: Snapshot of ``active_ranks`` at the previous
-            engine step. Compared via :meth:`is_active_equal_last` to detect
-            per-step changes.
-        active_ranks_cpu: CPU mirror of ``active_ranks``; the only copy a
-            non-GPU caller (e.g. the AsyncLLM DP dispatcher) should read.
+            engine step. Compared via :meth:`is_active_equal_last` to
+            detect per-step changes.
+        active_ranks_cpu: CPU mirror of ``active_ranks``.
+        tp_size: Number of TP workers per DP rank. ``ep_size`` /
+            ``tp_size`` = DP size.
     """
 
     active_ranks: torch.Tensor
     last_active_ranks: torch.Tensor
     active_ranks_cpu: torch.Tensor
+    tp_size: int = 1
+
+    @property
+    def ep_size(self) -> int:
+        return int(self.active_ranks.numel())
+
+    @property
+    def dp_size(self) -> int:
+        return self.ep_size // self.tp_size
 
     def is_active_equal_last(self) -> bool:
         return torch.equal(self.active_ranks, self.last_active_ranks)
@@ -69,6 +99,34 @@ class PeerActiveState:
     def alive_ranks(self) -> list[int]:
         """EP ranks currently alive (CPU read)."""
         return self.active_ranks_cpu.nonzero(as_tuple=False).flatten().tolist()
+
+    def dp_active_mask(self) -> list[int]:
+        """DP-level active mask, OR-reduced across each DP rank's TP siblings.
+
+        Length ``dp_size``; entry ``d`` is ``1`` if any of DP rank
+        ``d``'s TP siblings (EP slots ``d*tp .. (d+1)*tp - 1``) is alive.
+        Used by :func:`vllm.distributed.elastic_ep.ft_gloo.ft_or_raw_all_reduce`
+        so cross-DP collectives stay correct when one TP sibling in a
+        DP rank dies but others survive.
+        """
+        cpu = self.active_ranks_cpu.tolist()
+        tp = self.tp_size
+        dp = self.dp_size
+        return [1 if any(cpu[d * tp + t] for t in range(tp)) else 0 for d in range(dp)]
+
+    def dp_dead_ranks(self) -> set[int]:
+        """DP ranks where every TP sibling is dead (AND-reduce).
+
+        Used by the AsyncLLM dispatcher to decide which DP ranks to
+        skip for new requests. A DP rank with even one live TP sibling
+        is still routable -- that sibling's worker can serve the
+        request (and its EP all-to-all peers will reach it via the
+        NIXL mask).
+        """
+        cpu = self.active_ranks_cpu.tolist()
+        tp = self.tp_size
+        dp = self.dp_size
+        return {d for d in range(dp) if not any(cpu[d * tp + t] for t in range(tp))}
 
     def reset(self) -> None:
         """Mark every rank alive again. Use after a recovery / re-include."""
@@ -125,18 +183,39 @@ class PeerActiveStateManager:
     def init(
         cls,
         ep_size: int,
+        *,
+        tp_size: int = 1,
         device: torch.device | None = None,
     ) -> PeerActiveState:
-        """Idempotent initializer. Subsequent calls return the existing instance."""
+        """Idempotent initializer. Subsequent calls return the existing instance.
+
+        Args:
+            ep_size: total EP world size = ``dp_size * tp_size``.
+                For TP=1 callers may pass ``dp_size`` directly and the
+                DP-level derivations are identities.
+            tp_size: TP workers per DP rank. Defaults to ``1`` (the demo
+                topology); for TP>1 ``ep_size`` must be a multiple of
+                ``tp_size``.
+        """
         if cls._instance is not None:
-            if cls._instance.active_ranks.numel() != ep_size:
+            existing_ep = cls._instance.active_ranks.numel()
+            if existing_ep != ep_size or cls._instance.tp_size != tp_size:
                 logger.warning(
-                    "PeerActiveStateManager.init(ep_size=%d) called but an "
-                    "instance with ep_size=%d already exists; returning existing.",
+                    "PeerActiveStateManager.init(ep_size=%d, tp_size=%d) called "
+                    "but an instance with ep_size=%d, tp_size=%d already exists; "
+                    "returning existing.",
                     ep_size,
-                    cls._instance.active_ranks.numel(),
+                    tp_size,
+                    existing_ep,
+                    cls._instance.tp_size,
                 )
             return cls._instance
+
+        if ep_size % tp_size != 0:
+            raise ValueError(
+                f"PeerActiveStateManager.init: ep_size {ep_size} must be a "
+                f"multiple of tp_size {tp_size}"
+            )
 
         dev = device if device is not None else torch.device("cpu")
         active = torch.ones(ep_size, dtype=torch.int32, device=dev)
@@ -144,6 +223,7 @@ class PeerActiveStateManager:
             active_ranks=active,
             last_active_ranks=active.clone(),
             active_ranks_cpu=active.detach().cpu().clone(),
+            tp_size=tp_size,
         )
         return cls._instance
 
