@@ -1395,6 +1395,15 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         # To route aborts to the correct engine.
         self.reqs_in_flight: dict[str, EngineIdentity] = {}
 
+        # FT NIXL EP: DP indices reported dead either via engine outputs
+        # (degraded_peers) or by the per-engine liveness monitor below.
+        # The dispatcher in get_core_engine_for_request excludes these
+        # from routing so new requests land only on surviving DP ranks.
+        # Must be set BEFORE super().__init__() because MPClient.__init__
+        # spawns start_engine_core_monitor() (which we override) before
+        # returning, and that monitor mutates this set.
+        self.dead_engine_indices: set[int] = set()
+
         super().__init__(
             vllm_config,
             executor_class,
@@ -1409,6 +1418,124 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         self.eng_start_index = (
             len(self.core_engines) * self.client_index
         ) // client_count
+
+    def start_engine_core_monitor(self) -> None:
+        """FT NIXL EP override of ``MPClient.start_engine_core_monitor``.
+
+        The base monitor uses ``engine_manager.monitor_engine_liveness()``,
+        which returns on the first engine death and then unilaterally tears
+        down every actor + closes sockets, forcing the API server to shut
+        down. That's correct when one dead DP rank means "give up," but for
+        fault-tolerant NIXL EP we want surviving DP ranks to keep serving.
+
+        This override watches each Ray actor individually. On a single
+        engine death we add that engine to ``dead_engine_indices`` (which
+        the dispatcher already consults to route around dead ranks) and
+        log; we only fall through to the global "engine_dead -> shutdown"
+        path when every engine has died.
+
+        Falls back to the base monitor when elastic-EP is off or the
+        engine manager isn't the Ray-backed one.
+        """
+        if not self.vllm_config.parallel_config.enable_elastic_ep:
+            return super().start_engine_core_monitor()
+        engine_manager = self.resources.engine_manager
+        if not isinstance(engine_manager, CoreEngineActorManager):
+            return super().start_engine_core_monitor()
+
+        self_ref = weakref.ref(self)
+
+        def monitor_engine_cores():
+            import ray
+
+            # Engine index == position in (local + remote) actor list.
+            all_actors = (
+                engine_manager.local_engine_actors + engine_manager.remote_engine_actors
+            )
+            ref_to_idx: dict[Any, int] = {}
+            for idx, actor in enumerate(all_actors):
+                ref = engine_manager.actor_run_ref_dict.get(actor)
+                if ref is not None:
+                    ref_to_idx[ref] = idx
+            if not ref_to_idx:
+                return
+
+            pending = set(ref_to_idx.keys())
+            while pending and not engine_manager.manager_stopped.is_set():
+                done, _ = ray.wait(list(pending), timeout=5, num_returns=1)
+                _self = self_ref()
+                if _self is None or not _self._finalizer.alive:
+                    return
+
+                for ref in done:
+                    pending.discard(ref)
+                    idx = ref_to_idx[ref]
+                    try:
+                        ray.get(ref)
+                        cause = "exited cleanly"
+                    except ray.exceptions.RayActorError as e:
+                        cause = f"RayActorError: {str(e)[:200]}"
+                    except Exception as e:  # noqa: BLE001
+                        cause = f"{type(e).__name__}: {str(e)[:200]}"
+
+                    if idx in _self.dead_engine_indices:
+                        continue
+                    _self.dead_engine_indices.add(idx)
+                    logger.warning(
+                        "FT NIXL EP: DP engine %d died (%s). Dispatcher "
+                        "will skip rank %d; survivors continue serving.",
+                        idx,
+                        cause,
+                        idx,
+                    )
+                    _self._abort_in_flight_for_dead_engine(idx)
+
+                if not pending:
+                    logger.error(
+                        "FT NIXL EP: all DP engines have died; shutting "
+                        "down the API server."
+                    )
+                    _self.resources.engine_dead = True
+                    _self.shutdown()
+                    return
+
+        Thread(
+            target=monitor_engine_cores,
+            daemon=True,
+            name="DPLBFTEngineMonitor",
+        ).start()
+
+    def _abort_in_flight_for_dead_engine(self, dead_idx: int) -> None:
+        """Drop client-side bookkeeping for requests on a dead engine.
+
+        AsyncLLM keeps these request_ids on its tracker; with the engine
+        gone they will never get a final EngineCoreOutput. We log and
+        forget them here so abort routing doesn't try to send messages to
+        a dead identity. A follow-up should synthesize a
+        ``FinishReason.ERROR`` output so callers see a clean failure
+        rather than a hang -- matching the abort-callback path #38862
+        uses during scale-down.
+        """
+        if dead_idx >= len(self.core_engines):
+            return
+        dead_identity = self.core_engines[dead_idx]
+        abandoned = [
+            rid
+            for rid, eng in list(self.reqs_in_flight.items())
+            if eng == dead_identity
+        ]
+        if not abandoned:
+            return
+        logger.warning(
+            "FT NIXL EP: %d in-flight request(s) routed to dead DP %d "
+            "have no final output yet (no abort callback). Sample ids: %s%s",
+            len(abandoned),
+            dead_idx,
+            abandoned[:5],
+            "..." if len(abandoned) > 5 else "",
+        )
+        for rid in abandoned:
+            self.reqs_in_flight.pop(rid, None)
 
     def get_core_engine_for_request(self, request: EngineCoreRequest) -> EngineIdentity:
         # Engines are in rank order.
@@ -1426,6 +1553,10 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                 # Start from client_index to help with balancing when engines
                 # are empty.
                 idx = (self.eng_start_index + i) % num_engines
+                # FT NIXL EP: skip engines the per-engine monitor flagged
+                # dead so new requests land only on surviving DP ranks.
+                if idx in self.dead_engine_indices:
+                    continue
                 waiting, running = current_counts[idx]
                 score = waiting * 4 + running
                 if score < min_score:
