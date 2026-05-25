@@ -50,7 +50,61 @@ def _run_ar(
     tensor_cpu[2][dp_rank] = 1 if should_ubatch else 0
     tensor_cpu[3][dp_rank] = cudagraph_mode
     tensor = tensor_cpu.to(device, non_blocking=True)
-    dist.all_reduce(tensor, group=group)
+    # FT NIXL EP: when ``enable_elastic_ep`` is set, prefer the
+    # fault-tolerant gloo wrapper so a dead DP peer doesn't kill the
+    # surviving workers in the per-step DP coordination collective.
+    # Two practical issues drive the layered fallback below:
+    #
+    # 1. ``DPFTGlooManager`` / ``PeerActiveStateManager`` are
+    #    per-process singletons initialized in the engine-core actor,
+    #    not in its child ``RayWorkerProc``. The collective itself runs
+    #    in the worker, where ``ft_or_raw_all_reduce`` therefore falls
+    #    through to the raw ``dist.all_reduce`` path. Initializing the
+    #    singletons in the worker is a separate follow-up; for the
+    #    minimum-downtime demo we accept that the worker uses raw gloo.
+    # 2. Raw gloo raises ``Connection closed by peer`` when one rank
+    #    is dead, which today propagates up and kills the worker (and
+    #    cascades into engine death). Catch that here and proceed with
+    #    only this rank's contribution. Downstream logic degrades
+    #    safely: dead-rank slots stay 0, so ``_post_process_ubatch``
+    #    sees a non-all-1 vote (ubatch disabled), and
+    #    ``_post_process_cudagraph_mode`` returns 0 (cudagraph
+    #    disabled for the step). The DP padding result reflects only
+    #    the survivors, which is the desired behavior.
+    if tensor.device.type == "cpu":
+        from vllm.distributed.elastic_ep.ft_gloo import ft_or_raw_all_reduce
+
+        try:
+            ft_or_raw_all_reduce(tensor, dist.ReduceOp.SUM, group)
+        except (RuntimeError, ValueError) as e:
+            # Look at the full exception chain because torch's c10d_logger
+            # wrapper re-raises a ValueError ("Process group is not initialized
+            # in the world group map") while formatting the original gloo
+            # RuntimeError, and we want to recognize both shapes as the same
+            # "dead-peer" condition.
+            messages: list[str] = []
+            cur: BaseException | None = e
+            while cur is not None and len(messages) < 5:
+                messages.append(str(cur))
+                cur = cur.__context__ or cur.__cause__
+            joined = "\n".join(messages)
+            is_dead_peer = (
+                "Connection closed by peer" in joined
+                or "Connection reset" in joined
+                or "is not initialized in the world group map" in joined
+            )
+            if is_dead_peer:
+                logger.warning_once(
+                    "FT NIXL EP: DP _run_ar all_reduce failed (%s: %s); "
+                    "proceeding with local-only contribution. Ubatching "
+                    "and CUDA-graph will be disabled this step.",
+                    type(e).__name__,
+                    messages[0].splitlines()[0] if messages else "",
+                )
+            else:
+                raise
+    else:
+        dist.all_reduce(tensor, group=group)
     return tensor
 
 
