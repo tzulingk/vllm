@@ -278,6 +278,7 @@ if TYPE_CHECKING:
     VLLM_ELASTIC_EP_DRAIN_REQUESTS: bool = False
     VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: bool = True
     VLLM_NIXL_EP_MAX_NUM_RANKS: int = 32
+    VLLM_NIXL_EP_TIMEOUT_MS: int = 5000
     VLLM_XPU_ENABLE_XPU_GRAPH: bool = False
     VLLM_XPU_USE_SAMPLER_KERNEL: bool = True
     VLLM_LORA_ENABLE_DUAL_STREAM: bool = False
@@ -1954,6 +1955,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # NIXL EP environment variables
     "VLLM_NIXL_EP_MAX_NUM_RANKS": lambda: int(
         os.getenv("VLLM_NIXL_EP_MAX_NUM_RANKS", "32")
+    ),
+    # NIXL EP per-kernel GPU timeout. In low_latency_mode (the default for
+    # FT-NIXL-EP), a timeout marks the rank invalid and masks it out so the
+    # surviving peers' next dispatch/combine doesn't wait on a dead rank.
+    # We default to 5000ms (vs NIXL EP's own 30_000ms default) to keep the
+    # FT recovery window tight; raise it if false positives are a concern.
+    "VLLM_NIXL_EP_TIMEOUT_MS": lambda: int(
+        os.getenv("VLLM_NIXL_EP_TIMEOUT_MS", "5000")
     ),
     # Whether enable XPU graph on Intel GPU
     "VLLM_XPU_ENABLE_XPU_GRAPH": lambda: bool(

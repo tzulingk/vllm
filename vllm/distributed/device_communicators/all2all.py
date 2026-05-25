@@ -359,10 +359,46 @@ class NixlEPAll2AllManager(All2AllManagerBase):
         assert NixlEPAll2AllManager._buffer is None, (
             "NIXL EP buffer already initialized"
         )
-        buffer = Buffer(
-            rank=self.rank,
-            tcp_store_group=self.tcp_store_group.store,
-        )
+        # FT NIXL EP: NIXL EP's mask-aware kernels auto-mask a peer that
+        # doesn't respond within `timeout_ms`. The library default is
+        # 30_000ms; we shorten it via VLLM_NIXL_EP_TIMEOUT_MS (default
+        # 5000ms) so a dead-peer post-kill curl recovers within a few
+        # seconds rather than 30s. Tune higher if false positives.
+        #
+        # The `timeout_ms` kwarg was added in nixl-cu13 1.1.0. Older
+        # wheels (e.g. 1.0.1, which we currently pin in some images due
+        # to the 1.1.0 destructor segfault on arm64) don't accept it --
+        # pass it conditionally so we stay compatible. On older wheels
+        # the kernel keeps the library default (30_000ms) and FT
+        # recovery is correspondingly slower; warn so the operator
+        # knows.
+        import inspect
+
+        buffer_kwargs: dict[str, Any] = {
+            "rank": self.rank,
+            "tcp_store_group": self.tcp_store_group.store,
+        }
+        ctor_params = inspect.signature(Buffer.__init__).parameters
+        if "timeout_ms" in ctor_params:
+            buffer_kwargs["timeout_ms"] = envs.VLLM_NIXL_EP_TIMEOUT_MS
+        else:
+            logger.warning_once(
+                "FT NIXL EP: installed nixl_ep.Buffer does not accept "
+                "`timeout_ms`; the kernel will use the library default "
+                "(usually 30_000ms). Upgrade to nixl-cu13>=1.1.0 for "
+                "fast FT recovery."
+            )
+        # FT NIXL EP: nixl-cu13 1.1.0's Buffer destructor segfaults
+        # ("Unsupported NVL ranks", runtime.cu:48) when Python GC drops
+        # a reference to a Buffer that hasn't been `update_memory_buffers()`-ed,
+        # which can happen on arm64/GB200 during Ray task teardown.
+        # Pass `explicitly_destroy=True` so Python's __del__ doesn't fire
+        # the buggy destructor path; we never need to reclaim the Buffer
+        # mid-process (a fresh process is spawned on engine restart), so
+        # leaking the C++ object at process exit is acceptable.
+        if "explicitly_destroy" in ctor_params:
+            buffer_kwargs["explicitly_destroy"] = True
+        buffer = Buffer(**buffer_kwargs)
         buffer.update_memory_buffers(
             num_ranks=self.max_num_ep_ranks,
             num_experts_per_rank=num_experts_per_rank,
