@@ -12,15 +12,16 @@ same**. The dead peer's physical slots remain in
 the missing logical experts are reassigned onto the most-redundant
 surviving slots.
 
-What this module does *not* do (yet): move expert weights. PR #38862
-uses NCCL P2P + a disk-reload fallback to put the new expert into the
-correct physical slot. For the demo, only the placement table is
-updated; deployments running with ``replica_count >= 2`` per expert
-will already have a surviving copy of every logical expert in some
-other rank's slot, so the placement table update alone preserves
-correctness as long as the router can find that surviving copy. When
-no surviving replica exists, the expert is effectively unreachable
-until weight reload is wired in.
+When a logical expert had **at least one surviving replica** elsewhere,
+the placement-table rewrite alone is enough -- the model's MoE router
+will find that surviving slot the next time tokens are routed to that
+expert. When a logical expert lost **all** of its replicas (every copy
+was on the dead rank), the slot we reassigned to that expert still
+holds the *donor* expert's weights in its GPU buffer; the placement
+table lies. ``reassign_missing_experts_inplace`` therefore returns the
+set of ``(layer_idx, new_logical_id)`` pairs it created so the caller
+can reload those expert weights from the HF checkpoint via
+:func:`vllm.distributed.elastic_ep.eplb_reload.reload_experts_from_disk`.
 """
 
 from __future__ import annotations
@@ -73,7 +74,7 @@ def mark_dead_columns_inplace(
 def reassign_missing_experts_inplace(
     physical_to_logical_map: torch.Tensor,
     num_logical: int,
-) -> bool:
+) -> set[tuple[int, int]]:
     """Reassign logical experts that have lost all physical replicas.
 
     Operates layer-by-layer on ``physical_to_logical_map`` in place.
@@ -93,11 +94,19 @@ def reassign_missing_experts_inplace(
     inferred from the data, because a logical id with zero surviving
     replicas would otherwise be invisible.
 
-    Returns ``True`` if at least one slot was reassigned, ``False`` if
-    every logical expert was already present in every layer (no-op).
+    Returns the set of ``(layer_idx, logical_id)`` pairs that were
+    reassigned. Each pair indicates a slot whose placement-table entry
+    now points at ``logical_id`` but whose GPU weight buffer still
+    holds the donor expert's weights -- the caller must reload those
+    weights from disk (e.g. via
+    :func:`vllm.distributed.elastic_ep.eplb_reload.reload_experts_from_disk`)
+    before the model produces correct output for that expert. Empty set
+    means no reassignment occurred (every logical expert already had at
+    least one surviving replica in every layer).
+
     Raises ``RuntimeError`` when redundancy is insufficient to cover
     every missing expert -- the caller should detect this and either
-    scale down or reload from disk.
+    scale down or extend redundancy.
 
     Adapted from PR #38862's ``ElasticEPScalingExecutor.reassign_missing_experts``.
     """
@@ -109,7 +118,7 @@ def reassign_missing_experts_inplace(
 
     num_layers, num_physical = physical_to_logical_map.shape
     all_logical = set(range(num_logical))
-    any_reassigned = False
+    reassignments: set[tuple[int, int]] = set()
 
     for layer_idx in range(num_layers):
         layer = physical_to_logical_map[layer_idx]
@@ -123,7 +132,6 @@ def reassign_missing_experts_inplace(
         missing = sorted(all_logical - set(replica_count.keys()))
         if not missing:
             continue
-        any_reassigned = True
 
         # Build a list of (redundancy, phys_idx) for slots whose donor
         # still has > 1 replica. Sorted from most-redundant down.
@@ -152,6 +160,7 @@ def reassign_missing_experts_inplace(
                 if replica_count.get(old_lid, 0) > 1:
                     layer[global_slot] = logical_id
                     replica_count[old_lid] -= 1
+                    reassignments.add((layer_idx, logical_id))
                     placed = True
                     break
             if not placed:
@@ -161,7 +170,7 @@ def reassign_missing_experts_inplace(
                     f"{logical_id} despite candidate slots remaining."
                 )
 
-    return any_reassigned
+    return reassignments
 
 
 def rebuild_derived_maps_inplace(
