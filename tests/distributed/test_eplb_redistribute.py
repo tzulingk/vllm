@@ -72,10 +72,10 @@ def test_mark_dead_columns_silently_ignores_out_of_range():
 # --------------------- reassign_missing_experts_inplace ------------------ #
 
 
-def test_reassign_no_missing_returns_false():
+def test_reassign_no_missing_returns_empty_set():
     # 1 layer, 4 logical, 4 physical, no redundancy, no dead.
     p2l = torch.tensor([[0, 1, 2, 3]], dtype=torch.int32)
-    assert reassign_missing_experts_inplace(p2l, num_logical=4) is False
+    assert reassign_missing_experts_inplace(p2l, num_logical=4) == set()
     assert p2l.tolist() == [[0, 1, 2, 3]]
 
 
@@ -85,8 +85,10 @@ def test_reassign_missing_uses_redundant_slot():
     # Should reassign onto one of the redundant SURVIVING slots (4 or 5);
     # the -1 slot is "dead" -- it belongs to a dead rank and stays -1.
     p2l = torch.tensor([[0, 1, 2, -1, 0, 1]], dtype=torch.int32)
-    changed = reassign_missing_experts_inplace(p2l, num_logical=4)
-    assert changed is True
+    reassignments = reassign_missing_experts_inplace(p2l, num_logical=4)
+    # The new return type is the set of (layer_idx, new_logical_id) pairs
+    # that need a disk reload. Logical 3 should be there.
+    assert (0, 3) in reassignments
     # Logical 3 now has exactly one replica somewhere alive.
     survivors = [int(x) for x in p2l[0].tolist() if x >= 0]
     assert survivors.count(3) == 1
@@ -191,8 +193,8 @@ def test_end_to_end_one_rank_dies():
     mark_dead_columns_inplace(p2l, dead_ep_ranks={2}, num_local_experts=2)
     # Logical 4 still has a replica at slot 12; logical 5 still has slot 13.
     # So nothing should be missing.
-    changed = reassign_missing_experts_inplace(p2l, num_logical=8)
-    assert changed is False
+    reassignments = reassign_missing_experts_inplace(p2l, num_logical=8)
+    assert reassignments == set()
 
     # Now make rank 2's columns hold *unique* logical IDs so killing them
     # creates missing experts.
@@ -202,8 +204,10 @@ def test_end_to_end_one_rank_dies():
     ).reshape(1, 16)
     mark_dead_columns_inplace(p2l2, dead_ep_ranks={2}, num_local_experts=2)
     # Columns 4..5 (logical 8, 9) become -1; 8, 9 are now missing entirely.
-    changed = reassign_missing_experts_inplace(p2l2, num_logical=10)
-    assert changed is True
+    reassignments = reassign_missing_experts_inplace(p2l2, num_logical=10)
+    # Both 8 and 9 must appear in the reassignment set (at layer 0).
+    assert (0, 8) in reassignments
+    assert (0, 9) in reassignments
     survivors = [int(x) for x in p2l2[0].tolist() if x >= 0]
     assert 8 in survivors
     assert 9 in survivors
