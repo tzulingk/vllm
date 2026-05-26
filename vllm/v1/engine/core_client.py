@@ -34,10 +34,12 @@ from vllm.utils.network_utils import (
 from vllm.v1.engine import (
     EEP_NOTIFICATION_CALL_ID,
     EEPNotificationType,
+    EngineCoreOutput,
     EngineCoreOutputs,
     EngineCoreReadyResponse,
     EngineCoreRequest,
     EngineCoreRequestType,
+    FinishReason,
     PauseMode,
     ReconfigureDistributedRequest,
     ReconfigureRankType,
@@ -1443,15 +1445,25 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         ).start()
 
     def _abort_in_flight_for_dead_engine(self, dead_idx: int) -> None:
-        """Drop client-side bookkeeping for requests on a dead engine.
+        """Synthesize FinishReason.ERROR outputs for requests on a dead engine.
 
-        AsyncLLM keeps these request_ids on its tracker; with the engine
-        gone they will never get a final EngineCoreOutput. We log and
-        forget them here so abort routing doesn't try to send messages to
-        a dead identity. A follow-up should synthesize a
-        ``FinishReason.ERROR`` output so callers see a clean failure
-        rather than a hang -- matching the abort-callback path #38862
-        uses during scale-down.
+        Without this, AsyncLLM keeps the request_ids in its tracker and the
+        HTTP-side curl handler hangs forever waiting for an output the
+        dead engine will never produce. We synthesize an
+        ``EngineCoreOutputs`` containing one
+        ``EngineCoreOutput(finish_reason=FinishReason.ERROR)`` per
+        abandoned request and inject it into ``self.outputs_queue``
+        directly, bypassing the zmq read in ``process_outputs_socket``.
+
+        AsyncLLM's output consumer dequeues these like any other output
+        and routes each request_id's ``FinishReason.ERROR`` back to its
+        HTTP handler, which surfaces a clean 500 to the client (the
+        invariant documented on ``FinishReason.ERROR`` in
+        ``vllm/v1/engine/__init__.py``).
+
+        Called from the per-engine monitor thread (not in an asyncio
+        loop), so the queue ``put_nowait`` is dispatched onto the loop
+        via ``call_soon_threadsafe``.
         """
         if dead_idx >= len(self.core_engines):
             return
@@ -1463,16 +1475,68 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         ]
         if not abandoned:
             return
+
+        # Drop the routing bookkeeping immediately so any subsequent
+        # abort_requests call doesn't try to ship a message to a dead
+        # zmq identity. The synthesized FinishReason.ERROR output below
+        # is what AsyncLLM consumes; reqs_in_flight is purely for our
+        # own routing.
+        for rid in abandoned:
+            self.reqs_in_flight.pop(rid, None)
+
+        synthesized = EngineCoreOutputs(
+            engine_index=dead_idx,
+            outputs=[
+                EngineCoreOutput(
+                    request_id=rid,
+                    new_token_ids=[],
+                    finish_reason=FinishReason.ERROR,
+                )
+                for rid in abandoned
+            ],
+            finished_requests=set(abandoned),
+        )
+
+        # Inject onto outputs_queue. asyncio.Queue.put_nowait is not
+        # thread-safe; we're on the monitor thread, the queue is read
+        # by process_outputs_socket which runs in the API server's
+        # event loop. Look the loop up via the task that runs the
+        # queue-consumer and schedule the put through call_soon_threadsafe.
+        task = self.resources.output_queue_task
+        if task is None or self.outputs_queue is None:
+            # No output task yet (e.g. AsyncLLM hasn't begun consuming);
+            # log and move on. Requests routed to this engine were
+            # rejected from the dispatcher before they could be served,
+            # so this is rare in practice.
+            logger.warning(
+                "FT EP: cannot synthesize ERROR for %d abandoned request(s) "
+                "on dead DP %d -- output queue task not running yet.",
+                len(abandoned),
+                dead_idx,
+            )
+            return
+        try:
+            loop = task.get_loop()
+        except RuntimeError:
+            loop = None
+        if loop is None:
+            logger.warning(
+                "FT EP: cannot resolve event loop to inject ERROR outputs "
+                "for %d abandoned request(s) on dead DP %d.",
+                len(abandoned),
+                dead_idx,
+            )
+            return
+
+        loop.call_soon_threadsafe(self.outputs_queue.put_nowait, synthesized)
         logger.warning(
-            "FT NIXL EP: %d in-flight request(s) routed to dead DP %d "
-            "have no final output yet (no abort callback). Sample ids: %s%s",
+            "FT EP: synthesized FinishReason.ERROR for %d in-flight "
+            "request(s) routed to dead DP %d. Sample ids: %s%s",
             len(abandoned),
             dead_idx,
             abandoned[:5],
             "..." if len(abandoned) > 5 else "",
         )
-        for rid in abandoned:
-            self.reqs_in_flight.pop(rid, None)
 
     def get_core_engine_for_request(self, request: EngineCoreRequest) -> EngineIdentity:
         # Engines are in rank order.
