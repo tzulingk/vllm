@@ -160,35 +160,45 @@ class Worker(WorkerBase):
     def eplb_redistribute_for_dead_peers(self, dead_ep_ranks: list[int]) -> bool:
         """Update EPLB placement after one or more EP peers die.
 
-        Called once per detected mask change via ``collective_rpc``. Each
-        surviving worker runs the same deterministic algorithm against its
-        own ``eplb_state`` (which starts in sync across ranks), so the
-        resulting placement table is consistent across all survivors -- no
-        cross-rank coordination required.
+        Called by ``EngineCore._maybe_check_ft_mask`` via ``collective_rpc``
+        once per detected mask change. Each surviving worker runs the same
+        deterministic algorithm against its own ``eplb_state`` (which
+        starts in sync across ranks), so the resulting placement table is
+        consistent across all survivors -- no cross-rank coordination needed.
 
         Steps:
-        1. ``mark_dead_columns_inplace`` zeros the dead ranks' columns in
-           ``physical_to_logical_map``.
+        1. ``mark_dead_columns_inplace`` marks the dead ranks' columns
+           as ``-1`` in ``physical_to_logical_map``.
         2. ``reassign_missing_experts_inplace`` finds logical experts that
            lost their last replica and reassigns the most-redundant
-           surviving slots to host them.
+           surviving slots to host them. Returns the
+           ``(layer_idx, logical_id)`` pairs that were reassigned --
+           those slots now point at a new logical expert in the
+           placement table but still hold the donor expert's *weights*
+           in their GPU buffer, so the table currently lies.
         3. ``rebuild_derived_maps_inplace`` refreshes
            ``logical_to_physical_map`` + ``logical_replica_count`` from the
            updated ``physical_to_logical_map``.
-
-        Weight transfer (NCCL P2P / disk reload) is NOT wired here yet --
-        this only updates the placement table. Deployments with
-        ``replica_count >= 2`` per expert retain a surviving copy of every
-        logical expert and the placement update alone suffices; the
-        disk-reload follow-up handles the replica-zero case.
+        4. ``reload_experts_from_disk`` reads the reassigned experts'
+           weights from the HF checkpoint and routes them through
+           ``FusedMoE.weight_loader``, which consults the just-updated
+           placement table to write into the correct slot. After this
+           step the table no longer lies; the MoE forward will produce
+           correct output for the reassigned experts.
 
         Returns True if anything was reassigned, False if no changes (e.g.
-        EPLB disabled, or every logical still has a replica).
+        EPLB disabled, or every logical still had a replica). RuntimeError
+        from step 2 (redundancy exhausted) is converted to False after a
+        derived-map rebuild so the engine can degrade gracefully rather
+        than crash.
         """
         from vllm.distributed.elastic_ep.eplb_redistribute import (
             mark_dead_columns_inplace,
             reassign_missing_experts_inplace,
             rebuild_derived_maps_inplace,
+        )
+        from vllm.distributed.elastic_ep.eplb_reload import (
+            reload_experts_from_disk,
         )
 
         if not dead_ep_ranks:
@@ -216,13 +226,86 @@ class Worker(WorkerBase):
 
         mark_dead_columns_inplace(p2l, set(dead_ep_ranks), num_local_experts)
         try:
-            changed = reassign_missing_experts_inplace(p2l, num_logical)
-        except RuntimeError:
-            # EPLB redundancy insufficient -- can't recover placement-only.
+            reassignments = reassign_missing_experts_inplace(p2l, num_logical)
+        except RuntimeError as e:
+            # Redundancy exhausted -- there isn't a donor slot for every
+            # missing logical expert. Rebuild derived maps from what
+            # mark_dead_columns_inplace produced and surface False;
+            # downstream layers fall back to dead-rank tolerance without
+            # full recovery.
+            logger.warning(
+                "FT EP: cannot fully redistribute after dead peers %s: %s. "
+                "Some logical experts will be unreachable until weight "
+                "reload + replica grafting lands.",
+                sorted(dead_ep_ranks),
+                e,
+            )
             rebuild_derived_maps_inplace(p2l, l2p, lrc)
             return False
         rebuild_derived_maps_inplace(p2l, l2p, lrc)
-        return changed
+        if reassignments:
+            # The placement table now points reassigned slots at logical
+            # ids whose weights live elsewhere. Pull those weights from
+            # the HF checkpoint into the donor slot's GPU buffer.
+            model = self.model_runner.model
+            try:
+                loaded_count = reload_experts_from_disk(
+                    model, self.vllm_config, reassignments
+                )
+                logger.info(
+                    "FT EP: disk-reloaded %d expert tensor(s) covering "
+                    "%d (layer, logical-id) pair(s) after dead peers %s.",
+                    loaded_count,
+                    len(reassignments),
+                    sorted(dead_ep_ranks),
+                )
+            except Exception as e:
+                # Reloading a few experts shouldn't be load-bearing for
+                # the rest of the recovery -- the slots we couldn't fill
+                # will produce wrong output for tokens routed to those
+                # experts, but the engine itself stays up. Log loudly so
+                # an operator can investigate.
+                logger.exception(
+                    "FT EP: disk reload failed for %d (layer, logical-id) "
+                    "pair(s) after dead peers %s: %s. Affected experts may "
+                    "produce incorrect output until next reload.",
+                    len(reassignments),
+                    sorted(dead_ep_ranks),
+                    e,
+                )
+        return bool(reassignments)
+
+    def query_nixl_ep_mask(self) -> torch.Tensor | None:
+        """Return the current NIXL EP kernel mask, or None if N/A.
+
+        FT NIXL EP hook called once per forward step from the engine-core
+        (``EngineCore._maybe_check_ft_mask``) via ``collective_rpc``. The
+        engine-core ingests the mask into its ``PeerActiveState``; on
+        change, it aborts the just-executed batch with
+        ``FinishReason.ERROR``.
+
+        Returns a cloned ``[ep_size]`` int CPU tensor (1=dead, 0=alive)
+        so the engine-core sees a stable snapshot independent of the
+        manager's reusable read buffer.
+        """
+        from vllm.distributed import get_ep_group
+        from vllm.distributed.device_communicators.all2all import (
+            NixlEPAll2AllManager,
+        )
+
+        try:
+            ep_group = get_ep_group()
+        except Exception:
+            return None
+        if ep_group is None or getattr(ep_group, "device_communicator", None) is None:
+            return None
+        manager = getattr(ep_group.device_communicator, "all2all_manager", None)
+        if not isinstance(manager, NixlEPAll2AllManager):
+            return None
+        mask = manager.query_mask()
+        if mask is None:
+            return None
+        return mask.clone()
 
     def sleep(self, level: int = 1) -> None:
         from vllm.device_allocator.cumem import CuMemAllocator
@@ -1177,27 +1260,6 @@ class Worker(WorkerBase):
 
     def elastic_ep_execute(self, execute_method: str, *args, **kwargs):
         return self.elastic_ep_executor.execute(execute_method, *args, **kwargs)
-
-    # ft-nixl-ep-kernel-mask-repro: collective_rpc hook for the engine-core
-    # to read this worker's raw NIXL EP kernel mask. The engine-core
-    # gathers masks across DP ranks and crashes if any pair of survivors
-    # disagrees -- isolating the NIXL kernel as the divergent layer.
-    def query_nixl_ep_mask(self) -> torch.Tensor | None:
-        from vllm.distributed import get_ep_group
-        from vllm.distributed.device_communicators.all2all import (
-            NixlEPAll2AllManager,
-        )
-
-        try:
-            ep_group = get_ep_group()
-        except Exception:
-            return None
-        if ep_group is None or getattr(ep_group, "device_communicator", None) is None:
-            return None
-        manager = getattr(ep_group.device_communicator, "all2all_manager", None)
-        if not isinstance(manager, NixlEPAll2AllManager):
-            return None
-        return manager.query_mask()
 
 
 def init_worker_distributed_environment(
