@@ -1,22 +1,27 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Engine-layer mask state for FT NIXL EP / elastic EP.
+"""Engine-layer mask state for fault-tolerant EP.
 
-Modeled on SGLang's ``ElasticEPState``
-(``python/sglang/srt/elastic_ep/elastic_ep.py``): the engine -- not the
-kernel -- owns the set of currently-active EP peers. The kernel-side
-primitive (``NixlEPAll2AllManager.query_mask()``) is read into this
-state each step; ``is_active_equal_last()`` is the diff that triggers
-the request-abort path; ``active_ranks_cpu`` is what an FT-gloo wrapper
-consults to scope a collective to surviving ranks.
+The engine -- not the kernel -- owns the set of currently-active EP peers.
+A kernel-side primitive (e.g. a fault-tolerant all2all backend's
+``query_mask()``) is read into this state each step;
+``is_active_equal_last()`` is the diff that downstream consumers (request
+abort, EPLB redistribute, FT-gloo) react to; ``active_ranks_cpu`` is what
+an FT-gloo wrapper consults to scope a collective to surviving ranks.
 
-Convention: ``active_ranks[i] == 1`` means rank ``i`` is alive. The NIXL
-EP buffer reports the inverse (``1`` = masked / dead); :func:`apply_kernel_mask`
-inverts when ingesting.
+Convention: ``active_ranks[i] == 1`` means rank ``i`` is alive. Kernel
+APIs that report the inverse (``1`` = masked / dead) are inverted at the
+ingestion boundary by :func:`apply_kernel_mask`; kernel APIs that already
+use the alive convention can copy directly into ``active_ranks``.
+
+This module is intentionally agnostic to which FT all2all backend
+provides the mask. Anything that gives us a ``[ep_size]`` int tensor of
+``1=dead, 0=alive`` (or the inverse) plugs in here unchanged; only the
+ingestion adapter needs to know about the specific backend's convention.
 
 This module deliberately stops at "what is the current alive set." It
-does **not** trigger scale-down, EPLB reshuffle, or request abort -- those
-are layered on top in subsequent commits.
+does **not** trigger scale-down, EPLB reshuffle, or request abort --
+those are the responsibility of consumers that read this state.
 """
 
 from __future__ import annotations
@@ -136,14 +141,17 @@ class PeerActiveState:
 
 
 def apply_kernel_mask(state: PeerActiveState, kernel_mask: torch.Tensor) -> None:
-    """Update ``state.active_ranks`` from a NIXL EP kernel mask.
+    """Update ``state.active_ranks`` from an FT-EP kernel-reported mask.
 
     Args:
         state: the :class:`PeerActiveState` to update in place.
-        kernel_mask: ``[ep_size]`` int tensor as returned by
-            ``NixlEPAll2AllManager.query_mask()`` --
-            ``1`` = masked (dead), ``0`` = active. Inverted here to match
-            the ``1 = alive`` convention used internally.
+        kernel_mask: ``[ep_size]`` int tensor reported by the FT all2all
+            backend, using the convention ``1`` = masked (dead),
+            ``0`` = active. Inverted here to match the ``1 = alive``
+            convention used internally. A backend that already reports
+            ``1 = alive`` should copy directly into ``state.active_ranks``
+            and call :meth:`PeerActiveState.sync_active_to_cpu`, bypassing
+            this helper.
 
     Caller is responsible for calling :meth:`PeerActiveState.snapshot_active_to_last`
     *after* the per-step consumers have inspected the diff.

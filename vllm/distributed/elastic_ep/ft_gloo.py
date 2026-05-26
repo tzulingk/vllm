@@ -121,7 +121,29 @@ class FaultTolerantGlooGroup:
         return self._current_active_set
 
     def _allocate_rebuild_port(self, generation: int, am_master: bool) -> int:
-        """Master picks a fresh port and publishes it; non-master reads it."""
+        """Rendezvous on the TCP port the next gloo subgroup will bind to.
+
+        The new gloo subgroup needs a port the surviving ranks agree on.
+        The lowest-rank survivor (the "master") picks an open port and
+        publishes it to the parent TCP store; the other survivors block
+        on a ``get`` of the same key until the master writes it.
+
+        Args:
+            generation: Monotonically increasing rebuild count. Used to
+                construct a per-generation key ``ft_gloo_port_<gen>`` so
+                a later rebuild can't race with an earlier rebuild's
+                port and pick up a stale value.
+            am_master: ``True`` if this rank is the rendezvous master
+                (lowest-ranked survivor in the new active set).
+                Exactly one rank in the rebuild has ``am_master=True``.
+
+        Returns:
+            int: TCP port on ``self._master_addr`` to bind the new gloo
+            subgroup to. For the master this is the newly-picked open
+            port (already published to the store); for non-masters it
+            is the port read from the store, which blocks until the
+            master publishes.
+        """
         key = f"ft_gloo_port_{generation}"
         if am_master:
             port = _pick_open_port()
