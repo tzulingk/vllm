@@ -50,38 +50,45 @@ def _run_ar(
     tensor_cpu[2][dp_rank] = 1 if should_ubatch else 0
     tensor_cpu[3][dp_rank] = cudagraph_mode
     tensor = tensor_cpu.to(device, non_blocking=True)
-    # FT NIXL EP: when ``enable_elastic_ep`` is set, prefer the
-    # fault-tolerant gloo wrapper so a dead DP peer doesn't kill the
-    # surviving workers in the per-step DP coordination collective.
-    # Two practical issues drive the layered fallback below:
+    # Route the per-step DP coordination collective through the FT
+    # helper so a dead DP peer doesn't take down this worker. The
+    # helper uses the FT-gloo subgroup when the FT singletons are
+    # initialized in this process, and falls back to a direct
+    # ``dist.all_reduce(group=group)`` otherwise.
     #
-    # 1. ``DPFTGlooManager`` / ``PeerActiveStateManager`` are
-    #    per-process singletons initialized in the engine-core actor,
-    #    not in its child ``RayWorkerProc``. The collective itself runs
-    #    in the worker, where ``ft_or_raw_all_reduce`` therefore falls
-    #    through to the raw ``dist.all_reduce`` path. Initializing the
-    #    singletons in the worker is a separate follow-up; for the
-    #    minimum-downtime demo we accept that the worker uses raw gloo.
-    # 2. Raw gloo raises ``Connection closed by peer`` when one rank
-    #    is dead, which today propagates up and kills the worker (and
-    #    cascades into engine death). Catch that here and proceed with
-    #    only this rank's contribution. Downstream logic degrades
-    #    safely: dead-rank slots stay 0, so ``_post_process_ubatch``
-    #    sees a non-all-1 vote (ubatch disabled), and
-    #    ``_post_process_cudagraph_mode`` returns 0 (cudagraph
-    #    disabled for the step). The DP padding result reflects only
-    #    the survivors, which is the desired behavior.
+    # Either path can raise when a peer dies. We catch and return the
+    # tensor as-is -- only this rank's slot has a non-zero value, every
+    # other slot stays at the initial 0. That partial tensor is safe to
+    # consume:
+    #   - _post_process_ubatch checks ``torch.all(tensor[2] == 1)``;
+    #     dead-rank slot is 0, vote is not unanimous, ubatching is
+    #     disabled for this step.
+    #   - _post_process_cudagraph_mode takes ``tensor[3, :].min()``;
+    #     dead-rank slot is 0 (NONE), so cudagraph is disabled for this
+    #     step.
+    #   - _post_process_dp_padding takes ``tensor[1, :].max()``, which
+    #     correctly sizes to the surviving ranks only.
+    # The model itself is unaffected; ubatching + cudagraph come back
+    # on subsequent steps once the kernel-level NIXL EP mask catches up
+    # and ft_or_raw_all_reduce starts succeeding on the trimmed group.
     if tensor.device.type == "cpu":
         from vllm.distributed.elastic_ep.ft_gloo import ft_or_raw_all_reduce
 
         try:
             ft_or_raw_all_reduce(tensor, dist.ReduceOp.SUM, group)
         except (RuntimeError, ValueError) as e:
-            # Look at the full exception chain because torch's c10d_logger
-            # wrapper re-raises a ValueError ("Process group is not initialized
-            # in the world group map") while formatting the original gloo
-            # RuntimeError, and we want to recognize both shapes as the same
-            # "dead-peer" condition.
+            # A dead peer can surface here as either:
+            #   - RuntimeError("Connection closed by peer ...") from gloo
+            #     (the original failure), or
+            #   - ValueError("Process group is not initialized in the
+            #     world group map") wrapped by torch's c10d_logger when it
+            #     tries to format the original failure for its log line.
+            # The wrapping puts the original on ``__context__``, so the
+            # caller sees the ValueError and the gloo RuntimeError is one
+            # link down the chain. Walk the chain (capped at 5 to avoid
+            # weird pathological cycles) and accept either shape as
+            # "dead-peer; degrade gracefully." Any other exception means
+            # something we didn't anticipate -- re-raise.
             messages: list[str] = []
             cur: BaseException | None = e
             while cur is not None and len(messages) < 5:
@@ -95,7 +102,7 @@ def _run_ar(
             )
             if is_dead_peer:
                 logger.warning_once(
-                    "FT NIXL EP: DP _run_ar all_reduce failed (%s: %s); "
+                    "FT EP: DP _run_ar all_reduce failed (%s: %s); "
                     "proceeding with local-only contribution. Ubatching "
                     "and CUDA-graph will be disabled this step.",
                     type(e).__name__,

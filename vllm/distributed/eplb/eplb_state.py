@@ -826,10 +826,19 @@ class EplbState:
         cpu_group = getattr(parallel_state, "cpu_group", None)
         if cpu_group is not None and cpu_group.size() > 1:
             flag = torch.tensor((has_result,), dtype=torch.int32, device="cpu")
-            # FT NIXL EP: route the small flag check through the FT gloo
-            # wrapper when the DP FT singletons are initialized; falls back
-            # to raw all_reduce(group=cpu_group) otherwise. Lazy import to
-            # avoid a config-time circular pull.
+            # Use the FT gloo helper instead of dist.all_reduce directly so
+            # this collective tolerates a dead peer: when FT is configured,
+            # the helper bounds the call with a timeout and rebuilds the
+            # gloo subgroup over the survivors; the dead peer's
+            # contribution is missing, so the SUM is short, and the
+            # equality check below correctly returns False ("not all ranks
+            # ready yet") instead of raising. When FT is not configured
+            # (vanilla vLLM), the helper falls through to a direct
+            # dist.all_reduce on `cpu_group` -- zero overhead, behavior
+            # identical to before. Local import: ft_gloo pulls in
+            # torch.distributed at module load and eplb_state is imported
+            # early enough that a module-level import here can deadlock
+            # against config init.
             from vllm.distributed.elastic_ep.ft_gloo import ft_or_raw_all_reduce
 
             ft_or_raw_all_reduce(flag, ReduceOp.SUM, cpu_group)
