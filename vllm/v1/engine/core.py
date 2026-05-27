@@ -454,6 +454,9 @@ class EngineCore:
         # FT NIXL EP: end-of-forward mask check. No-op when the FT
         # singletons aren't initialized (non-NIXL-EP deployments).
         self._maybe_check_ft_mask()
+        # FT TP NCCL: poll the per-TP-group active mask too. No-op when
+        # VLLM_FT_TP_NCCL=0 or the FT TP PG hasn't been initialized.
+        self._maybe_check_ft_tp_mask()
         self._attach_degraded_peers(engine_core_outputs)
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
@@ -461,22 +464,46 @@ class EngineCore:
     def _attach_degraded_peers(
         self, engine_core_outputs: dict[int, "EngineCoreOutputs"]
     ) -> None:
-        """Stamp the current fully-dead-DP-rank set on every EngineCoreOutputs.
+        """Stamp degraded DP ranks on every EngineCoreOutputs.
 
-        Source: ``PeerActiveStateManager.instance().dp_dead_ranks()`` --
-        a DP rank is reported "degraded" only when **all** of its TP
-        siblings are dead (AND-reduce). DP ranks with one or more live
-        TP siblings still route correctly via NIXL EP's per-slot mask,
-        so the AsyncLLM dispatcher should NOT skip them.
+        Two sources unioned together:
+
+        1. **Fully-dead DP ranks** -- ``PeerActiveStateManager.dp_dead_ranks()``.
+           AND-reduce: a DP rank counts here only when **all** of its TP
+           siblings are dead. DP ranks with one or more live TP siblings
+           still route correctly via NIXL EP's per-slot mask, so AsyncLLM
+           keeps them in the EP all-to-all -- but obviously stops accepting
+           new requests from them.
+
+        2. **TP-degraded DP ranks** (``self._ft_tp_degraded`` for this
+           engine). OR-reduce within a TP group: even one dead TP sibling
+           is enough to flag the DP rank as "don't accept new requests"
+           because the surviving TP rank's dense compute is wrong without
+           its partner's half of the weights. The surviving rank continues
+           stepping so the EP all-to-all stays routable for *other* DP
+           ranks; only AsyncLLM intake routing is affected.
+
+        AsyncLLM dispatcher reads ``EngineCoreOutputs.degraded_peers`` and
+        skips listed ranks for new requests; the union here is the only
+        thing that needs to change.
 
         No-op when the FT singletons aren't initialized.
         """
         from vllm.distributed.elastic_ep.peer_state import PeerActiveStateManager
 
-        state = PeerActiveStateManager.instance()
-        if state is None or not engine_core_outputs:
+        if not engine_core_outputs:
             return
-        dead = state.dp_dead_ranks()
+
+        state = PeerActiveStateManager.instance()
+        dead: set[int] = state.dp_dead_ranks() if state is not None else set()
+
+        # Add this DP rank if FT TP detected a sibling death this run.
+        # getattr(...) so non-DP engines (no ``dp_rank``) don't AttributeError.
+        if getattr(self, "_ft_tp_degraded", False):
+            dp_rank = getattr(self, "dp_rank", None)
+            if dp_rank is not None:
+                dead = dead | {dp_rank}
+
         if not dead:
             return
         for eco in engine_core_outputs.values():
@@ -562,6 +589,65 @@ class EngineCore:
             )
 
         state.snapshot_active_to_last()
+
+    def _maybe_check_ft_tp_mask(self) -> None:
+        """Poll the FT NCCL TP mask once per step; flip the degraded flag.
+
+        Called once per forward pass from ``step`` / ``step_with_batch_queue``.
+        Each TP worker reports its ``FtTpProcessGroup.last_active_mask``;
+        if any entry is ``False``, this DP rank has lost a TP sibling and is
+        running degraded dense compute.
+
+        Sets ``self._ft_tp_degraded = True`` on the death transition.
+        ``_attach_degraded_peers`` picks this up and stamps this engine's DP
+        rank into ``EngineCoreOutputs.degraded_peers``, which the AsyncLLM
+        dispatcher already reads to skip dead/degraded DP ranks for new
+        requests.  The surviving TP rank continues stepping (dummy dense
+        compute) so the EP all-to-all stays routable for other DP ranks.
+
+        Sticky once flipped: doesn't re-poll every step.  Recovery (when a
+        TP sibling rejoins, e.g. via FT NCCL ``ncclCommGrow``) would clear
+        this flag -- not implemented yet, recovery isn't supported on the
+        worker side either.
+
+        Early-exit (FT TP not enabled, masks not yet populated) keeps non-FT
+        deployments paying zero cost beyond a class-attr check.
+        """
+        if not hasattr(self, "_ft_tp_degraded"):
+            self._ft_tp_degraded = False
+        if self._ft_tp_degraded:
+            return
+
+        try:
+            masks: list[Any] = self.collective_rpc("query_ft_tp_mask")
+        except Exception as e:
+            logger.warning(
+                "FT TP: collective_rpc(query_ft_tp_mask) raised %s; "
+                "skipping mask check this step.",
+                e,
+            )
+            return
+
+        first_dead_mask: list[bool] | None = None
+        for m in masks:
+            if m is None:
+                continue
+            if not all(m):
+                first_dead_mask = list(m)
+                break
+        if first_dead_mask is None:
+            return
+
+        self._ft_tp_degraded = True
+        logger.warning(
+            "FT TP: TP-sibling death detected at engine-core step boundary "
+            "(local TP mask = %s; True=alive). This DP rank is now "
+            "TP-degraded -- dense compute is unreliable but EP all-to-all "
+            "will continue so other DP ranks can still route experts here. "
+            "Flagging in EngineCoreOutputs.degraded_peers so the dispatcher "
+            "stops routing new requests to this DP rank.",
+            first_dead_mask,
+        )
 
     def post_step(self, model_executed: bool) -> None:
         # When using async scheduling we can't get draft token ids in advance,
@@ -694,6 +780,7 @@ class EngineCore:
         # max_concurrent_batches > 1 (pp > 1 or async scheduling), so without
         # this hook the FT mask poll never runs in those configurations.
         self._maybe_check_ft_mask()
+        self._maybe_check_ft_tp_mask()
         self._attach_degraded_peers(engine_core_outputs)
 
         return engine_core_outputs, model_executed

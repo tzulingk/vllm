@@ -10,7 +10,21 @@ from .parallel_state import get_tp_group
 
 
 def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
-    """All-reduce the input tensor across model parallel group."""
+    """All-reduce the input tensor across model parallel group.
+
+    Branches to the FT NCCL path when ``VLLM_FT_TP_NCCL=1`` and
+    :func:`vllm.distributed.ft_tp.init_ft_tp` has run on this worker.  The FT
+    path keeps the TP comm at constant size N even when a peer dies (the FT
+    LSA kernel masks dead slots in place), so captured CUDA graphs and
+    torch.compile artifacts stay valid across a TP-sibling failure -- but the
+    FT call itself is not torch.compile-captured today (see
+    ``ft_tp.py`` docstring).
+    """
+    from .ft_tp import get_ft_tp
+
+    ft = get_ft_tp()
+    if ft is not None:
+        return ft.all_reduce(input_)
     return get_tp_group().all_reduce(input_)
 
 

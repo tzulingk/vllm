@@ -307,6 +307,25 @@ class Worker(WorkerBase):
             return None
         return mask.clone()
 
+    def query_ft_tp_mask(self) -> list[bool] | None:
+        """Return this worker's FT NCCL TP active mask, or None if N/A.
+
+        FT TP hook called once per forward step from the engine-core
+        (``EngineCore._maybe_check_ft_tp_mask``) via ``collective_rpc``.
+        The returned mask is ``FtTpProcessGroup.last_active_mask`` -- a list
+        of bools of length ``tp_size`` populated by the most recent FT
+        all_reduce (entry True iff that TP rank's data arrived in time).
+
+        Returns None when FT TP is disabled (no ``VLLM_FT_TP_NCCL=1``) or
+        when the singleton has not yet been initialized.
+        """
+        from vllm.distributed.ft_tp import get_ft_tp
+
+        ft = get_ft_tp()
+        if ft is None:
+            return None
+        return ft.last_active_mask
+
     def sleep(self, level: int = 1) -> None:
         from vllm.device_allocator.cumem import CuMemAllocator
 
@@ -1298,6 +1317,22 @@ def init_worker_distributed_environment(
         parallel_config.prefill_context_parallel_size,
         parallel_config.decode_context_parallel_size,
     )
+
+    # FT TP NCCL: optional fault-tolerant TP all_reduce backed by FT NCCL's
+    # LSA kernel.  Enabled by VLLM_FT_TP_NCCL=1.  Lives in its own subgroup
+    # so the default TP path (NCCL) and the FT path coexist; only
+    # tensor_model_parallel_all_reduce() routes through FT when enabled.
+    # See vllm/distributed/ft_tp.py for the cast-pair and torch.compile caveats.
+    from vllm.distributed.ft_tp import init_ft_tp, is_ft_tp_enabled
+
+    if is_ft_tp_enabled():
+        # COLLECTIVE: every default-group rank must call init_ft_tp with
+        # matching args so the internal dist.new_group loop is consistent.
+        init_ft_tp(
+            world_size=parallel_config.world_size,
+            tp_size=parallel_config.tensor_parallel_size,
+            my_rank=rank,
+        )
 
     # Init ec connector here before KV caches init
     # NOTE: We do not init KV caches for Encoder-only instance in EPD disagg mode
