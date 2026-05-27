@@ -510,24 +510,27 @@ class EngineCore:
             eco.degraded_peers = dead
 
     def _maybe_check_ft_mask(self) -> None:
-        """Poll the NIXL EP kernel mask and abort the batch on change.
+        """Poll the NIXL EP kernel mask and keep PeerActiveState in sync.
 
-        Called once per forward pass from ``step``. Workflow:
+        Called once per forward pass from ``step``.  This was historically
+        the trigger for in-flight request aborts and EPLB redistribute,
+        but those moved to ``notify_engine_death`` (driven by the trusted
+        Ray-actor-death signal from the API server).  The kernel-mask path
+        was prone to false positives from timeout cascades, which made
+        per-engine redistribute decisions diverge across engines and broke
+        the placement-table consistency EPLB needs.
 
-        1. ``collective_rpc("query_nixl_ep_mask")`` -- workers return the
-           NIXL EP buffer's mask (``1`` = dead). For TP > 1 every worker
-           reads the same class-level buffer, so any non-None result is
-           authoritative.
-        2. ``apply_kernel_mask`` ingests it into ``PeerActiveState``
-           (convention is inverted; state stores ``1`` = alive).
-        3. If ``is_active_equal_last() == False``, the just-executed batch
-           crossed a broken EP all-to-all -- finish every still-running
-           request with ``RequestStatus.FINISHED_ERROR`` and snapshot the
-           new mask.
+        After that move, this function's only remaining job is to keep
+        ``PeerActiveState.active_ranks`` aligned with the kernel's view
+        for diagnostics / debug instrumentation -- the kernel mask is now
+        treated as a best-effort hint, not authority.  No behavior is
+        driven from here anymore.
 
-        Early-exit (no FT, no NIXL EP backend, mask not yet readable)
-        keeps non-FT deployments paying zero cost beyond the singleton
-        ``None`` check.
+        The confirmed-dead set is unioned into the mask before applying,
+        so a rank that ``notify_engine_death`` marked dead stays dead in
+        PeerActiveState even if the kernel mask happens to claim it's
+        alive (e.g., between consecutive cascade events on a different
+        rank).
         """
         from vllm.distributed.elastic_ep.peer_state import (
             PeerActiveStateManager,
@@ -556,41 +559,22 @@ class EngineCore:
 
         self._ft_ep_debug_engine_mask(masks)
 
+        # Union with confirmed_dead so a notify_engine_death-acknowledged
+        # rank cannot be un-flagged by a transient kernel-mask blip.
+        # Kernel convention: 1 = dead.  EP slot for DP rank d, TP rank t is
+        # d * tp_size + t.
+        confirmed = getattr(self, "_confirmed_dead_dp_ranks", None)
+        if confirmed:
+            tp_size = state.tp_size
+            for dp in confirmed:
+                for t in range(tp_size):
+                    kernel_mask[dp * tp_size + t] = 1
+
+        # Apply to PeerActiveState as a *hint*.  No redistribute, no abort,
+        # no last_active_ranks snapshot from here -- those would be
+        # triggered if the cascade flagged a falsely-dead rank, the very
+        # behavior we just moved to notify_engine_death to avoid.
         apply_kernel_mask(state, kernel_mask)
-        if state.is_active_equal_last():
-            return
-
-        newly_dead = state.newly_dead_peers()
-        # `running` lives on the concrete Scheduler, not SchedulerInterface;
-        # gracefully handle alternative scheduler implementations.
-        running = getattr(self.scheduler, "running", [])
-        running_req_ids = [r.request_id for r in running]
-        logger.warning(
-            "FT NIXL EP: newly-dead EP peers %s detected at engine-core step "
-            "boundary; aborting %d running request(s) with FinishReason.ERROR.",
-            newly_dead,
-            len(running_req_ids),
-        )
-        if running_req_ids:
-            self.scheduler.finish_requests(
-                running_req_ids, RequestStatus.FINISHED_ERROR
-            )
-
-        # Tell every surviving worker to update its EPLB placement table.
-        # No cross-worker coordination required -- each worker runs the
-        # same deterministic algorithm against its own (in-sync) eplb_state.
-        # Best-effort: failures are logged but don't tear down the engine.
-        try:
-            self.collective_rpc("eplb_redistribute_for_dead_peers", args=(newly_dead,))
-        except Exception as e:
-            logger.warning(
-                "FT NIXL EP: eplb_redistribute_for_dead_peers RPC failed: %s "
-                "(placement table not updated; subsequent forward passes "
-                "may route to dead slots).",
-                e,
-            )
-
-        state.snapshot_active_to_last()
 
     def _maybe_check_ft_tp_mask(self) -> None:
         """Poll the FT NCCL TP mask once per step; flip the degraded flag.
@@ -664,24 +648,94 @@ class EngineCore:
 
         Distinct from the per-step kernel-mask path
         (``_maybe_check_ft_mask``), which is fast but can have false
-        positives from timeout cascades.  Today this handler only records
-        receipt and logs; a follow-up commit will switch the redistribute
-        trigger from the kernel-mask path to this confirmed set.
+        positives from timeout cascades.  This handler is the *authoritative*
+        trigger for behavior changes (abort running requests, redistribute
+        experts); ``_maybe_check_ft_mask`` only updates PeerActiveState as a
+        best-effort hint after this commit.
 
         Idempotent.  Returns nothing (Ray actor methods return None by
         default when invoked via ``.remote(...)``).
         """
+        from vllm.distributed.elastic_ep.peer_state import PeerActiveStateManager
+
         if not hasattr(self, "_confirmed_dead_dp_ranks"):
             self._confirmed_dead_dp_ranks: set[int] = set()
         if dead_dp_rank in self._confirmed_dead_dp_ranks:
             return
         self._confirmed_dead_dp_ranks.add(dead_dp_rank)
+
+        state = PeerActiveStateManager.instance()
+        if state is None:
+            # No FT EP backend on this engine; nothing to drive.  Still
+            # record in the confirmed set so the dispatcher's union with
+            # this engine's degraded_peers is correct.
+            logger.warning(
+                "FT EP: confirmed death of DP rank %d; PeerActiveState not "
+                "initialized on this engine (non-FT-EP backend?), skipping "
+                "state update and redistribute.",
+                dead_dp_rank,
+            )
+            return
+
+        # Translate DP-rank death to EP-slot death.  For TP=1 this is one
+        # slot; for TP>1 it's every EP slot in the DP rank's TP group.
+        tp_size = state.tp_size
+        newly_dead_ep_slots = [dead_dp_rank * tp_size + t for t in range(tp_size)]
+
+        # Update active_ranks in place.  Any bits that were already 0
+        # (set by _maybe_check_ft_mask's pre-emptive hint, or by a prior
+        # notify call we somehow missed) are left as-is.
+        flipped = False
+        for ep_slot in newly_dead_ep_slots:
+            if state.active_ranks[ep_slot].item() != 0:
+                state.active_ranks[ep_slot] = 0
+                flipped = True
+        state.sync_active_to_cpu()
+
+        # Abort the engine's currently-running batch.  Their last forward
+        # pass crossed an EP all-to-all whose mask just changed -- any
+        # tokens generated this step may have routed through the dead
+        # rank's expert slots and are unreliable.  Better to surface a
+        # clean error to clients than emit a garbled token.
+        running = getattr(self.scheduler, "running", [])
+        running_req_ids = [r.request_id for r in running]
         logger.warning(
-            "FT EP: engine received coordinator-confirmed death notice for "
-            "DP rank %d; confirmed_dead now %s.",
+            "FT EP: confirmed death of DP rank %d (EP slots %s); "
+            "aborting %d running request(s) with FinishReason.ERROR and "
+            "redistributing experts.",
             dead_dp_rank,
-            sorted(self._confirmed_dead_dp_ranks),
+            newly_dead_ep_slots,
+            len(running_req_ids),
         )
+        if running_req_ids:
+            self.scheduler.finish_requests(
+                running_req_ids, RequestStatus.FINISHED_ERROR
+            )
+
+        if flipped:
+            # Tell every surviving worker to update its EPLB placement
+            # table.  Deterministic: every engine that received this
+            # notice runs the same algorithm against the same input set,
+            # so all placement tables stay in lockstep -- the property
+            # the kernel-mask-driven path could not guarantee.
+            try:
+                self.collective_rpc(
+                    "eplb_redistribute_for_dead_peers",
+                    args=(newly_dead_ep_slots,),
+                )
+            except Exception as e:
+                logger.warning(
+                    "FT EP: eplb_redistribute_for_dead_peers RPC failed "
+                    "after confirmed death of DP rank %d: %s "
+                    "(placement table not updated; subsequent forward "
+                    "passes may route to dead slots until next death).",
+                    dead_dp_rank,
+                    e,
+                )
+
+        # Mark these bits as "observed dead" so _maybe_check_ft_mask
+        # doesn't re-trigger on them.
+        state.snapshot_active_to_last()
 
     # ------------------------------------------------------------------
     # FT EP cascade-debug instrumentation
