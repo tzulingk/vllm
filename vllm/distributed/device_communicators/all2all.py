@@ -415,6 +415,17 @@ class NixlEPAll2AllManager(All2AllManagerBase):
         masked (dead) and `0` means active. Returns None and warns once if
         the buffer has not yet been initialized (no dispatch / combine has
         run on this manager).
+
+        Implementation note: the NIXL EP ``Buffer`` is provisioned with
+        ``num_ranks = VLLM_NIXL_EP_MAX_NUM_RANKS`` (default 32) -- larger
+        than the currently-active EP world size so elastic scale-up can
+        attach without a buffer rebuild. ``query_mask_buffer`` writes
+        ``buffer.group_size`` entries, **not** ``cpu_group.size()``
+        entries; passing a smaller tensor silently leaves the bits we
+        care about unwritten and the function appears to "return all
+        zeros." So we read into a ``group_size``-wide scratch tensor
+        and slice the meaningful prefix down to the currently-connected
+        rank count before returning.
         """
         if NixlEPAll2AllManager._buffer is None:
             logger.warning_once(
@@ -423,13 +434,23 @@ class NixlEPAll2AllManager(All2AllManagerBase):
                 "forward must run before a mask is available."
             )
             return None
-        _, ep_size = NixlEPAll2AllManager._buffer
-        if self._mask_status_buf is None or self._mask_status_buf.numel() != ep_size:
+        buffer, ep_size = NixlEPAll2AllManager._buffer
+        # Allocate to the buffer's full group_size (not the active EP world
+        # size). Slots beyond the connected rank count contain ``-1``
+        # sentinels which we discard in the slice below.
+        full_size = int(getattr(buffer, "group_size", ep_size))
+        if full_size <= 0:
+            full_size = ep_size
+        if self._mask_status_buf is None or self._mask_status_buf.numel() != full_size:
             self._mask_status_buf = torch.zeros(
-                ep_size, dtype=torch.int32, device="cpu"
+                full_size, dtype=torch.int32, device="cpu"
             )
-        NixlEPAll2AllManager._buffer[0].query_mask_buffer(self._mask_status_buf)
-        return self._mask_status_buf
+        buffer.query_mask_buffer(self._mask_status_buf)
+        # Trim to the active EP world size; slots `ep_size..full_size-1` are
+        # `-1` sentinels for unconnected ranks. ``.contiguous()`` so the
+        # downstream ``apply_kernel_mask`` ``copy_`` doesn't fault on a
+        # non-contiguous view.
+        return self._mask_status_buf[:ep_size].contiguous()
 
     def _update_buffer(self):
         assert NixlEPAll2AllManager._buffer is not None
