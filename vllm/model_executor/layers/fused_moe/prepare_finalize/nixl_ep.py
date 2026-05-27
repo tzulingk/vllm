@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
+import time
 from collections.abc import Callable
 
 import nixl_ep
@@ -270,6 +272,7 @@ class NixlEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             return_recv_hook=True,
         )
         self.handles[a2a_idx] = handle
+        self._ft_ep_debug_after("dispatch")
 
         return (
             hook,
@@ -363,6 +366,7 @@ class NixlEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             return_recv_hook=do_recv_hook,
             out=output,
         )
+        self._ft_ep_debug_after("combine")
 
         return recv_hook, lambda: None
 
@@ -402,4 +406,81 @@ class NixlEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             apply_router_weight_on_input,
             weight_and_reduce_impl,
             do_async=False,
+        )
+
+    # ------------------------------------------------------------------
+    # FT EP cascade-debug instrumentation
+    # ------------------------------------------------------------------
+    # Class-level state so the per-call hook is cheap and bounded.  Reads
+    # the NIXL EP buffer's mask right after dispatch / combine and logs on
+    # *every change* (steady-state all-zeros is silent after the first hit).
+    # Cap on total emitted logs prevents runaway growth if something keeps
+    # flipping the mask.  Gated by VLLM_FT_EP_DEBUG=1 -- the env-var lookup
+    # is cached on the class so the hot path stays a single attribute read
+    # when disabled.
+    _FT_EP_DEBUG_MAX_LOGS = 200
+    _ft_ep_debug_enabled_cached: bool | None = None
+    _ft_ep_debug_n_logged: int = 0
+    _ft_ep_debug_last_mask: tuple[int, ...] = ()
+    _ft_ep_debug_t0_ns: int | None = None
+    _ft_ep_debug_mask_buf: torch.Tensor | None = None
+
+    @classmethod
+    def _ft_ep_debug_is_enabled(cls) -> bool:
+        if cls._ft_ep_debug_enabled_cached is None:
+            cls._ft_ep_debug_enabled_cached = (
+                os.environ.get("VLLM_FT_EP_DEBUG", "0") == "1"
+            )
+        return cls._ft_ep_debug_enabled_cached
+
+    def _ft_ep_debug_after(self, label: str) -> None:
+        """Snapshot the NIXL EP kernel mask after a dispatch / combine call.
+
+        Logs only when the mask snapshot CHANGES since the last call, with a
+        millisecond-resolution timestamp relative to first invocation so the
+        cascade trajectory (initial flip + any follow-on cascades) is easy
+        to correlate across workers.  Capped at ``_FT_EP_DEBUG_MAX_LOGS``
+        emissions per process so a runaway flip-flop doesn't drown the log.
+        """
+        cls = type(self)
+        if not cls._ft_ep_debug_is_enabled():
+            return
+        if cls._ft_ep_debug_n_logged >= cls._FT_EP_DEBUG_MAX_LOGS:
+            return
+        qmb = getattr(self.buffer, "query_mask_buffer", None)
+        if qmb is None:
+            return
+        width = getattr(self.buffer, "group_size", 0)
+        if not isinstance(width, int) or width <= 0:
+            return
+        buf = cls._ft_ep_debug_mask_buf
+        if buf is None or buf.numel() != width:
+            buf = torch.zeros(width, dtype=torch.int32, device="cpu")
+            cls._ft_ep_debug_mask_buf = buf
+        try:
+            qmb(buf)
+        except Exception as e:
+            logger.warning(
+                "FT EP DEBUG: query_mask_buffer raised %s; disabling further "
+                "debug reads for this process.",
+                e,
+            )
+            cls._ft_ep_debug_enabled_cached = False
+            return
+        snapshot = tuple(int(x) for x in buf.tolist())
+        if snapshot == cls._ft_ep_debug_last_mask:
+            return  # no change; stay quiet
+        cls._ft_ep_debug_last_mask = snapshot
+        if cls._ft_ep_debug_t0_ns is None:
+            cls._ft_ep_debug_t0_ns = time.monotonic_ns()
+        elapsed_ms = (time.monotonic_ns() - cls._ft_ep_debug_t0_ns) // 1_000_000
+        cls._ft_ep_debug_n_logged += 1
+        logger.warning(
+            "FT EP DEBUG #%d t=+%dms after %s: mask=%s "
+            "(1=dead, 0=alive, -1=unused slot). buffer.group_size=%d",
+            cls._ft_ep_debug_n_logged,
+            elapsed_ms,
+            label,
+            list(snapshot),
+            width,
         )

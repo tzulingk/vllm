@@ -554,6 +554,8 @@ class EngineCore:
         if kernel_mask is None:
             return
 
+        self._ft_ep_debug_engine_mask(masks)
+
         apply_kernel_mask(state, kernel_mask)
         if state.is_active_equal_last():
             return
@@ -679,6 +681,77 @@ class EngineCore:
             "DP rank %d; confirmed_dead now %s.",
             dead_dp_rank,
             sorted(self._confirmed_dead_dp_ranks),
+        )
+
+    # ------------------------------------------------------------------
+    # FT EP cascade-debug instrumentation
+    # ------------------------------------------------------------------
+    # Engine-side counterpart to the per-call kernel-mask snapshot logged
+    # by NixlEPPrepareAndFinalize._ft_ep_debug_after.  Lets us correlate
+    # what THIS engine's _maybe_check_ft_mask consumed at each step with
+    # the per-worker kernel-mask snapshots.  Gated by VLLM_FT_EP_DEBUG=1;
+    # logs only when the mask returned by collective_rpc changes since
+    # the previous step.  Capped to bound log growth.
+
+    _FT_EP_DEBUG_ENGINE_MAX_LOGS: int = 50
+    _ft_ep_debug_engine_enabled_cached: bool | None = None
+
+    def _ft_ep_debug_engine_mask(self, masks: list[Any]) -> None:
+        """Log this engine's view of the kernel mask once per step on change."""
+        cls = type(self)
+        if cls._ft_ep_debug_engine_enabled_cached is None:
+            cls._ft_ep_debug_engine_enabled_cached = (
+                os.environ.get("VLLM_FT_EP_DEBUG", "0") == "1"
+            )
+        if not cls._ft_ep_debug_engine_enabled_cached:
+            return
+
+        if not hasattr(self, "_ft_ep_dbg_engine_n"):
+            self._ft_ep_dbg_engine_n = 0
+            self._ft_ep_dbg_engine_last: tuple[int, ...] = ()
+            self._ft_ep_dbg_engine_t0_ns: int | None = None
+
+        if self._ft_ep_dbg_engine_n >= self._FT_EP_DEBUG_ENGINE_MAX_LOGS:
+            return
+
+        # Project each worker's mask (a torch.Tensor or None) into a tuple
+        # so we can detect divergence between workers and log every mask
+        # received -- not just the "first non-None" the engine actually
+        # uses for state updates.
+        per_worker: list[tuple[int, ...] | None] = []
+        for m in masks:
+            if m is None:
+                per_worker.append(None)
+            else:
+                try:
+                    per_worker.append(tuple(int(x) for x in m.tolist()))
+                except Exception:
+                    per_worker.append(None)
+
+        # Aggregate signature = the consumed mask (first non-None).
+        primary = next((m for m in per_worker if m is not None), None)
+        if primary is None:
+            return
+        if primary == self._ft_ep_dbg_engine_last:
+            return
+        self._ft_ep_dbg_engine_last = primary
+
+        if self._ft_ep_dbg_engine_t0_ns is None:
+            self._ft_ep_dbg_engine_t0_ns = time.monotonic_ns()
+        elapsed_ms = (time.monotonic_ns() - self._ft_ep_dbg_engine_t0_ns) // 1_000_000
+
+        self._ft_ep_dbg_engine_n += 1
+        # Show divergence across workers explicitly so we can answer
+        # "did all TP workers report the same mask, or did they disagree?"
+        per_worker_repr = [list(m) if m is not None else None for m in per_worker]
+        logger.warning(
+            "FT EP DEBUG (engine) #%d t=+%dms: primary=%s per_worker=%s "
+            "(1=dead, 0=alive). DP-confirmed-dead set=%s.",
+            self._ft_ep_dbg_engine_n,
+            elapsed_ms,
+            list(primary),
+            per_worker_repr,
+            sorted(getattr(self, "_confirmed_dead_dp_ranks", set())),
         )
 
     def post_step(self, model_executed: bool) -> None:
