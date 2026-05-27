@@ -689,6 +689,13 @@ class EngineCore:
             future = self.model_executor.sample_tokens(grammar_output, non_block=True)
             batch_queue.appendleft((future, deferred_scheduler_output, exec_future))
 
+        # FT NIXL EP: end-of-forward mask check. Mirrors the call in step().
+        # Required here because step_with_batch_queue is the step_fn whenever
+        # max_concurrent_batches > 1 (pp > 1 or async scheduling), so without
+        # this hook the FT mask poll never runs in those configurations.
+        self._maybe_check_ft_mask()
+        self._attach_degraded_peers(engine_core_outputs)
+
         return engine_core_outputs, model_executed
 
     def _process_aborts_queue(self):
