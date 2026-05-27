@@ -1428,6 +1428,12 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                         idx,
                     )
                     _self._abort_in_flight_for_dead_engine(idx)
+                    # Broadcast to surviving engines so they all converge on
+                    # the same dead set -- needed for deterministic EPLB
+                    # redistribute decisions across engines (a follow-up
+                    # commit drives redistribute from this signal instead
+                    # of from each engine's local kernel mask).
+                    _self._broadcast_engine_death(idx)
 
                 if not pending:
                     logger.error(
@@ -1443,6 +1449,42 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             daemon=True,
             name="DPLBFTEngineMonitor",
         ).start()
+
+    def _broadcast_engine_death(self, dead_dp_rank: int) -> None:
+        """Fire-and-forget Ray RPC informing every surviving engine of a death.
+
+        The API server is the single source of truth for "is rank N
+        permanently gone" (it owns Ray-actor-level death detection via
+        ``monitor_engine_cores``).  Broadcasting this confirmed signal to
+        every surviving engine lets them all converge on the same dead
+        set -- the prerequisite for deterministic EPLB redistribution
+        across engines.  Mirrors SGLang's DataParallelController.status
+        pattern but with Ray actor death (not local kernel mask) as the
+        trusted signal.
+
+        Skips the dead rank itself and any engine the dispatcher has
+        already flagged dead (no point telling them about their peer).
+        Best-effort: if an actor RPC fails, the receiving engine's
+        kernel-mask path is still a safety net for the next forward step.
+        """
+        engine_manager = self.resources.engine_manager
+        if not isinstance(engine_manager, CoreEngineActorManager):
+            return
+        all_actors = (
+            engine_manager.local_engine_actors + engine_manager.remote_engine_actors
+        )
+        for idx, actor in enumerate(all_actors):
+            if idx == dead_dp_rank or idx in self.dead_engine_indices:
+                continue
+            try:
+                actor.notify_engine_death.remote(dead_dp_rank)
+            except Exception as e:
+                logger.warning(
+                    "FT EP: notify_engine_death broadcast to engine %d "
+                    "failed: %s (engine will fall back to kernel-mask path).",
+                    idx,
+                    e,
+                )
 
     def _abort_in_flight_for_dead_engine(self, dead_idx: int) -> None:
         """Synthesize FinishReason.ERROR outputs for requests on a dead engine.

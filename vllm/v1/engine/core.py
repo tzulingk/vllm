@@ -649,6 +649,38 @@ class EngineCore:
             first_dead_mask,
         )
 
+    def notify_engine_death(self, dead_dp_rank: int) -> None:
+        """FT-EP coordinator-confirmed death notice (RPC entry point).
+
+        Called from ``DPLBAsyncMPClient._broadcast_engine_death`` when the
+        API server's monitor thread observes a Ray actor death (the highest-
+        confidence death signal we have).  Mirrors SGLang's design where
+        the central coordinator is the single source of truth for the dead
+        set: every surviving engine receives the same notice, so every
+        engine's ``_confirmed_dead_dp_ranks`` converges -- which is the
+        prerequisite for deterministic EPLB redistribution across engines.
+
+        Distinct from the per-step kernel-mask path
+        (``_maybe_check_ft_mask``), which is fast but can have false
+        positives from timeout cascades.  Today this handler only records
+        receipt and logs; a follow-up commit will switch the redistribute
+        trigger from the kernel-mask path to this confirmed set.
+
+        Idempotent.  Returns nothing (Ray actor methods return None by
+        default when invoked via ``.remote(...)``).
+        """
+        if not hasattr(self, "_confirmed_dead_dp_ranks"):
+            self._confirmed_dead_dp_ranks: set[int] = set()
+        if dead_dp_rank in self._confirmed_dead_dp_ranks:
+            return
+        self._confirmed_dead_dp_ranks.add(dead_dp_rank)
+        logger.warning(
+            "FT EP: engine received coordinator-confirmed death notice for "
+            "DP rank %d; confirmed_dead now %s.",
+            dead_dp_rank,
+            sorted(self._confirmed_dead_dp_ranks),
+        )
+
     def post_step(self, model_executed: bool) -> None:
         # When using async scheduling we can't get draft token ids in advance,
         # so we update draft token ids in the worker process and don't
