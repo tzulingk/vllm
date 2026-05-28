@@ -526,8 +526,14 @@ class EngineCore:
         if published:
             dead = dead | published
 
-        if not dead:
-            return
+        # ALWAYS publish degraded_peers (even when empty). The dispatcher's
+        # _consensus_dead_set() requires fresh reports from every surviving
+        # engine before computing the AND-consensus -- if an engine's empty
+        # view is missing from the cache, an outlier engine's report (e.g.
+        # one engine's cascade-driven {1,2,3}) would degenerate AND to that
+        # single report and falsely trigger broadcast on its alive peers.
+        # By always publishing, we keep the cache populated with each
+        # engine's current view, even when it has nothing to report.
         for eco in engine_core_outputs.values():
             eco.degraded_peers = dead
 
@@ -592,20 +598,20 @@ class EngineCore:
                 for t in range(tp_size):
                     kernel_mask[dp * tp_size + t] = 1
 
+        # L3: silent-failure detection. Runs BEFORE apply_kernel_mask so
+        # transient kernel-mask blips don't pollute state.active_ranks.
+        # _update_kernel_mask_suspicion mutates kernel_mask in place to
+        # clear bits the engine has decided to probe (first observation
+        # or under-threshold reflip); only persistent suspicions remain
+        # set when apply_kernel_mask runs. See L3 design in
+        # fault-tolerance-overview.md.
+        self._update_kernel_mask_suspicion(kernel_mask, state.tp_size)
+
         # Apply to PeerActiveState as a *hint*.  No redistribute, no abort,
         # no last_active_ranks snapshot from here -- those would be
         # triggered if the cascade flagged a falsely-dead rank, the very
         # behavior we just moved to commit_engine_death to avoid.
         apply_kernel_mask(state, kernel_mask)
-
-        # L3: silent-failure detection. For each bit the kernel set that is
-        # NOT in _confirmed_dead_dp_ranks: actively clear it via
-        # update_mask_buffer and count whether it re-flips on the next
-        # dispatch. Persistent re-flips -> publish via degraded_peers so the
-        # dispatcher's consensus reduction can fire _broadcast_engine_death.
-        # Transient blips drop their suspicion entry once the bit stays
-        # cleared. See L3 design in fault-tolerance-overview.md.
-        self._update_kernel_mask_suspicion(kernel_mask, state.tp_size)
 
     _L3_ESCALATION_REFLIP_THRESHOLD: int = 3
 
@@ -646,6 +652,10 @@ class EngineCore:
                 if dp_rank not in self._kernel_mask_suspicion:
                     # First observation -- clear and probe.
                     self._kernel_mask_clear_bit(ep_slot)
+                    # Also mutate the local mask tensor so the subsequent
+                    # apply_kernel_mask doesn't pollute state.active_ranks
+                    # with this not-yet-confirmed flip.
+                    kernel_mask[ep_slot] = 0
                     self._kernel_mask_suspicion[dp_rank] = 1
                     logger.warning(
                         "FT EP L3: rank %d kernel mask flagged "
@@ -667,9 +677,15 @@ class EngineCore:
                                 dp_rank,
                                 n,
                             )
+                        # Leave kernel_mask[ep_slot] = 1 so apply_kernel_mask
+                        # propagates this persistent suspicion into
+                        # state.active_ranks for the degraded_peers report.
                     else:
-                        # Keep probing.
+                        # Under threshold -- keep probing, and continue to
+                        # suppress the bit from state.active_ranks until
+                        # we're sure.
                         self._kernel_mask_clear_bit(ep_slot)
+                        kernel_mask[ep_slot] = 0
             else:
                 # bit == 0
                 if dp_rank in self._kernel_mask_suspicion:

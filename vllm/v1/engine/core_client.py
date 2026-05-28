@@ -1586,11 +1586,20 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
           - ``LAST``: report from the highest-indexed live engine that
             has reported anything.
 
+        For AND specifically: require reports from EVERY live engine
+        before computing the intersection. Otherwise AND over a single
+        report degenerates to that single report -- which (per DYN-3121
+        L3 test) would let one cascade-affected engine's spurious view
+        flag its alive peers as dead. With the "all-live-reported"
+        requirement, the AND reduction is unanimous-by-construction:
+        every survivor independently agrees.
+
         Confirmed-dead engines (already in ``self.dead_engine_indices``)
         contribute their last cached report; we cannot rely on them to
         update, so under AND they would block forever, hence the
-        live-only filter.
+        live-only filter on what counts as "all".
         """
+        live_engine_count = len(self.core_engines) - len(self.dead_engine_indices)
         live_reports: list[tuple[int, frozenset[int]]] = [
             (idx, rep)
             for idx, rep in self._reported_degraded_per_engine.items()
@@ -1600,17 +1609,22 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             return set()
 
         rule = self._consensus_rule
-        if rule == "OR":
-            out: set[int] = set()
-            for _, rep in live_reports:
-                out |= rep
-            return out
         if rule == "AND":
+            # Require a current report from every live engine; otherwise
+            # AND collapses to whichever subset has reported, which lets
+            # a single outlier's view leak through (the DYN-3121 L3 bug).
+            if len(live_reports) < live_engine_count:
+                return set()
             it = iter(live_reports)
             acc = set(next(it)[1])
             for _, rep in it:
                 acc &= rep
             return acc
+        if rule == "OR":
+            out: set[int] = set()
+            for _, rep in live_reports:
+                out |= rep
+            return out
         if rule == "FIRST":
             return set(min(live_reports, key=lambda kv: kv[0])[1])
         if rule == "LAST":
