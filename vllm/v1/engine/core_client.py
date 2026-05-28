@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
 import contextlib
+import os
 import queue
 import sys
 import uuid
@@ -1343,6 +1344,34 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         # returning, and that monitor mutates this set.
         self.dead_engine_indices: set[int] = set()
 
+        # FT NIXL EP cascade-consensus state.  Each engine reports its
+        # locally-observed dead set via ``EngineCoreOutputs.degraded_peers``;
+        # we cache the latest report per engine (last-writer-wins) and
+        # reduce across engines with one of {AND, OR, FIRST, LAST}:
+        #   AND   -- intersection: only flag a rank dead when every live
+        #            engine that has reported agrees it is dead. Robust
+        #            against the kernel-mask cascade we observed in
+        #            DYN-3121 where killing rank 1 caused some engines to
+        #            also flag {2, 3}.
+        #   OR    -- union: flag dead if any engine reports it. Matches
+        #            the legacy behavior; the catastrophic cascade
+        #            amplifier.
+        #   FIRST -- use the lowest-indexed live engine's report verbatim.
+        #            Equivalent to "trust DP rank 0 as coordinator."
+        #   LAST  -- use the highest-indexed live engine's report verbatim.
+        # Ray-monitor-confirmed deaths (added directly to
+        # ``dead_engine_indices`` by ``monitor_engine_cores``) are not
+        # subject to consensus -- those are authoritative and stay set.
+        self._consensus_rule: str = os.environ.get("VLLM_FT_EP_CONSENSUS", "OR").upper()
+        if self._consensus_rule not in ("AND", "OR", "FIRST", "LAST"):
+            logger.warning(
+                "VLLM_FT_EP_CONSENSUS=%s is not one of {AND, OR, FIRST, "
+                "LAST}; defaulting to OR.",
+                self._consensus_rule,
+            )
+            self._consensus_rule = "OR"
+        self._reported_degraded_per_engine: dict[int, frozenset[int]] = {}
+
         super().__init__(
             vllm_config,
             executor_class,
@@ -1451,40 +1480,210 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         ).start()
 
     def _broadcast_engine_death(self, dead_dp_rank: int) -> None:
-        """Fire-and-forget Ray RPC informing every surviving engine of a death.
+        """2-phase ack barrier: broadcast a confirmed death to every survivor.
 
-        The API server is the single source of truth for "is rank N
-        permanently gone" (it owns Ray-actor-level death detection via
-        ``monitor_engine_cores``).  Broadcasting this confirmed signal to
-        every surviving engine lets them all converge on the same dead
-        set -- the prerequisite for deterministic EPLB redistribution
-        across engines.  Mirrors SGLang's DataParallelController.status
-        pattern but with Ray actor death (not local kernel mask) as the
-        trusted signal.
+        Phase 1 (prepare): send ``prepare_engine_death(dead)`` to every
+        surviving engine in parallel, await all acks (or a timeout).
+        Phase 1 is cheap on the engine side -- just records the rank as
+        "pending dead" and aborts in-flight requests.
 
-        Skips the dead rank itself and any engine the dispatcher has
-        already flagged dead (no point telling them about their peer).
-        Best-effort: if an actor RPC fails, the receiving engine's
-        kernel-mask path is still a safety net for the next forward step.
+        Phase 2 (commit): once all phase-1 acks are in, send
+        ``commit_engine_death(dead)`` to those same engines in parallel.
+        The commit step does the expensive part (EPLB redistribute +
+        per-worker disk reload of reassigned expert weights).
+
+        Why split: the expensive part of redistribute is per-worker disk
+        I/O that can take seconds.  With a single-phase notification each
+        engine starts that disk reload as soon as it drains its zmq queue,
+        which is staggered across engines.  An engine that starts its
+        redistribute earlier than its peers goes silent on the NIXL-EP
+        dispatch/combine kernels for the disk-reload duration; peers that
+        are still doing forward passes wait on its atomicAdd sentinel,
+        time out, and FALSELY flag it dead.  This is the step-skew
+        cascade observed in DYN-3121 (NIXL team review credit).  With the
+        2-phase barrier, all engines start their disk reload within
+        roughly one zmq round-trip of each other, dramatically shrinking
+        the silent window.
+
+        Why zmq utility calls instead of a Ray actor RPC: each engine's
+        Ray actor is single-threaded and its ``run()`` method never
+        returns, so a queued ``actor.X.remote(...)`` call would never
+        dispatch.  ``_call_utility_async`` rides the engine's input zmq
+        socket, which is drained inside the engine loop on every step.
+
+        Best-effort: if phase 1 ack fails for an engine, that engine is
+        excluded from phase 2 (it will fall back to its kernel-mask path
+        for that rank).  Other engines still get both phases.
         """
-        engine_manager = self.resources.engine_manager
-        if not isinstance(engine_manager, CoreEngineActorManager):
+        survivors = [
+            idx
+            for idx in range(len(self.core_engines))
+            if idx != dead_dp_rank and idx not in self.dead_engine_indices
+        ]
+        if not survivors:
             return
-        all_actors = (
-            engine_manager.local_engine_actors + engine_manager.remote_engine_actors
+
+        # We're on the monitor daemon Thread, not the API server's
+        # asyncio loop. Resolve the loop from the output_queue_task
+        # (same pattern as ``_abort_in_flight_for_dead_engine``) and
+        # schedule the orchestration coroutine onto it via
+        # run_coroutine_threadsafe.
+        task = self.resources.output_queue_task
+        if task is None:
+            logger.warning(
+                "FT EP: cannot broadcast engine death (DP %d) -- output "
+                "queue task not running yet; survivors will fall back to "
+                "the kernel-mask path.",
+                dead_dp_rank,
+            )
+            return
+        try:
+            loop = task.get_loop()
+        except RuntimeError:
+            loop = None
+        if loop is None:
+            logger.warning(
+                "FT EP: cannot resolve event loop to broadcast engine "
+                "death (DP %d); survivors will fall back to the "
+                "kernel-mask path.",
+                dead_dp_rank,
+            )
+            return
+
+        asyncio.run_coroutine_threadsafe(
+            self._broadcast_engine_death_2phase(dead_dp_rank, survivors),
+            loop,
         )
-        for idx, actor in enumerate(all_actors):
-            if idx == dead_dp_rank or idx in self.dead_engine_indices:
-                continue
-            try:
-                actor.notify_engine_death.remote(dead_dp_rank)
-            except Exception as e:
-                logger.warning(
-                    "FT EP: notify_engine_death broadcast to engine %d "
-                    "failed: %s (engine will fall back to kernel-mask path).",
-                    idx,
-                    e,
+
+    async def _broadcast_engine_death_2phase(
+        self, dead_dp_rank: int, survivors: list[int]
+    ) -> None:
+        """Run the prepare -> ack -> commit flow described on _broadcast_engine_death.
+
+        Phase 1 has a wall-clock timeout cap (10s) so a single hung
+        engine cannot stall recovery of the rest of the cluster -- we
+        fall through to phase 2 with whoever did ack.
+        """
+        prepare_futs = [
+            asyncio.ensure_future(
+                self._call_utility_async(
+                    "prepare_engine_death",
+                    dead_dp_rank,
+                    engine=self.core_engines[idx],
                 )
+            )
+            for idx in survivors
+        ]
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*prepare_futs, return_exceptions=True),
+                timeout=10.0,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "FT EP: 2-phase broadcast for dead DP %d timed out in "
+                "phase 1 (prepare); committing to whoever acked.",
+                dead_dp_rank,
+            )
+
+        committed_survivors: list[int] = []
+        for idx, fut in zip(survivors, prepare_futs):
+            if not fut.done():
+                fut.cancel()
+                logger.warning(
+                    "FT EP: prepare_engine_death(%d) for engine %d did "
+                    "not ack within timeout (excluded from commit).",
+                    dead_dp_rank,
+                    idx,
+                )
+                continue
+            exc = fut.exception() if not fut.cancelled() else fut.exception()
+            if exc is not None:
+                logger.warning(
+                    "FT EP: prepare_engine_death(%d) for engine %d "
+                    "failed: %s (excluded from commit).",
+                    dead_dp_rank,
+                    idx,
+                    exc,
+                )
+                continue
+            committed_survivors.append(idx)
+        if not committed_survivors:
+            logger.warning(
+                "FT EP: no engines acked phase 1 for dead DP %d; skipping phase 2.",
+                dead_dp_rank,
+            )
+            return
+
+        commit_futs = [
+            self._call_utility_async(
+                "commit_engine_death",
+                dead_dp_rank,
+                engine=self.core_engines[idx],
+            )
+            for idx in committed_survivors
+        ]
+        commit_results = await asyncio.gather(*commit_futs, return_exceptions=True)
+        for idx, result in zip(committed_survivors, commit_results):
+            if isinstance(result, BaseException):
+                logger.warning(
+                    "FT EP: commit_engine_death(%d) for engine %d "
+                    "failed: %s (engine will fall back to kernel-mask "
+                    "path).",
+                    dead_dp_rank,
+                    idx,
+                    result,
+                )
+
+    def _consensus_dead_set(self) -> set[int]:
+        """Reduce per-engine degraded_peers reports under the configured rule.
+
+        Inputs are the latest report each engine has sent, cached in
+        ``self._reported_degraded_per_engine``.  Only reports from engines
+        the dispatcher considers live count -- a known-dead engine's stale
+        report can't be expected to update.
+
+        Rules:
+          - ``AND``: intersection over all live reports. Returns empty if
+            any engine has not reported yet (treat missing as "no claim
+            of death").  Correct against cascade false positives.
+          - ``OR``: union over all live reports.  Legacy behavior.
+          - ``FIRST``: report from the lowest-indexed live engine that
+            has reported anything.
+          - ``LAST``: report from the highest-indexed live engine that
+            has reported anything.
+
+        Confirmed-dead engines (already in ``self.dead_engine_indices``)
+        contribute their last cached report; we cannot rely on them to
+        update, so under AND they would block forever, hence the
+        live-only filter.
+        """
+        live_reports: list[tuple[int, frozenset[int]]] = [
+            (idx, rep)
+            for idx, rep in self._reported_degraded_per_engine.items()
+            if idx not in self.dead_engine_indices
+        ]
+        if not live_reports:
+            return set()
+
+        rule = self._consensus_rule
+        if rule == "OR":
+            out: set[int] = set()
+            for _, rep in live_reports:
+                out |= rep
+            return out
+        if rule == "AND":
+            it = iter(live_reports)
+            acc = set(next(it)[1])
+            for _, rep in it:
+                acc &= rep
+            return acc
+        if rule == "FIRST":
+            return set(min(live_reports, key=lambda kv: kv[0])[1])
+        if rule == "LAST":
+            return set(max(live_reports, key=lambda kv: kv[0])[1])
+        # Defensive default -- already validated at init, but be explicit.
+        return set()
 
     def _abort_in_flight_for_dead_engine(self, dead_idx: int) -> None:
         """Synthesize FinishReason.ERROR outputs for requests on a dead engine.
@@ -1650,20 +1849,29 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         if outputs.finished_requests and self.reqs_in_flight:
             for req_id in outputs.finished_requests:
                 self.reqs_in_flight.pop(req_id, None)
-        # FT NIXL EP: union the degraded_peers report into the local
-        # dead-engine set. Every engine sees the same kernel mask so
-        # reports converge quickly; we union (never narrow) so a stale
-        # "rank N is alive" never resurrects a known-dead rank without
-        # explicit recovery.
-        if outputs.degraded_peers:
-            new_dead = outputs.degraded_peers - self.dead_engine_indices
+        # FT NIXL EP: feed each engine's degraded_peers report into the
+        # cascade-consensus state. The cached report is reduced across
+        # all engines with the configured rule (AND/OR/FIRST/LAST) to
+        # produce the consensus dead set; we union that into the local
+        # dead-engine set (never narrow -- once flagged, always flagged
+        # absent explicit recovery).
+        if outputs.degraded_peers is not None:
+            self._reported_degraded_per_engine[outputs.engine_index] = frozenset(
+                outputs.degraded_peers
+            )
+            consensus_dead = self._consensus_dead_set()
+            new_dead = consensus_dead - self.dead_engine_indices
             if new_dead:
                 self.dead_engine_indices |= new_dead
                 logger.warning(
                     "FT NIXL EP: AsyncLLM dispatcher: DP rank(s) %s flagged "
-                    "dead by engine %d; subsequent requests will skip them.",
+                    "dead by %s-consensus over engine reports "
+                    "(triggered by engine %d's report = %s); subsequent "
+                    "requests will skip them.",
                     sorted(new_dead),
+                    self._consensus_rule,
                     outputs.engine_index,
+                    sorted(outputs.degraded_peers),
                 )
 
     @staticmethod
