@@ -2147,6 +2147,11 @@ class DPEngineCoreProc(EngineCoreProc):
             if self.ft_dying_peer_state is not None:
                 _ = self.ft_dying_peer_state.progress()
                 if self.ft_dying_peer_state.is_complete():
+                    # Re-enable input-queue blocking so the engine can
+                    # idle waiting for new work. notify_engine_death
+                    # turned this off so the state machine could run
+                    # on its own without external input.
+                    self.process_input_queue_block = True
                     self.ft_dying_peer_state = None
 
             executed = self._process_engine_step()
@@ -2294,6 +2299,15 @@ class DPEngineCoreProc(EngineCoreProc):
             dead_dp_rank=dead_dp_rank,
             engine_core=self,
         )
+        # Unblock _process_input_queue so the run loop iterates even when
+        # there's no inference work. The state-machine progress hook only
+        # runs on each iteration -- without unblocking, an idle engine
+        # would sit in input_queue.get(block=True) and never call
+        # progress(), so the barrier would never advance. Mirrors what
+        # reinitialize_distributed does for the elastic-EP state machine.
+        # ft_dying_peer_state.progress() (or whoever clears the state)
+        # re-sets this to True on COMPLETE.
+        self.process_input_queue_block = False
 
     def _eep_send_engine_core_notification(
         self,
