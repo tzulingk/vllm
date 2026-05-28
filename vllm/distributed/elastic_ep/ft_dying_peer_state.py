@@ -88,9 +88,13 @@ class FtDyingPeerState:
         # operations on the TCPStore (analogous to dp_rank==0 in
         # elastic-EP but skipping the dead rank).
         self.leader_rank: int = 0 if dead_dp_rank != 0 else 1
-        # Unique key suffix in case multiple sequential deaths happen
-        # in the same process lifetime (don't collide on TCPStore keys).
-        self._key_suffix: str = f"dead_{dead_dp_rank}_gen_{time.monotonic_ns()}"
+        # Shared key suffix across surviving engines: same dead rank
+        # implies same barrier. The per-rank suffix is enough -- a given
+        # dead rank cannot die twice in the same process lifetime (the
+        # rank is gone), so we don't need a per-event generation tag.
+        # Earlier attempts to include time.monotonic_ns() here ARE WHY
+        # each engine ran a barrier on its OWN key and they never met.
+        self._key_suffix: str = f"dead_{dead_dp_rank}"
         self._barrier_count_key: str = f"ft_dying_peer_count_{self._key_suffix}"
         self._barrier_name: str = f"ft_dying_peer_{self._key_suffix}"
         # Whether this engine has already incremented the counter once.
