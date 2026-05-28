@@ -104,6 +104,16 @@ class EngineCore:
 
         load_general_plugins()
 
+        # FT EP state used by the L3 hook in _maybe_check_ft_mask
+        # below. Real values are written by DPEngineCoreProc.__init__;
+        # initialized here so non-DP engines (which never reach the
+        # NIXL-EP-mask path anyway) have valid empty defaults rather
+        # than AttributeError. Each instance gets its own object to
+        # avoid the class-level-mutable-default footgun.
+        self._confirmed_dead_dp_ranks: set[int] = set()
+        self._kernel_mask_suspicion: dict[int, int] = {}
+        self._suspicion_published: set[int] = set()
+
         self.vllm_config = vllm_config
         if not vllm_config.parallel_config.data_parallel_rank_local:
             logger.info(
@@ -504,6 +514,18 @@ class EngineCore:
             if dp_rank is not None:
                 dead = dead | {dp_rank}
 
+        # L3: include silent-failure suspicions that have crossed the
+        # persistence threshold on this engine. The dispatcher reduces
+        # across all engines' reports under VLLM_FT_EP_CONSENSUS; only
+        # when the cross-engine consensus expands does
+        # _broadcast_engine_death fire. So publishing here is safe even
+        # if the suspicion is only local -- it'll be filtered out by the
+        # dispatcher's reduction. See L3 design in
+        # fault-tolerance-overview.md.
+        published = getattr(self, "_suspicion_published", None)
+        if published:
+            dead = dead | published
+
         if not dead:
             return
         for eco in engine_core_outputs.values():
@@ -575,6 +597,110 @@ class EngineCore:
         # triggered if the cascade flagged a falsely-dead rank, the very
         # behavior we just moved to commit_engine_death to avoid.
         apply_kernel_mask(state, kernel_mask)
+
+        # L3: silent-failure detection. For each bit the kernel set that is
+        # NOT in _confirmed_dead_dp_ranks: actively clear it via
+        # update_mask_buffer and count whether it re-flips on the next
+        # dispatch. Persistent re-flips -> publish via degraded_peers so the
+        # dispatcher's consensus reduction can fire _broadcast_engine_death.
+        # Transient blips drop their suspicion entry once the bit stays
+        # cleared. See L3 design in fault-tolerance-overview.md.
+        self._update_kernel_mask_suspicion(kernel_mask, state.tp_size)
+
+    _L3_ESCALATION_REFLIP_THRESHOLD: int = 3
+
+    def _update_kernel_mask_suspicion(self, kernel_mask: Any, tp_size: int) -> None:
+        """L3 probe loop: distinguish transient vs persistent mask flips.
+
+        Called once per forward step from _maybe_check_ft_mask after the
+        kernel mask has been read and ingested. Maintains
+        self._kernel_mask_suspicion (rank -> consecutive_reflips) and
+        self._suspicion_published (ranks the engine reports as dead via
+        degraded_peers).
+
+        Logic per kernel-mask bit ``kernel_mask[ep_slot]``:
+
+        * bit == 1 and dp_rank in confirmed-dead: legitimate, no L3 action.
+        * bit == 1 and first observation: clear bit via
+          update_mask_buffer(False), set counter to 1.
+        * bit == 1 and prior suspicion exists: counter++. At threshold,
+          add to suspicion_published; until threshold, keep probing
+          (clear again, watch for next re-flip).
+        * bit == 0 with prior suspicion: probe succeeded, drop entry +
+          unpublish.
+
+        See L3 design in fault-tolerance-overview.md for the 3
+        no-consensus scenarios (single-engine view, disagreeing engines,
+        all-engines-brief-flag) and the rationale for the "do nothing
+        wrong" property of this design.
+        """
+        confirmed = self._confirmed_dead_dp_ranks
+        ep_slots = list(range(kernel_mask.numel()))
+        for ep_slot in ep_slots:
+            bit = int(kernel_mask[ep_slot].item())
+            dp_rank = ep_slot // tp_size if tp_size > 0 else ep_slot
+            if dp_rank in confirmed:
+                continue
+
+            if bit == 1:
+                if dp_rank not in self._kernel_mask_suspicion:
+                    # First observation -- clear and probe.
+                    self._kernel_mask_clear_bit(ep_slot)
+                    self._kernel_mask_suspicion[dp_rank] = 1
+                    logger.warning(
+                        "FT EP L3: rank %d kernel mask flagged "
+                        "(ep_slot %d); cleared bit, probing for re-flip.",
+                        dp_rank,
+                        ep_slot,
+                    )
+                else:
+                    self._kernel_mask_suspicion[dp_rank] += 1
+                    n = self._kernel_mask_suspicion[dp_rank]
+                    if n >= self._L3_ESCALATION_REFLIP_THRESHOLD:
+                        if dp_rank not in self._suspicion_published:
+                            self._suspicion_published.add(dp_rank)
+                            logger.warning(
+                                "FT EP L3: rank %d re-flagged %d times; "
+                                "publishing as silent-failure suspect "
+                                "via degraded_peers (dispatcher consensus "
+                                "reduction will decide whether to escalate).",
+                                dp_rank,
+                                n,
+                            )
+                    else:
+                        # Keep probing.
+                        self._kernel_mask_clear_bit(ep_slot)
+            else:
+                # bit == 0
+                if dp_rank in self._kernel_mask_suspicion:
+                    # Bit stayed cleared after probe -- was transient.
+                    del self._kernel_mask_suspicion[dp_rank]
+                    if dp_rank in self._suspicion_published:
+                        self._suspicion_published.discard(dp_rank)
+                    logger.warning(
+                        "FT EP L3: rank %d kernel-mask cleared without "
+                        "re-flip; treating as transient blip.",
+                        dp_rank,
+                    )
+
+    def _kernel_mask_clear_bit(self, ep_slot: int) -> None:
+        """Worker collective_rpc wrapper to clear one mask bit.
+
+        Calls Buffer.update_mask_buffer(ep_slot, False) on the NIXL EP
+        buffer via the worker. Best-effort: on RPC failure we just log
+        and skip the probe -- L3 falls back to no-discrimination
+        (suspicion entry never gets dropped, so the rank stays
+        published, which is the conservative-safe behavior).
+        """
+        try:
+            self.collective_rpc("update_nixl_ep_mask_bit", args=(ep_slot, False))
+        except Exception as e:
+            logger.warning(
+                "FT EP L3: update_nixl_ep_mask_bit(%d, False) rpc raised %s; "
+                "L3 probe step degraded for this rank.",
+                ep_slot,
+                e,
+            )
 
     def _maybe_check_ft_tp_mask(self) -> None:
         """Poll the FT NCCL TP mask once per step; flip the degraded flag.
@@ -1951,12 +2077,11 @@ class DPEngineCoreProc(EngineCoreProc):
         # arrives via the zmq utility channel; advanced by run_busy_loop
         # each tick. Cleared once the state machine reaches COMPLETE.
         self.ft_dying_peer_state: FtDyingPeerState | None = None
-        # FT EP: set of DP ranks that have been confirmed dead by the
-        # coordinator. Populated by FtDyingPeerState during its
-        # REDISTRIBUTE phase; read by ``_maybe_check_ft_mask`` to
-        # prevent the kernel mask from un-flagging a confirmed-dead
-        # rank via a transient blip.
-        self._confirmed_dead_dp_ranks: set[int] = set()
+        # FT EP state attributes (_confirmed_dead_dp_ranks,
+        # _kernel_mask_suspicion, _suspicion_published) are initialized
+        # by EngineCore.__init__ -- see the docstring there for the L3
+        # design rationale. DPEngineCoreProc inherits the same
+        # instance-level defaults.
 
         # Initialize the engine.
         dp_rank = vllm_config.parallel_config.data_parallel_rank

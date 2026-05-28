@@ -1806,6 +1806,26 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                     outputs.engine_index,
                     sorted(outputs.degraded_peers),
                 )
+                # L3 silent-failure escalation: when cross-engine consensus
+                # expands to include a rank that Ray did NOT confirm dead
+                # (i.e., L1/L2 didn't already start the recovery), this is
+                # the silent-failure case -- a hung-but-alive peer that
+                # Ray can't see but multiple engines' kernel masks
+                # persistently flag. Drive the same recovery path as a
+                # Ray-confirmed death by firing _broadcast_engine_death;
+                # surviving engines will run FtDyingPeerState.
+                # See L3 design in fault-tolerance-overview.md for the
+                # full rationale, including the 3 no-consensus scenarios
+                # and the "do nothing wrong" property.
+                for dp in new_dead:
+                    logger.warning(
+                        "FT EP L3: silent-failure consensus on DP rank %d "
+                        "(no Ray death but %s engines flagged it "
+                        "persistently); broadcasting notify_engine_death.",
+                        dp,
+                        self._consensus_rule,
+                    )
+                    self._broadcast_engine_death(dp)
 
     @staticmethod
     async def eep_process_engine_core_notification(

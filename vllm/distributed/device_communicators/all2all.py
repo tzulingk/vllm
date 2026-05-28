@@ -452,6 +452,29 @@ class NixlEPAll2AllManager(All2AllManagerBase):
         # non-contiguous view.
         return self._mask_status_buf[:ep_size].contiguous()
 
+    def update_mask_bit(self, ep_slot: int, mask: bool) -> bool:
+        """Set or clear one bit of the NIXL EP buffer's kernel mask.
+
+        Engine-side override of the kernel's autonomous timeout-flip via
+        ``buffer.update_mask_buffer`` (see NIXL EP buffer.py:729). Used by
+        the L3 silent-failure detection path in the engine-core to
+        distinguish transient kernel-mask blips from persistent symptoms:
+        the engine clears the bit, the kernel may re-set it on the next
+        dispatch if the underlying issue is still present. See the L3
+        design section in fault-tolerance-overview.md for the full
+        rationale on why we need this for transient/persistent
+        discrimination (the kernel mask is otherwise sticky-set).
+
+        Returns True if the call was made, False if no buffer yet
+        (returns silently rather than raising so the engine's L3 hook
+        can safely fall through).
+        """
+        if NixlEPAll2AllManager._buffer is None:
+            return False
+        buffer, _ = NixlEPAll2AllManager._buffer
+        buffer.update_mask_buffer(ep_slot, mask)
+        return True
+
     def _update_buffer(self):
         assert NixlEPAll2AllManager._buffer is not None
         buffer, current_ep_size = NixlEPAll2AllManager._buffer

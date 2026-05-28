@@ -307,6 +307,42 @@ class Worker(WorkerBase):
             return None
         return mask.clone()
 
+    def update_nixl_ep_mask_bit(self, ep_slot: int, mask: bool) -> bool:
+        """Set or clear one bit of the NIXL EP kernel mask.
+
+        FT NIXL EP L3 (silent-failure detection) probe step. The engine-core
+        calls this via ``collective_rpc`` to actively clear a kernel-mask bit
+        the kernel autonomously flipped via ``atomicExch`` on receive
+        timeout. On the next dispatch, if the underlying condition is still
+        present the kernel will re-flip the bit (counted as "persistent
+        symptom" by the engine-core); if not it'll stay clear (counted as
+        "transient blip").
+
+        Without active clearing, the kernel mask is sticky -- once flipped,
+        it stays set for the rest of the process lifetime -- so we cannot
+        distinguish transient from persistent symptoms. See the L3 design
+        section in the fault-tolerance runbook for rationale.
+
+        ``mask=False`` clears the bit (re-include rank). ``mask=True`` sets
+        it (skip rank). Returns True if the call was made, False if the NIXL
+        EP backend isn't initialized (non-FT path).
+        """
+        from vllm.distributed import get_ep_group
+        from vllm.distributed.device_communicators.all2all import (
+            NixlEPAll2AllManager,
+        )
+
+        try:
+            ep_group = get_ep_group()
+        except Exception:
+            return False
+        if ep_group is None or getattr(ep_group, "device_communicator", None) is None:
+            return False
+        manager = getattr(ep_group.device_communicator, "all2all_manager", None)
+        if not isinstance(manager, NixlEPAll2AllManager):
+            return False
+        return manager.update_mask_bit(ep_slot, mask)
+
     def query_ft_tp_mask(self) -> list[bool] | None:
         """Return this worker's FT NCCL TP active mask, or None if N/A.
 
