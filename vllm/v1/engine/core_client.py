@@ -1480,40 +1480,36 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         ).start()
 
     def _broadcast_engine_death(self, dead_dp_rank: int) -> None:
-        """2-phase ack barrier: broadcast a confirmed death to every survivor.
+        """Fan out a death notification to every surviving DP engine.
 
-        Phase 1 (prepare): send ``prepare_engine_death(dead)`` to every
-        surviving engine in parallel, await all acks (or a timeout).
-        Phase 1 is cheap on the engine side -- just records the rank as
-        "pending dead" and aborts in-flight requests.
+        Each engine's ``notify_engine_death`` handler is intentionally
+        trivial: it instantiates a ``FtDyingPeerState`` state machine and
+        returns. The state machine, driven each tick by the engine's
+        ``run_busy_loop``, performs:
 
-        Phase 2 (commit): once all phase-1 acks are in, send
-        ``commit_engine_death(dead)`` to those same engines in parallel.
-        The commit step does the expensive part (EPLB redistribute +
-        per-worker disk reload of reassigned expert weights).
-
-        Why split: the expensive part of redistribute is per-worker disk
-        I/O that can take seconds.  With a single-phase notification each
-        engine starts that disk reload as soon as it drains its zmq queue,
-        which is staggered across engines.  An engine that starts its
-        redistribute earlier than its peers goes silent on the NIXL-EP
-        dispatch/combine kernels for the disk-reload duration; peers that
-        are still doing forward passes wait on its atomicAdd sentinel,
-        time out, and FALSELY flag it dead.  This is the step-skew
-        cascade observed in DYN-3121 (NIXL team review credit).  With the
-        2-phase barrier, all engines start their disk reload within
-        roughly one zmq round-trip of each other, dramatically shrinking
-        the silent window.
+        1. ENTER_BARRIER -- non-blocking TCPStore staged barrier (the same
+           ``_staged_barrier`` pattern used by elastic-EP scaling, minus
+           the ``torch.distributed.barrier`` because our DP process group
+           still includes the dead rank and would hang).
+        2. REDISTRIBUTE -- once every surviving engine has reached the
+           barrier, all advance simultaneously and run the slow
+           ``eplb_redistribute_for_dead_peers`` (disk reload). Because the
+           barrier guarantees every survivor enters this state at the same
+           step boundary, no engine goes silent on NIXL EP while peers are
+           still dispatching -- closing the cascade window observed in
+           DYN-3121.
+        3. COMPLETE -- engine clears the state machine, resumes normal
+           operation with the updated placement table.
 
         Why zmq utility calls instead of a Ray actor RPC: each engine's
         Ray actor is single-threaded and its ``run()`` method never
         returns, so a queued ``actor.X.remote(...)`` call would never
         dispatch.  ``_call_utility_async`` rides the engine's input zmq
-        socket, which is drained inside the engine loop on every step.
+        socket, which is drained inside the engine loop on every tick.
 
-        Best-effort: if phase 1 ack fails for an engine, that engine is
-        excluded from phase 2 (it will fall back to its kernel-mask path
-        for that rank).  Other engines still get both phases.
+        Best-effort: if a single utility send fails, that engine misses
+        the notification and falls back to its kernel-mask path for the
+        dead rank. Other engines still get notified.
         """
         survivors = [
             idx
@@ -1526,7 +1522,7 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         # We're on the monitor daemon Thread, not the API server's
         # asyncio loop. Resolve the loop from the output_queue_task
         # (same pattern as ``_abort_in_flight_for_dead_engine``) and
-        # schedule the orchestration coroutine onto it via
+        # schedule each utility coroutine onto it via
         # run_coroutine_threadsafe.
         task = self.resources.output_queue_task
         if task is None:
@@ -1550,90 +1546,27 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             )
             return
 
-        asyncio.run_coroutine_threadsafe(
-            self._broadcast_engine_death_2phase(dead_dp_rank, survivors),
-            loop,
-        )
-
-    async def _broadcast_engine_death_2phase(
-        self, dead_dp_rank: int, survivors: list[int]
-    ) -> None:
-        """Run the prepare -> ack -> commit flow described on _broadcast_engine_death.
-
-        Phase 1 has a wall-clock timeout cap (10s) so a single hung
-        engine cannot stall recovery of the rest of the cluster -- we
-        fall through to phase 2 with whoever did ack.
-        """
-        prepare_futs = [
-            asyncio.ensure_future(
-                self._call_utility_async(
-                    "prepare_engine_death",
-                    dead_dp_rank,
-                    engine=self.core_engines[idx],
-                )
-            )
-            for idx in survivors
-        ]
-        try:
-            await asyncio.wait_for(
-                asyncio.gather(*prepare_futs, return_exceptions=True),
-                timeout=10.0,
-            )
-        except asyncio.TimeoutError:
-            logger.warning(
-                "FT EP: 2-phase broadcast for dead DP %d timed out in "
-                "phase 1 (prepare); committing to whoever acked.",
-                dead_dp_rank,
-            )
-
-        committed_survivors: list[int] = []
-        for idx, fut in zip(survivors, prepare_futs):
-            if not fut.done():
-                fut.cancel()
-                logger.warning(
-                    "FT EP: prepare_engine_death(%d) for engine %d did "
-                    "not ack within timeout (excluded from commit).",
-                    dead_dp_rank,
-                    idx,
-                )
-                continue
-            exc = fut.exception() if not fut.cancelled() else fut.exception()
-            if exc is not None:
-                logger.warning(
-                    "FT EP: prepare_engine_death(%d) for engine %d "
-                    "failed: %s (excluded from commit).",
-                    dead_dp_rank,
-                    idx,
-                    exc,
-                )
-                continue
-            committed_survivors.append(idx)
-        if not committed_survivors:
-            logger.warning(
-                "FT EP: no engines acked phase 1 for dead DP %d; skipping phase 2.",
-                dead_dp_rank,
-            )
-            return
-
-        commit_futs = [
-            self._call_utility_async(
-                "commit_engine_death",
+        for idx in survivors:
+            coro = self._call_utility_async(
+                "notify_engine_death",
                 dead_dp_rank,
                 engine=self.core_engines[idx],
             )
-            for idx in committed_survivors
-        ]
-        commit_results = await asyncio.gather(*commit_futs, return_exceptions=True)
-        for idx, result in zip(committed_survivors, commit_results):
-            if isinstance(result, BaseException):
-                logger.warning(
-                    "FT EP: commit_engine_death(%d) for engine %d "
-                    "failed: %s (engine will fall back to kernel-mask "
-                    "path).",
-                    dead_dp_rank,
-                    idx,
-                    result,
-                )
+            fut = asyncio.run_coroutine_threadsafe(coro, loop)
+
+            def _log_failure(f, target_idx=idx, dead=dead_dp_rank):
+                exc = f.exception()
+                if exc is not None:
+                    logger.warning(
+                        "FT EP: notify_engine_death(%d) to engine %d "
+                        "failed: %s (engine will fall back to "
+                        "kernel-mask path).",
+                        dead,
+                        target_idx,
+                        exc,
+                    )
+
+            fut.add_done_callback(_log_failure)
 
     def _consensus_dead_set(self) -> set[int]:
         """Reduce per-engine degraded_peers reports under the configured rule.

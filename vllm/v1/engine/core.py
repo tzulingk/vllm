@@ -635,110 +635,10 @@ class EngineCore:
             first_dead_mask,
         )
 
-    def prepare_engine_death(self, dead_dp_rank: int) -> None:
-        """Phase 1 of the 2-phase ack barrier for a coordinator-confirmed death.
-
-        Cheap bookkeeping only: record the rank as "pending dead" and abort
-        the engine's in-flight requests so they don't continue trying to use
-        the dead rank.  Does NOT update PeerActiveState and does NOT run
-        EPLB redistribute -- those are the expensive operations that go in
-        phase 2 (``commit_engine_death``), so that all surviving engines
-        enter the heavy disk-reload step roughly simultaneously rather than
-        staggered (the step-skew that causes the false-positive cascade
-        observed in DYN-3121).
-
-        The async caller (``DPLBAsyncMPClient._broadcast_engine_death``)
-        sends this to every surviving engine, awaits all acks, then sends
-        the matching ``commit_engine_death`` so all engines move to the
-        active phase together.  Idempotent; safe to call twice.
-        """
-        if not hasattr(self, "_pending_dead_dp_ranks"):
-            self._pending_dead_dp_ranks: set[int] = set()
-        if dead_dp_rank in self._pending_dead_dp_ranks:
-            return
-        self._pending_dead_dp_ranks.add(dead_dp_rank)
-
-        # Abort any in-flight requests now -- they may have already touched
-        # the dead rank in earlier forward passes, so their output cannot
-        # be trusted.  Cheap (just marks requests as finished); doesn't
-        # block on disk/IO.
-        running = getattr(self.scheduler, "running", [])
-        running_req_ids = [r.request_id for r in running]
-        if running_req_ids:
-            self.scheduler.finish_requests(
-                running_req_ids, RequestStatus.FINISHED_ERROR
-            )
-        logger.warning(
-            "FT EP: prepare_engine_death(%d) acked; aborted %d in-flight "
-            "request(s) (commit phase will redistribute experts).",
-            dead_dp_rank,
-            len(running_req_ids),
-        )
-
-    def commit_engine_death(self, dead_dp_rank: int) -> None:
-        """Phase 2 of the 2-phase ack barrier: apply the dead-rank change.
-
-        Updates PeerActiveState and triggers ``eplb_redistribute_for_dead_peers``
-        (which on each worker reloads experts from the HF checkpoint --
-        seconds of disk I/O).  ``DPLBAsyncMPClient._broadcast_engine_death``
-        sends this to every surviving engine *after* all engines have
-        acked phase 1, so the slow disk-reload happens roughly simultaneously
-        across engines -- avoiding the step-skew window where one engine
-        is in redistribute (silent on NIXL-EP) while others are still
-        dispatching (and would time out on the silent engine, falsely
-        flagging it dead).
-
-        Idempotent; safe to call twice.  Returns ``None``.
-        """
-        from vllm.distributed.elastic_ep.peer_state import PeerActiveStateManager
-
-        if not hasattr(self, "_confirmed_dead_dp_ranks"):
-            self._confirmed_dead_dp_ranks: set[int] = set()
-        if dead_dp_rank in self._confirmed_dead_dp_ranks:
-            return
-        self._confirmed_dead_dp_ranks.add(dead_dp_rank)
-
-        state = PeerActiveStateManager.instance()
-        if state is None:
-            logger.warning(
-                "FT EP: commit_engine_death(%d); PeerActiveState not "
-                "initialized on this engine (non-FT-EP backend?), skipping "
-                "state update and redistribute.",
-                dead_dp_rank,
-            )
-            return
-
-        tp_size = state.tp_size
-        newly_dead_ep_slots = [dead_dp_rank * tp_size + t for t in range(tp_size)]
-        flipped = False
-        for ep_slot in newly_dead_ep_slots:
-            if state.active_ranks[ep_slot].item() != 0:
-                state.active_ranks[ep_slot] = 0
-                flipped = True
-        state.sync_active_to_cpu()
-        logger.warning(
-            "FT EP: commit_engine_death(%d) (EP slots %s); redistributing experts.",
-            dead_dp_rank,
-            newly_dead_ep_slots,
-        )
-
-        if flipped:
-            try:
-                self.collective_rpc(
-                    "eplb_redistribute_for_dead_peers",
-                    args=(newly_dead_ep_slots,),
-                )
-            except Exception as e:
-                logger.warning(
-                    "FT EP: eplb_redistribute_for_dead_peers RPC failed "
-                    "after commit_engine_death(%d): %s "
-                    "(placement table not updated; subsequent forward "
-                    "passes may route to dead slots until next death).",
-                    dead_dp_rank,
-                    e,
-                )
-
-        state.snapshot_active_to_last()
+    # NOTE: notify_engine_death lives on DPEngineCoreProc (not here)
+    # because the FT death state machine needs dp_group + dp_store for
+    # its TCPStore-based barrier, and those attributes are only set on
+    # the DP subclass.
 
     # ------------------------------------------------------------------
     # FT EP cascade-debug instrumentation
@@ -2042,8 +1942,21 @@ class DPEngineCoreProc(EngineCoreProc):
         self.ignore_start_dp_wave = False
 
         from vllm.distributed.elastic_ep.elastic_state import ElasticEPScalingState
+        from vllm.distributed.elastic_ep.ft_dying_peer_state import (
+            FtDyingPeerState,
+        )
 
         self.eep_scaling_state: ElasticEPScalingState | None = None
+        # FT EP dying-peer state machine. Set when notify_engine_death
+        # arrives via the zmq utility channel; advanced by run_busy_loop
+        # each tick. Cleared once the state machine reaches COMPLETE.
+        self.ft_dying_peer_state: FtDyingPeerState | None = None
+        # FT EP: set of DP ranks that have been confirmed dead by the
+        # coordinator. Populated by FtDyingPeerState during its
+        # REDISTRIBUTE phase; read by ``_maybe_check_ft_mask`` to
+        # prevent the kernel mask from un-flagging a confirmed-dead
+        # rank via a transient blip.
+        self._confirmed_dead_dp_ranks: set[int] = set()
 
         # Initialize the engine.
         dp_rank = vllm_config.parallel_config.data_parallel_rank
@@ -2221,6 +2134,21 @@ class DPEngineCoreProc(EngineCoreProc):
                     self.process_input_queue_block = True
                     self.eep_scaling_state = None
 
+            # FT EP dying-peer state machine: same loop position as the
+            # elastic-EP scaling state above. progress() returns one of:
+            #   - False: blocked (e.g., barrier waiting for peers) -- we
+            #     fall through to a normal forward pass and retry next tick.
+            #   - True: state advanced (or stayed in COMPLETE).
+            # The state machine internally enforces synchronization via a
+            # TCPStore staged barrier, so every surviving engine enters
+            # the slow REDISTRIBUTE step at the same step boundary; no
+            # engine goes silent on NIXL EP while peers are still
+            # dispatching (which would trigger the DYN-3121 cascade).
+            if self.ft_dying_peer_state is not None:
+                _ = self.ft_dying_peer_state.progress()
+                if self.ft_dying_peer_state.is_complete():
+                    self.ft_dying_peer_state = None
+
             executed = self._process_engine_step()
             self._maybe_publish_request_counts()
 
@@ -2326,6 +2254,45 @@ class DPEngineCoreProc(EngineCoreProc):
         self.process_input_queue_block = False
         logger.info(
             "[Elastic EP] Received reconfiguration request and starting scaling up/down"
+        )
+
+    def notify_engine_death(self, dead_dp_rank: int) -> None:
+        """FT EP: kick off the dying-peer state machine on this engine.
+
+        Called as a zmq utility method by
+        ``DPLBAsyncMPClient._broadcast_engine_death`` when the API server's
+        Ray monitor confirms a peer DP rank has died. This handler is
+        intentionally trivial: it constructs the per-event state machine
+        and returns immediately. The actual cross-DP synchronization and
+        the slow ``eplb_redistribute_for_dead_peers`` happen inside the
+        state machine, driven by ``run_busy_loop`` tick-by-tick.
+
+        Returning quickly is critical: if this handler ran the redistribute
+        inline, this engine's CPU would block for seconds, its NIXL EP
+        dispatch kernel wouldn't launch, and peers still in their forward
+        pass would time out on it -- the DYN-3121 cascade.
+
+        Idempotent for a given ``dead_dp_rank``: a second invocation while
+        the first state machine is still running is silently ignored.
+        Aborting in-flight requests is deferred to the state machine's
+        REDISTRIBUTE step so that any requests routed to this engine
+        between now and the barrier passing also get aborted.
+        """
+        from vllm.distributed.elastic_ep.ft_dying_peer_state import (
+            FtDyingPeerState,
+        )
+
+        if self.ft_dying_peer_state is not None:
+            logger.warning(
+                "FT EP: notify_engine_death(%d) ignored -- a dying-peer "
+                "state machine for DP %d is already running.",
+                dead_dp_rank,
+                self.ft_dying_peer_state.dead_dp_rank,
+            )
+            return
+        self.ft_dying_peer_state = FtDyingPeerState(
+            dead_dp_rank=dead_dp_rank,
+            engine_core=self,
         )
 
     def _eep_send_engine_core_notification(
