@@ -809,6 +809,7 @@ class EngineCore:
             self._ft_ep_dbg_engine_n = 0
             self._ft_ep_dbg_engine_last: tuple[int, ...] = ()
             self._ft_ep_dbg_engine_t0_ns: int | None = None
+            self._ft_ep_dbg_engine_last_step_ns: int | None = None
 
         if self._ft_ep_dbg_engine_n >= self._FT_EP_DEBUG_ENGINE_MAX_LOGS:
             return
@@ -831,26 +832,42 @@ class EngineCore:
         primary = next((m for m in per_worker if m is not None), None)
         if primary is None:
             return
-        if primary == self._ft_ep_dbg_engine_last:
-            return
+
+        # Log EVERY step (not just on change). Sticky masks mean "log on
+        # change" gives us a single line at some point and we don't see
+        # what step that was; per-step logging shows the exact evolution.
+        changed = primary != self._ft_ep_dbg_engine_last
         self._ft_ep_dbg_engine_last = primary
 
+        now_ns = time.monotonic_ns()
         if self._ft_ep_dbg_engine_t0_ns is None:
-            self._ft_ep_dbg_engine_t0_ns = time.monotonic_ns()
-        elapsed_ms = (time.monotonic_ns() - self._ft_ep_dbg_engine_t0_ns) // 1_000_000
+            self._ft_ep_dbg_engine_t0_ns = now_ns
+            self._ft_ep_dbg_engine_last_step_ns = now_ns
+        t_total_ms = (now_ns - self._ft_ep_dbg_engine_t0_ns) // 1_000_000
+        last_step_ns = (
+            self._ft_ep_dbg_engine_last_step_ns
+            if self._ft_ep_dbg_engine_last_step_ns is not None
+            else now_ns
+        )
+        t_step_ms = (now_ns - last_step_ns) // 1_000_000
+        self._ft_ep_dbg_engine_last_step_ns = now_ns
 
         self._ft_ep_dbg_engine_n += 1
         # Show divergence across workers explicitly so we can answer
         # "did all TP workers report the same mask, or did they disagree?"
         per_worker_repr = [list(m) if m is not None else None for m in per_worker]
         logger.warning(
-            "FT EP DEBUG (engine) #%d t=+%dms: primary=%s per_worker=%s "
-            "(1=dead, 0=alive). DP-confirmed-dead set=%s.",
+            "FT EP DEBUG (engine) step=%d t_total=%dms t_step=%dms "
+            "changed=%s primary=%s per_worker=%s "
+            "(1=dead, 0=alive). DP-confirmed-dead set=%s suspicion=%s.",
             self._ft_ep_dbg_engine_n,
-            elapsed_ms,
+            t_total_ms,
+            t_step_ms,
+            "Y" if changed else "n",
             list(primary),
             per_worker_repr,
             sorted(getattr(self, "_confirmed_dead_dp_ranks", set())),
+            dict(getattr(self, "_kernel_mask_suspicion", {})),
         )
 
     def post_step(self, model_executed: bool) -> None:
@@ -2428,14 +2445,23 @@ class DPEngineCoreProc(EngineCoreProc):
             FtDyingPeerState,
         )
 
+        t_received = time.time()
         if self.ft_dying_peer_state is not None:
             logger.warning(
                 "FT EP: notify_engine_death(%d) ignored -- a dying-peer "
-                "state machine for DP %d is already running.",
+                "state machine for DP %d is already running. wall_t=%.6f",
                 dead_dp_rank,
                 self.ft_dying_peer_state.dead_dp_rank,
+                t_received,
             )
             return
+        logger.warning(
+            "FT EP: notify_engine_death(%d) RECEIVED on dp_rank=%d. "
+            "wall_t=%.6f -- constructing FtDyingPeerState.",
+            dead_dp_rank,
+            getattr(self, "dp_rank", -1),
+            t_received,
+        )
         self.ft_dying_peer_state = FtDyingPeerState(
             dead_dp_rank=dead_dp_rank,
             engine_core=self,

@@ -412,17 +412,23 @@ class NixlEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
     # FT EP cascade-debug instrumentation
     # ------------------------------------------------------------------
     # Class-level state so the per-call hook is cheap and bounded.  Reads
-    # the NIXL EP buffer's mask right after dispatch / combine and logs on
-    # *every change* (steady-state all-zeros is silent after the first hit).
+    # the NIXL EP buffer's mask right after dispatch / combine and logs
+    # the snapshot on every call (not just changes) so the FULL evolution
+    # of the mask is visible -- with sticky masks, "only-on-change" logging
+    # gives us a single line saying "at some point it became X" without
+    # showing which dispatch was the trigger. Per-call logging shows the
+    # exact dispatch index at which the cascade fires.
     # Cap on total emitted logs prevents runaway growth if something keeps
     # flipping the mask.  Gated by VLLM_FT_EP_DEBUG=1 -- the env-var lookup
     # is cached on the class so the hot path stays a single attribute read
     # when disabled.
-    _FT_EP_DEBUG_MAX_LOGS = 200
+    _FT_EP_DEBUG_MAX_LOGS = 2000
     _ft_ep_debug_enabled_cached: bool | None = None
     _ft_ep_debug_n_logged: int = 0
+    _ft_ep_debug_n_calls: int = 0  # total dispatch/combine calls observed
     _ft_ep_debug_last_mask: tuple[int, ...] = ()
     _ft_ep_debug_t0_ns: int | None = None
+    _ft_ep_debug_last_call_ns: int | None = None
     _ft_ep_debug_mask_buf: torch.Tensor | None = None
 
     @classmethod
@@ -436,11 +442,18 @@ class NixlEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
     def _ft_ep_debug_after(self, label: str) -> None:
         """Snapshot the NIXL EP kernel mask after a dispatch / combine call.
 
-        Logs only when the mask snapshot CHANGES since the last call, with a
-        millisecond-resolution timestamp relative to first invocation so the
-        cascade trajectory (initial flip + any follow-on cascades) is easy
-        to correlate across workers.  Capped at ``_FT_EP_DEBUG_MAX_LOGS``
-        emissions per process so a runaway flip-flop doesn't drown the log.
+        Logs the snapshot on EVERY call (not just changes) so the full
+        cascade trajectory is visible -- which dispatch index first sees a
+        bit flip, how long between flips, etc. Each line includes:
+
+        * call number (monotonic counter)
+        * t_total_ms (wall-clock-ish since first call)
+        * t_delta_ms (since previous call -- shows dispatch cadence)
+        * the call label (dispatch / combine)
+        * whether the mask changed since the previous call
+
+        Capped at ``_FT_EP_DEBUG_MAX_LOGS`` emissions so a runaway
+        flip-flop doesn't drown the log.
         """
         cls = type(self)
         if not cls._ft_ep_debug_is_enabled():
@@ -468,19 +481,31 @@ class NixlEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             cls._ft_ep_debug_enabled_cached = False
             return
         snapshot = tuple(int(x) for x in buf.tolist())
-        if snapshot == cls._ft_ep_debug_last_mask:
-            return  # no change; stay quiet
-        cls._ft_ep_debug_last_mask = snapshot
+        now_ns = time.monotonic_ns()
         if cls._ft_ep_debug_t0_ns is None:
-            cls._ft_ep_debug_t0_ns = time.monotonic_ns()
-        elapsed_ms = (time.monotonic_ns() - cls._ft_ep_debug_t0_ns) // 1_000_000
+            cls._ft_ep_debug_t0_ns = now_ns
+            cls._ft_ep_debug_last_call_ns = now_ns
+        t_total_ms = (now_ns - cls._ft_ep_debug_t0_ns) // 1_000_000
+        last_call_ns = (
+            cls._ft_ep_debug_last_call_ns
+            if cls._ft_ep_debug_last_call_ns is not None
+            else now_ns
+        )
+        t_delta_ms = (now_ns - last_call_ns) // 1_000_000
+        cls._ft_ep_debug_last_call_ns = now_ns
+        cls._ft_ep_debug_n_calls += 1
+        changed = snapshot != cls._ft_ep_debug_last_mask
+        cls._ft_ep_debug_last_mask = snapshot
         cls._ft_ep_debug_n_logged += 1
         logger.warning(
-            "FT EP DEBUG #%d t=+%dms after %s: mask=%s "
+            "FT EP DEBUG call=%d t_total=%dms t_delta=%dms after %s "
+            "(changed=%s): mask=%s "
             "(1=dead, 0=alive, -1=unused slot). buffer.group_size=%d",
-            cls._ft_ep_debug_n_logged,
-            elapsed_ms,
+            cls._ft_ep_debug_n_calls,
+            t_total_ms,
+            t_delta_ms,
             label,
+            "Y" if changed else "n",
             list(snapshot),
             width,
         )

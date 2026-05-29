@@ -101,13 +101,21 @@ class FtDyingPeerState:
         self._announced_arrival: bool = False
         # Current state of the machine.
         self.state: DyingPeerEngineState = DyingPeerEngineState.ENTER_BARRIER
+        # High-precision wall-clock for cross-engine correlation. All log
+        # lines below include time.time() in floating-point epoch seconds
+        # so we can match "DP 0 reached barrier at t=X" with "DP 2 reached
+        # barrier at t=Y" across separate actor log files.
+        self._t_create: float = time.time()
         logger.warning(
             "FT EP: FtDyingPeerState created for dead DP rank %d "
-            "(survivor count=%d, leader_rank=%d, key=%s)",
+            "(survivor count=%d, leader_rank=%d, key=%s, dp_rank=%d) "
+            "wall_t=%.6f",
             dead_dp_rank,
             self.survivor_count,
             self.leader_rank,
             self._key_suffix,
+            self.dp_rank,
+            self._t_create,
         )
 
     @property
@@ -150,11 +158,16 @@ class FtDyingPeerState:
         if not self._announced_arrival:
             self.dp_store.add(self._barrier_count_key, 1)
             self._announced_arrival = True
+            t_now = time.time()
             logger.warning(
-                "FT EP: dying-peer barrier %s: announced arrival; "
-                "waiting for %d survivors.",
+                "FT EP: dying-peer barrier %s: dp_rank=%d announced "
+                "arrival; waiting for %d survivors. wall_t=%.6f "
+                "(t_since_create=%.3fs)",
                 self._barrier_name,
+                self.dp_rank,
                 self.survivor_count,
+                t_now,
+                t_now - self._t_create,
             )
         try:
             arrived = int(self.dp_store.get(self._barrier_count_key))
@@ -170,9 +183,14 @@ class FtDyingPeerState:
         if self.dp_rank == self.leader_rank:
             self.dp_store.delete_key(self._barrier_count_key)
         self.state = DyingPeerEngineState.REDISTRIBUTE
+        t_now = time.time()
         logger.warning(
-            "FT EP: dying-peer barrier %s passed; advancing to REDISTRIBUTE.",
+            "FT EP: dying-peer barrier %s passed; dp_rank=%d advancing to "
+            "REDISTRIBUTE. wall_t=%.6f (t_since_create=%.3fs)",
             self._barrier_name,
+            self.dp_rank,
+            t_now,
+            t_now - self._t_create,
         )
         return True
 
@@ -285,12 +303,17 @@ class FtDyingPeerState:
                 state.active_ranks[ep_slot] = 0
                 flipped = True
         state.sync_active_to_cpu()
+        t_redistribute_start = time.time()
         logger.warning(
             "FT EP: REDISTRIBUTE running for dead DP %d (EP slots %s, "
-            "aborted %d in-flight req(s)).",
+            "aborted %d in-flight req(s)). dp_rank=%d wall_t=%.6f "
+            "(t_since_create=%.3fs)",
             self.dead_dp_rank,
             newly_dead_ep_slots,
             len(running),
+            self.dp_rank,
+            t_redistribute_start,
+            t_redistribute_start - self._t_create,
         )
 
         if flipped:
@@ -309,7 +332,14 @@ class FtDyingPeerState:
 
         state.snapshot_active_to_last()
         self.state = DyingPeerEngineState.COMPLETE
+        t_complete = time.time()
         logger.warning(
-            "FT EP: dying-peer state machine for dead DP %d -> COMPLETE.",
+            "FT EP: dying-peer state machine for dead DP %d -> COMPLETE. "
+            "dp_rank=%d wall_t=%.6f (t_since_create=%.3fs, "
+            "redistribute_took=%.3fs)",
             self.dead_dp_rank,
+            self.dp_rank,
+            t_complete,
+            t_complete - self._t_create,
+            t_complete - t_redistribute_start,
         )

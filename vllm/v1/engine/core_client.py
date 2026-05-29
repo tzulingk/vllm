@@ -1449,12 +1449,17 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                     if idx in _self.dead_engine_indices:
                         continue
                     _self.dead_engine_indices.add(idx)
+                    import time as _time
+
+                    _t_death = _time.time()
                     logger.warning(
                         "FT NIXL EP: DP engine %d died (%s). Dispatcher "
-                        "will skip rank %d; survivors continue serving.",
+                        "will skip rank %d; survivors continue serving. "
+                        "wall_t=%.6f",
                         idx,
                         cause,
                         idx,
+                        _t_death,
                     )
                     _self._abort_in_flight_for_dead_engine(idx)
                     # Broadcast to surviving engines so they all converge on
