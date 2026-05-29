@@ -1635,7 +1635,30 @@ class EngineCoreProc(EngineCore):
                     waited = True
             block = self.process_input_queue_block
             try:
+                if block and self.input_queue.empty():
+                    # FT EP debug: surface when an engine parks itself in
+                    # input_queue.get(block=True). If this fires for an
+                    # engine that has no in-flight work and never sees a
+                    # subsequent unblock log, the engine is stuck idle
+                    # and won't participate in the next DP collective.
+                    logger.warning(
+                        "FT EP busy_loop: dp_rank=%d about to BLOCK in "
+                        "input_queue.get (block=True, queue empty) "
+                        "engines_running=%s wall_t=%.6f",
+                        getattr(self, "dp_rank", -1),
+                        getattr(self, "engines_running", "n/a"),
+                        time.time(),
+                    )
                 req = self.input_queue.get(block=block)
+                logger.warning(
+                    "FT EP busy_loop: dp_rank=%d input_queue.get returned "
+                    "req_type=%s wall_t=%.6f",
+                    getattr(self, "dp_rank", -1),
+                    type(req[0]).__name__
+                    if isinstance(req, tuple)
+                    else type(req).__name__,
+                    time.time(),
+                )
                 self._handle_client_request(*req)
             except queue.Empty:
                 break
@@ -2311,6 +2334,18 @@ class DPEngineCoreProc(EngineCoreProc):
                     # on its own without external input.
                     self.process_input_queue_block = True
                     self.ft_dying_peer_state = None
+                    logger.warning(
+                        "FT EP busy_loop: dp_rank=%d post-COMPLETE "
+                        "restored process_input_queue_block=True "
+                        "engines_running=%s "
+                        "scheduler.has_unfinished_requests=%s "
+                        "input_queue.qsize=%d wall_t=%.6f",
+                        getattr(self, "dp_rank", -1),
+                        self.engines_running,
+                        self.scheduler.has_unfinished_requests(),
+                        self.input_queue.qsize(),
+                        time.time(),
+                    )
 
             executed = self._process_engine_step()
             self._maybe_publish_request_counts()
@@ -2323,7 +2358,22 @@ class DPEngineCoreProc(EngineCoreProc):
 
                 # We are in a running state and so must execute a dummy pass
                 # if the model didn't execute any ready requests.
+                _ft_t0 = time.time()
+                logger.warning(
+                    "FT EP busy_loop: dp_rank=%d execute_dummy_batch START "
+                    "engines_running=%s wall_t=%.6f",
+                    getattr(self, "dp_rank", -1),
+                    self.engines_running,
+                    _ft_t0,
+                )
                 self.execute_dummy_batch()
+                logger.warning(
+                    "FT EP busy_loop: dp_rank=%d execute_dummy_batch DONE "
+                    "took=%.3fs wall_t=%.6f",
+                    getattr(self, "dp_rank", -1),
+                    time.time() - _ft_t0,
+                    time.time(),
+                )
 
             # 3) All-reduce operation to determine global unfinished reqs.
             self.engines_running = self._has_global_unfinished_reqs(
