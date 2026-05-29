@@ -6,12 +6,24 @@ Modeled on
 :class:`vllm.distributed.elastic_ep.elastic_state.ElasticEPScalingState`:
 each surviving engine drives its own copy of the state machine through
 its ``run_busy_loop``, advancing at most one state per loop tick.
-Cross-DP synchronization is a TCPStore-based non-blocking barrier with
-a 5-second first-attempt timeout (mirroring elastic-EP's
-``_staged_barrier``): engines that arrive at the barrier early fall
-back to a normal forward pass and retry on the next tick, so peers
-slightly behind in their loops can catch up without anyone being
-silent on NIXL EP.
+Cross-DP synchronization is two-layered: (1) a TCPStore counter that
+each survivor increments once on arrival, used as a non-blocking
+"all peers received the notify" check; (2) a survivors-only barrier
+via :class:`FaultTolerantGlooGroup` all_reduce -- this rebuilds the
+gloo sub-group to exclude the dead rank (which EPLB collectives in
+REDISTRIBUTE need anyway) and serves as the actual cross-rank
+synchronization, with a 5-second first-attempt timeout. Engines that
+arrive at the barrier early fall back to a normal forward pass and
+retry on the next tick, so peers slightly behind in their loops can
+catch up without anyone being silent on NIXL EP.
+
+Why FT-gloo instead of ``torch.distributed.barrier(dp_group)``: the
+elastic-EP ``_staged_barrier`` uses TCPStore-poll + dp_group barrier,
+where the dp_group barrier ensures the leader cleanup of arrival
+keys can't race with slow joiners. We can't use dp_group directly
+because it still includes the dead rank (would hang forever).
+FT-gloo gives the same all-ranks-here semantics on a survivor-only
+sub-group.
 
 This shape exists because of DYN-3121: if a single fast-path notify
 handler runs the slow ``eplb_redistribute_for_dead_peers`` inline,
@@ -27,12 +39,11 @@ that cascade window.
 import enum
 import time
 import weakref
-from datetime import timedelta
 from typing import TYPE_CHECKING
 
-from torch.distributed import Store
+import torch
+from torch.distributed import ReduceOp, Store
 
-from vllm.distributed import sched_yield
 from vllm.logger import init_logger
 
 if TYPE_CHECKING:
@@ -55,10 +66,6 @@ class DyingPeerEngineState(enum.IntEnum):
 # set), no timeout (wait indefinitely, because every engine will
 # eventually arrive in normal operation).
 _BARRIER_FIRST_ATTEMPT_TIMEOUT_S = 5.0
-
-
-class _BarrierTimeoutError(RuntimeError):
-    """First-attempt staged-barrier timeout signal."""
 
 
 class FtDyingPeerState:
@@ -195,65 +202,92 @@ class FtDyingPeerState:
         return True
 
     def _staged_barrier(self) -> bool:
-        """TCPStore-only staged barrier.
+        """Survivors-only staged barrier via :class:`FaultTolerantGlooGroup`.
 
-        Skips the ``torch.distributed.barrier(dp_group)`` that
-        elastic-EP's version uses: our ``dp_group`` still includes the
-        dead rank and would hang forever. The TCPStore polling barrier
-        on its own gives wall-clock synchronization for surviving
-        ranks.
+        Replaces the original "per-rank arrival key + leader cleanup"
+        polling barrier, which had a race where the leader could
+        ``delete_key`` arrival keys before a slow survivor observed
+        them, deadlocking the slow survivor on its next poll (DYN-3121
+        sub-issue, seen in the 2026-05-28 run where DP3 announced
+        arrival last and then went silent forever).
+
+        Mirrors elastic-EP's pattern of TCPStore-poll + collective
+        barrier (``elastic_state.py``, line 215), but on a survivors-
+        only sub-group instead of ``dp_group`` -- because ``dp_group``
+        still includes the dead rank and ``torch.distributed.barrier``
+        on it hangs.
+
+        The all_reduce serves three purposes at once:
+          1. Synchronization barrier (every survivor must arrive
+             before any survivor can proceed).
+          2. Rebuilds the FT-gloo sub-group to exclude the dead rank,
+             which is the exact group that EPLB cross-DP collectives
+             in REDISTRIBUTE need next.
+          3. Implicitly fails if any "survivor" turns out to be also
+             dead (the rebuild rendezvous times out), surfacing as
+             ``valid=False`` for the caller to retry.
+
+        Sync key pattern preserved: first attempt uses 5s timeout;
+        if any rank times out the first attempt is marked sync_key
+        on the TCPStore and the next attempt uses a long timeout
+        (60s) to allow stragglers to arrive.
         """
+        from vllm.distributed.elastic_ep.ft_gloo import DPFTGlooManager
+
         sync_key = f"{self._barrier_name}_sync"
-        timeout = (
-            None
-            if self.dp_store.check([sync_key])
-            else timedelta(seconds=_BARRIER_FIRST_ATTEMPT_TIMEOUT_S)
+        first_attempt = not self.dp_store.check([sync_key])
+        timeout_ms = (
+            int(_BARRIER_FIRST_ATTEMPT_TIMEOUT_S * 1000) if first_attempt else 60_000
         )
-        try:
-            self._execute_tcp_store_barrier(timeout=timeout)
-            if self.dp_rank == self.leader_rank:
-                for r in range(self.dp_world_size):
-                    if r == self.dead_dp_rank:
-                        continue
-                    self.dp_store.delete_key(self._arrival_key(r))
-                if self.dp_store.check([sync_key]):
-                    self.dp_store.delete_key(sync_key)
+
+        ft = DPFTGlooManager.instance()
+        if ft is None:
+            # FT NIXL EP deployments always init DPFTGlooManager at engine
+            # startup; if we got here without one, something is wrong with
+            # the deployment. Surface it loudly rather than silently
+            # falling through (which would re-introduce the cleanup race).
+            raise RuntimeError(
+                "FT EP: FtDyingPeerState requires DPFTGlooManager to be "
+                "initialized for the survivors-only barrier."
+            )
+
+        # active_mask: 1 for surviving DP ranks, 0 for the dead rank.
+        # FaultTolerantGlooGroup rebuilds the underlying gloo subgroup
+        # if the active set differs from its last call -- on the first
+        # FtDyingPeerState event this rebuild happens here (which is
+        # exactly what we want for REDISTRIBUTE's downstream collectives).
+        survivor_mask = [
+            1 if r != self.dead_dp_rank else 0 for r in range(self.dp_world_size)
+        ]
+        # Dummy tensor: any all_reduce on the survivor sub-group serves
+        # as a barrier; SUM of zeros stays zero so the result is unused.
+        dummy = torch.zeros(1, dtype=torch.float32)
+        _, valid = ft.all_reduce(
+            dummy,
+            op=ReduceOp.SUM,
+            active_mask=survivor_mask,
+            timeout_ms=timeout_ms,
+        )
+        if valid:
+            # Leader clears the sync_key so the next FT event on a
+            # different dead rank starts with a fresh first-attempt
+            # timeout.
+            if self.dp_rank == self.leader_rank and self.dp_store.check([sync_key]):
+                self.dp_store.delete_key(sync_key)
             return True
-        except _BarrierTimeoutError as e:
-            if timeout is None:
-                raise RuntimeError(
-                    "FT EP: unexpected timeout on second-stage barrier "
-                    f"{self._barrier_name} (should not happen with timeout=None)"
-                ) from e
-            # First-stage timeout: mark the sync key so the next attempt
-            # uses no timeout and blocks until everyone arrives.
+
+        if first_attempt:
+            # Mark sync_key so the next progress() tick uses the long
+            # timeout; the caller (progress_enter_barrier) will fall
+            # back to a normal forward pass meanwhile.
             self.dp_store.compare_set(sync_key, "", b"1")
             return False
-
-    def _arrival_key(self, rank: int) -> str:
-        return f"arrival_{self._barrier_name}_{rank}"
-
-    def _execute_tcp_store_barrier(self, timeout):
-        arrival_key = self._arrival_key(self.dp_rank)
-        self.dp_store.set(arrival_key, b"1")
-
-        start = time.time()
-        expected = {r for r in range(self.dp_world_size) if r != self.dead_dp_rank}
-        arrived: set[int] = set()
-        while arrived != expected:
-            if timeout is not None and time.time() - start > timeout.total_seconds():
-                raise _BarrierTimeoutError(
-                    f"FT EP: barrier {self._barrier_name} first-attempt "
-                    f"timeout after {timeout.total_seconds()}s; "
-                    f"arrived={sorted(arrived)}, expected={sorted(expected)}"
-                )
-            for r in expected:
-                if r in arrived:
-                    continue
-                if self.dp_store.check([self._arrival_key(r)]):
-                    arrived.add(r)
-            if arrived != expected:
-                sched_yield()
+        raise RuntimeError(
+            f"FT EP: FT-gloo survivors-only barrier failed even on the "
+            f"long-timeout retry for {self._barrier_name}; survivor set "
+            f"{[r for r in range(self.dp_world_size) if r != self.dead_dp_rank]} "
+            f"may be split."
+        )
 
     def _progress_redistribute(self) -> None:
         """REDISTRIBUTE: update PeerActiveState and run the slow disk reload.
