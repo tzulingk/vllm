@@ -338,7 +338,26 @@ def ft_or_raw_all_reduce(
     ft = DPFTGlooManager.instance()
     state = PeerActiveStateManager.instance()
     if ft is None or state is None:
-        dist.all_reduce(tensor, op=op, group=dp_group)
+        # Fallback: FT singletons aren't initialized in this process.
+        # This is the case on the Worker (Ray subprocess) because
+        # DPFTGlooManager.init() runs in the Actor's __init__ and the
+        # per-process singleton doesn't propagate. The raw all_reduce
+        # below was hanging indefinitely (DYN-3121) when a peer died and
+        # the local gloo socket was in a half-closed state -- the send
+        # buffered into the OS, the recv blocked forever, no vllm-level
+        # timeout. The async_op+work.wait(timeout) pattern bounds that
+        # wait so the existing dp_utils.py:_run_ar exception handler
+        # can catch the failure and proceed local-only.
+        work = dist.all_reduce(tensor, op=op, group=dp_group, async_op=True)
+        try:
+            work.wait(timeout=timedelta(seconds=10))
+        except (RuntimeError, TimeoutError) as e:
+            # _run_ar's chain-walking catch in dp_utils.py recognizes
+            # both RuntimeError and ValueError shapes; re-raise as the
+            # same shape so its dead-peer detection path fires.
+            raise RuntimeError(
+                f"ft_or_raw_all_reduce fallback timed out on dp_group: {e}"
+            ) from e
         return
 
     # PeerActiveState is EP-indexed (one bit per GPU). The DP FT gloo
