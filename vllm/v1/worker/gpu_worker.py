@@ -4,6 +4,7 @@
 
 import gc
 import os
+import time
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from datetime import timedelta
@@ -201,15 +202,38 @@ class Worker(WorkerBase):
             reload_experts_from_disk,
         )
 
+        t_enter = time.time()
+        logger.warning(
+            "FT EP worker: eplb_redistribute_for_dead_peers ENTER "
+            "dead_ep_ranks=%s wall_t=%.6f",
+            sorted(dead_ep_ranks),
+            t_enter,
+        )
+
         if not dead_ep_ranks:
+            logger.warning(
+                "FT EP worker: eplb_redistribute_for_dead_peers EXIT "
+                "(empty dead_ep_ranks) took=%.3fs",
+                time.time() - t_enter,
+            )
             return False
         eplb_state = getattr(self.model_runner, "eplb_state", None)
         if eplb_state is None:
+            logger.warning(
+                "FT EP worker: eplb_redistribute_for_dead_peers EXIT "
+                "(no eplb_state on model_runner) took=%.3fs",
+                time.time() - t_enter,
+            )
             return False
 
         model_config = self.model_runner.model_config
         eplb_model_state = eplb_state.model_states.get(model_config.compute_hash())
         if eplb_model_state is None:
+            logger.warning(
+                "FT EP worker: eplb_redistribute_for_dead_peers EXIT "
+                "(no model_state) took=%.3fs",
+                time.time() - t_enter,
+            )
             return False
 
         p2l = eplb_model_state.physical_to_logical_map
@@ -222,11 +246,25 @@ class Worker(WorkerBase):
         try:
             num_local_experts = p2l.shape[1] // get_ep_group().world_size
         except Exception:
+            logger.warning(
+                "FT EP worker: eplb_redistribute_for_dead_peers EXIT "
+                "(get_ep_group failed) took=%.3fs",
+                time.time() - t_enter,
+            )
             return False
 
         mark_dead_columns_inplace(p2l, set(dead_ep_ranks), num_local_experts)
+        logger.warning(
+            "FT EP worker: mark_dead_columns done t=%.3fs",
+            time.time() - t_enter,
+        )
         try:
             reassignments = reassign_missing_experts_inplace(p2l, num_logical)
+            logger.warning(
+                "FT EP worker: reassign_missing_experts done t=%.3fs reassignments=%d",
+                time.time() - t_enter,
+                len(reassignments) if reassignments else 0,
+            )
         except RuntimeError as e:
             # Redundancy exhausted -- there isn't a donor slot for every
             # missing logical expert. Rebuild derived maps from what
@@ -243,11 +281,22 @@ class Worker(WorkerBase):
             rebuild_derived_maps_inplace(p2l, l2p, lrc)
             return False
         rebuild_derived_maps_inplace(p2l, l2p, lrc)
+        logger.warning(
+            "FT EP worker: rebuild_derived_maps done t=%.3fs",
+            time.time() - t_enter,
+        )
         if reassignments:
             # The placement table now points reassigned slots at logical
             # ids whose weights live elsewhere. Pull those weights from
             # the HF checkpoint into the donor slot's GPU buffer.
             model = self.model_runner.model
+            t_reload_start = time.time()
+            logger.warning(
+                "FT EP worker: reload_experts_from_disk START "
+                "n_reassignments=%d t=%.3fs",
+                len(reassignments),
+                t_reload_start - t_enter,
+            )
             try:
                 loaded_count = reload_experts_from_disk(
                     model, self.vllm_config, reassignments
@@ -258,6 +307,11 @@ class Worker(WorkerBase):
                     loaded_count,
                     len(reassignments),
                     sorted(dead_ep_ranks),
+                )
+                logger.warning(
+                    "FT EP worker: reload_experts_from_disk DONE loaded=%d took=%.3fs",
+                    loaded_count,
+                    time.time() - t_reload_start,
                 )
             except Exception as e:
                 # Reloading a few experts shouldn't be load-bearing for
@@ -273,6 +327,12 @@ class Worker(WorkerBase):
                     sorted(dead_ep_ranks),
                     e,
                 )
+        logger.warning(
+            "FT EP worker: eplb_redistribute_for_dead_peers EXIT "
+            "returning=%s total_took=%.3fs",
+            bool(reassignments),
+            time.time() - t_enter,
+        )
         return bool(reassignments)
 
     def query_nixl_ep_mask(self) -> torch.Tensor | None:

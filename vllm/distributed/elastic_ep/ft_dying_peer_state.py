@@ -351,16 +351,37 @@ class FtDyingPeerState:
         )
 
         if flipped:
+            t_rpc_start = time.time()
+            logger.warning(
+                "FT EP: DP %d entering collective_rpc("
+                "eplb_redistribute_for_dead_peers, ep_slots=%s) "
+                "wall_t=%.6f",
+                self.dp_rank,
+                newly_dead_ep_slots,
+                t_rpc_start,
+            )
             try:
                 ec.collective_rpc(
                     "eplb_redistribute_for_dead_peers",
                     args=(newly_dead_ep_slots,),
                 )
-            except Exception as e:
+                t_rpc_end = time.time()
                 logger.warning(
-                    "FT EP: REDISTRIBUTE for dead DP %d -- "
-                    "eplb_redistribute_for_dead_peers RPC failed: %s",
-                    self.dead_dp_rank,
+                    "FT EP: DP %d collective_rpc("
+                    "eplb_redistribute_for_dead_peers) RETURNED "
+                    "took=%.3fs wall_t=%.6f",
+                    self.dp_rank,
+                    t_rpc_end - t_rpc_start,
+                    t_rpc_end,
+                )
+            except Exception as e:
+                t_rpc_end = time.time()
+                logger.warning(
+                    "FT EP: DP %d collective_rpc("
+                    "eplb_redistribute_for_dead_peers) FAILED "
+                    "after=%.3fs: %s",
+                    self.dp_rank,
+                    t_rpc_end - t_rpc_start,
                     e,
                 )
 
