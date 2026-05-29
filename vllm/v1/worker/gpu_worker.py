@@ -158,6 +158,67 @@ class Worker(WorkerBase):
         # pending non-blocking PP send work from the previous iteration
         self._pp_send_work: list[Handle] = []
 
+        # FT NIXL EP: initialize the FT-gloo wrapper + PeerActiveState
+        # singletons IN THIS WORKER PROCESS too.
+        #
+        # These singletons are process-local; the init call inside
+        # DPEngineCoreProc.__init__ (the Actor) does NOT carry over
+        # into the Ray-spawned Worker. Without this init, the Worker's
+        # per-step DP collective (`_run_ar` -> `ft_or_raw_all_reduce`)
+        # falls back to `dist.all_reduce(group=dp_group)` on the
+        # original DP-world-size gloo group, which still includes any
+        # dead peers -- and that raw all_reduce can hang the worker
+        # indefinitely (DYN-3121 post-redistribute cascade root cause).
+        #
+        # IMPORTANT: pass a coord_key DISTINCT from the Actor's so the
+        # Worker's port-rendezvous doesn't read the stale port written
+        # by the earlier Actor call (`stateless_init_dp_group` defaults
+        # to coord_key="dp_master_port"). An earlier attempt that
+        # omitted this caused Worker rank N to read the closed Actor
+        # master port and hang 30 min in c10d.waitForInput.
+        parallel_config = vllm_config.parallel_config
+        if parallel_config.all2all_backend == "nixl_ep":
+            from vllm.distributed.elastic_ep.ft_gloo import DPFTGlooManager
+            from vllm.distributed.elastic_ep.peer_state import (
+                PeerActiveStateManager,
+            )
+
+            dp_size = parallel_config.data_parallel_size
+            dp_rank = parallel_config.data_parallel_rank
+            tp_size = parallel_config.tensor_parallel_size
+            ep_size = dp_size * tp_size
+
+            if not PeerActiveStateManager.is_initialized():
+                PeerActiveStateManager.init(ep_size=ep_size, tp_size=tp_size)
+                logger.warning(
+                    "FT EP shutdown trace: Worker initialized "
+                    "PeerActiveStateManager(ep_size=%d, tp_size=%d) "
+                    "dp_rank=%d",
+                    ep_size,
+                    tp_size,
+                    dp_rank,
+                )
+
+            if not DPFTGlooManager.is_initialized():
+                _, worker_dp_store = parallel_config.stateless_init_dp_group(
+                    return_store=True,
+                    coord_key="worker_dp_master_port",
+                )
+                DPFTGlooManager.init(
+                    store=worker_dp_store,
+                    master_addr=parallel_config.data_parallel_master_ip,
+                    my_global_rank=dp_rank,
+                    total_world_size=dp_size,
+                )
+                logger.warning(
+                    "FT EP shutdown trace: Worker initialized "
+                    "DPFTGlooManager(dp_rank=%d, dp_size=%d, "
+                    "master_addr=%s, coord_key=worker_dp_master_port)",
+                    dp_rank,
+                    dp_size,
+                    parallel_config.data_parallel_master_ip,
+                )
+
     def eplb_redistribute_for_dead_peers(self, dead_ep_ranks: list[int]) -> bool:
         """Update EPLB placement after one or more EP peers die.
 

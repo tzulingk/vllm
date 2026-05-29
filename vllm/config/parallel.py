@@ -542,12 +542,20 @@ class ParallelConfig:
 
         return answer
 
-    def _pick_stateless_dp_port(self) -> tuple[int, socket.socket | None]:
+    def _pick_stateless_dp_port(
+        self, coord_key: str = "dp_master_port"
+    ) -> tuple[int, socket.socket | None]:
         """Return ``(port, listen_socket)`` for DP group init.
 
         With a coord store, rank 0 binds a socket and publishes the port;
         others read it.  Without one, pops a pre-allocated port and
         returns ``listen_socket=None``.
+
+        ``coord_key`` is the TCPStore key used for the port rendezvous.
+        The default ``"dp_master_port"`` is what Actor-side callers use.
+        Other callers (e.g. the Worker-side FT-gloo init) MUST pass a
+        distinct key so their rendezvous doesn't read a stale port from
+        the Actor's earlier write or race with concurrent overwrites.
         """
         if not self._coord_store_port:
             return self.get_next_dp_init_port(), None
@@ -558,27 +566,28 @@ class ParallelConfig:
             self.data_parallel_master_ip, self._coord_store_port
         )
 
-        key = "dp_master_port"
         if self.data_parallel_rank == 0:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.bind((self.data_parallel_master_ip, 0))
             s.listen()
             port = s.getsockname()[1]
-            store.set(key, str(port).encode())
+            store.set(coord_key, str(port).encode())
             return port, s
         else:
-            return int(store.get(key).decode()), None
+            return int(store.get(coord_key).decode()), None
 
     @overload
     def stateless_init_dp_group(
-        self, return_store: Literal[False] = ...
+        self, return_store: Literal[False] = ..., coord_key: str = ...
     ) -> ProcessGroup: ...
     @overload
     def stateless_init_dp_group(
-        self, return_store: Literal[True] = ...
+        self, return_store: Literal[True] = ..., coord_key: str = ...
     ) -> tuple[ProcessGroup, Store]: ...
     def stateless_init_dp_group(
-        self, return_store: bool = False
+        self,
+        return_store: bool = False,
+        coord_key: str = "dp_master_port",
     ) -> ProcessGroup | tuple[ProcessGroup, Store]:
         # NOTE: In high-concurrency scenarios multiple processes
         # can pick the same (currently free) port through a race
@@ -597,7 +606,7 @@ class ParallelConfig:
         last_exc: Exception | None = None
         for _ in range(max_retries):
             try:
-                port, listen_socket = self._pick_stateless_dp_port()
+                port, listen_socket = self._pick_stateless_dp_port(coord_key=coord_key)
                 # use gloo since the engine process might not have cuda device
                 return stateless_init_torch_distributed_process_group(
                     self.data_parallel_master_ip,
