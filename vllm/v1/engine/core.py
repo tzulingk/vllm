@@ -1568,6 +1568,15 @@ class EngineCoreProc(EngineCore):
             signal_callback = SignalCallback(wakeup_engine)
 
             def signal_handler(signum, frame):
+                import os as _os
+
+                logger.warning(
+                    "FT EP shutdown trace: signal_handler caught signum=%s "
+                    "in pid=%d (dp_rank=%s); setting shutdown_state=REQUESTED",
+                    signum,
+                    _os.getpid(),
+                    getattr(engine_core, "dp_rank", "n/a"),
+                )
                 engine_core.shutdown_state = EngineShutdownState.REQUESTED
                 signal_callback.trigger()
 
@@ -1577,9 +1586,25 @@ class EngineCoreProc(EngineCore):
             engine_core.run_busy_loop()
 
         except SystemExit:
-            logger.debug("EngineCore exiting.")
+            import traceback as _tb
+
+            logger.warning(
+                "FT EP shutdown trace: SystemExit caught at engine_core.run() "
+                "boundary -- run_busy_loop has exited. dp_rank=%s "
+                "shutdown_state=%s. Recent traceback:\n%s",
+                getattr(engine_core, "dp_rank", "n/a") if engine_core else "n/a",
+                getattr(engine_core, "shutdown_state", "n/a") if engine_core else "n/a",
+                "".join(_tb.format_stack()),
+            )
             raise
         except Exception as e:
+            logger.warning(
+                "FT EP shutdown trace: Exception caught at engine_core.run() "
+                "boundary -- run_busy_loop raised %s: %s. dp_rank=%s",
+                type(e).__name__,
+                e,
+                getattr(engine_core, "dp_rank", "n/a") if engine_core else "n/a",
+            )
             if engine_core is None:
                 logger.exception("EngineCore failed to start.")
             else:
@@ -1611,12 +1636,22 @@ class EngineCoreProc(EngineCore):
 
     def run_busy_loop(self):
         """Core busy loop of the EngineCore."""
+        logger.warning(
+            "FT EP shutdown trace: run_busy_loop (base) ENTERED dp_rank=%s pid=%d",
+            getattr(self, "dp_rank", "n/a"),
+            os.getpid(),
+        )
         while self._handle_shutdown():
             # 1) Poll the input queue until there is work to do.
             self._process_input_queue()
             # 2) Step the engine core and return the outputs.
             self._process_engine_step()
 
+        logger.warning(
+            "FT EP shutdown trace: run_busy_loop (base) while-loop EXITED "
+            "naturally; about to raise SystemExit (dp_rank=%s)",
+            getattr(self, "dp_rank", "n/a"),
+        )
         raise SystemExit
 
     def _process_input_queue(self):
@@ -1703,6 +1738,13 @@ class EngineCoreProc(EngineCore):
         if self.shutdown_state == EngineShutdownState.RUNNING:
             return True
 
+        logger.warning(
+            "FT EP shutdown trace: _handle_shutdown observed "
+            "shutdown_state=%s (dp_rank=%s); processing shutdown.",
+            self.shutdown_state,
+            getattr(self, "dp_rank", "n/a"),
+        )
+
         if self.shutdown_state == EngineShutdownState.REQUESTED:
             shutdown_timeout = self.vllm_config.shutdown_timeout
 
@@ -1725,10 +1767,20 @@ class EngineCoreProc(EngineCore):
                         shutdown_timeout,
                     )
 
+            logger.warning(
+                "FT EP shutdown trace: transitioning "
+                "REQUESTED -> SHUTTING_DOWN (dp_rank=%s)",
+                getattr(self, "dp_rank", "n/a"),
+            )
             self.shutdown_state = EngineShutdownState.SHUTTING_DOWN
 
         # Exit when no work remaining
         if not self.has_work():
+            logger.warning(
+                "FT EP shutdown trace: _handle_shutdown returning False -- "
+                "while loop will exit (dp_rank=%s has_work=False)",
+                getattr(self, "dp_rank", "n/a"),
+            )
             logger.info("Shutdown complete")
             return False
 
@@ -1763,6 +1815,11 @@ class EngineCoreProc(EngineCore):
             )
             self._invoke_utility_method(method_name, get_result, output, enqueue_output)
         elif request_type == EngineCoreRequestType.EXECUTOR_FAILED:
+            logger.warning(
+                "FT EP shutdown trace: EXECUTOR_FAILED request received "
+                "(dp_rank=%s); about to raise RuntimeError('Executor failed.')",
+                getattr(self, "dp_rank", "n/a"),
+            )
             raise RuntimeError("Executor failed.")
         else:
             logger.error(
@@ -1829,6 +1886,11 @@ class EngineCoreProc(EngineCore):
     def _send_engine_dead(self):
         """Send EngineDead status to the EngineCoreClient."""
 
+        logger.warning(
+            "FT EP shutdown trace: _send_engine_dead CALLED -- enqueueing "
+            "ENGINE_CORE_DEAD to API server (dp_rank=%s)",
+            getattr(self, "dp_rank", "n/a"),
+        )
         # Put ENGINE_CORE_DEAD in the queue.
         self.output_queue.put_nowait(EngineCoreProc.ENGINE_CORE_DEAD)
 
@@ -2300,6 +2362,11 @@ class DPEngineCoreProc(EngineCoreProc):
     def run_busy_loop(self):
         """Core busy loop of the EngineCore for data parallel case."""
 
+        logger.warning(
+            "FT EP shutdown trace: run_busy_loop (DP) ENTERED dp_rank=%s pid=%d",
+            getattr(self, "dp_rank", "n/a"),
+            os.getpid(),
+        )
         # Loop until process is sent a SIGINT or SIGTERM
         while self._handle_shutdown():
             # 1) Poll the input queue until there is work to do.
@@ -2311,6 +2378,12 @@ class DPEngineCoreProc(EngineCoreProc):
                 _ = self.eep_scaling_state.progress()
                 if self.eep_scaling_state.is_complete():
                     if self.eep_scaling_state.worker_type == "removing":
+                        logger.warning(
+                            "FT EP shutdown trace: eep_scaling_state COMPLETE "
+                            "with worker_type=removing; about to raise SystemExit "
+                            "(dp_rank=%s)",
+                            getattr(self, "dp_rank", "n/a"),
+                        )
                         raise SystemExit
                     self.process_input_queue_block = True
                     self.eep_scaling_state = None
@@ -2400,6 +2473,13 @@ class DPEngineCoreProc(EngineCoreProc):
                 self.current_wave += 1
                 self.step_counter = 0
 
+        logger.warning(
+            "FT EP shutdown trace: run_busy_loop (DP) while-loop EXITED "
+            "naturally; about to raise SystemExit (dp_rank=%s "
+            "shutdown_state=%s)",
+            getattr(self, "dp_rank", "n/a"),
+            self.shutdown_state,
+        )
         raise SystemExit
 
     def _has_global_unfinished_reqs(self, local_unfinished: bool) -> bool:
@@ -2707,15 +2787,41 @@ class EngineCoreActorMixin:
         """
         Run the engine core busy loop.
         """
+        logger.warning(
+            "FT EP shutdown trace: actor.run() ENTERED on dp_rank=%s pid=%d",
+            getattr(self, "dp_rank", "n/a"),
+            os.getpid(),
+        )
         try:
             self.run_busy_loop()  # type: ignore[attr-defined]
         except SystemExit:
-            logger.debug("EngineCore exiting.")
+            import traceback as _tb
+
+            logger.warning(
+                "FT EP shutdown trace: actor.run() caught SystemExit "
+                "from run_busy_loop (dp_rank=%s shutdown_state=%s). "
+                "Traceback:\n%s",
+                getattr(self, "dp_rank", "n/a"),
+                getattr(self, "shutdown_state", "n/a"),
+                "".join(_tb.format_stack()),
+            )
             raise
-        except Exception:
+        except Exception as _e:
+            logger.warning(
+                "FT EP shutdown trace: actor.run() caught Exception "
+                "%s: %s (dp_rank=%s)",
+                type(_e).__name__,
+                _e,
+                getattr(self, "dp_rank", "n/a"),
+            )
             logger.exception("EngineCore encountered a fatal error.")
             raise
         finally:
+            logger.warning(
+                "FT EP shutdown trace: actor.run() FINALLY calling "
+                "self.shutdown() (dp_rank=%s)",
+                getattr(self, "dp_rank", "n/a"),
+            )
             self.shutdown()  # type: ignore[attr-defined]
 
 
