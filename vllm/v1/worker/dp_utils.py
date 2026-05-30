@@ -50,7 +50,30 @@ def _run_ar(
     tensor_cpu[2][dp_rank] = 1 if should_ubatch else 0
     tensor_cpu[3][dp_rank] = cudagraph_mode
     tensor = tensor_cpu.to(device, non_blocking=True)
-    dist.all_reduce(tensor, group=group)
+    # ft-nixl-ep-kernel-mask-repro: guard the cross-DP all_reduce against
+    # the c10d cascade that fires when one DP rank dies. Without this
+    # guard, the surviving Workers raise `Connection closed by peer`
+    # (chained with `Process group ... is not initialized in the world
+    # group map`), which their busy_loop doesn't recover from -- the
+    # whole cluster cascade-dies. With the guard, the local Worker
+    # absorbs the failure, keeps stepping with its local contribution
+    # only (degraded for this step, no ubatching / cudagraph), and the
+    # actor's run_busy_loop stays alive long enough for the kernel-mask
+    # consensus check to fire and observe what each rank's NIXL EP
+    # kernel reports about the dead peer.
+    try:
+        dist.all_reduce(tensor, group=group)
+    except (RuntimeError, ValueError) as e:
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "FT EP CASCADE GUARD: dp_group all_reduce on dp_rank=%d failed "
+            "(%s: %s); proceeding with local-only contribution for this "
+            "step. Ubatching + cudagraph will be disabled.",
+            dp_rank,
+            type(e).__name__,
+            e,
+        )
     return tensor
 
 
