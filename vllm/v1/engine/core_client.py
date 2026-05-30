@@ -1436,6 +1436,19 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             current_counts[eng_index][0] += self.client_count
 
         chosen_engine = self.core_engines[eng_index]
+        # ft-nixl-ep-kernel-mask-repro: log each request -> DP rank routing
+        # decision so we can diagnose why one rank (e.g. DP0) ends up not
+        # observing DP1 dead in the kernel mask. Includes the lb_engines
+        # counts at the moment of pick so we can correlate the choice with
+        # the (waiting * 4 + running) score.
+        logger.info(
+            "FT EP LB ROUTE: request_id=%s -> dp_rank=%d "
+            "(lb_engines=%s, eng_start_index=%d)",
+            request.request_id,
+            eng_index,
+            self.lb_engines,
+            self.eng_start_index,
+        )
         # Record which engine is chosen for this request, to handle aborts.
         self.reqs_in_flight[request.request_id] = chosen_engine
         return chosen_engine
