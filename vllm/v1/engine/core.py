@@ -587,6 +587,20 @@ class EngineCore:
 
         self._ft_ep_debug_engine_mask(masks)
 
+        # VLLM_FT_EP_OBSERVE_ONLY=1: divergence-investigation mode. The
+        # engine still POLLS the kernel mask (so we can log how the
+        # kernel's autonomous bit-flipping evolves across ranks) but does
+        # not write to anything: no L3 probe-and-clear (skips the
+        # update_mask_buffer collective_rpc), no apply_kernel_mask
+        # (skips the state.active_ranks mutation), no confirmed-dead
+        # union. State.active_ranks stays at its initial "all alive"
+        # value; FT-gloo stays at its initial active=[0..N-1] group.
+        # The point is to see what the NIXL EP kernel decides about
+        # peer liveness with no engine-side intervention -- per-rank
+        # divergence in that observed mask is the pure upstream signal.
+        if os.environ.get("VLLM_FT_EP_OBSERVE_ONLY", "0") == "1":
+            return
+
         # Union with confirmed_dead so a commit_engine_death-acknowledged
         # rank cannot be un-flagged by a transient kernel-mask blip.
         # Kernel convention: 1 = dead.  EP slot for DP rank d, TP rank t is
@@ -2654,6 +2668,23 @@ class DPEngineCoreProc(EngineCoreProc):
         )
 
         t_received = time.time()
+        if os.environ.get("VLLM_FT_EP_OBSERVE_ONLY", "0") == "1":
+            # Observe-only mode: log the notify but do not create the
+            # state machine, so neither the FT-gloo barrier nor the
+            # REDISTRIBUTE/EPLB updates run -- nothing mutates active
+            # masks. The kernel mask continues to evolve autonomously
+            # and we log its trajectory via _maybe_check_ft_mask and
+            # _ft_ep_debug_after.
+            logger.warning(
+                "FT EP: notify_engine_death(%d) RECEIVED on dp_rank=%d "
+                "wall_t=%.6f -- OBSERVE_ONLY mode, NOT constructing "
+                "FtDyingPeerState (no state.active_ranks or kernel-mask "
+                "writes will happen).",
+                dead_dp_rank,
+                getattr(self, "dp_rank", -1),
+                t_received,
+            )
+            return
         if self.ft_dying_peer_state is not None:
             logger.warning(
                 "FT EP: notify_engine_death(%d) ignored -- a dying-peer "
