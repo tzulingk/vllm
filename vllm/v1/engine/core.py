@@ -2073,6 +2073,23 @@ class DPEngineCoreProc(EngineCoreProc):
         my_ts = time.time()
         my_wave = self.current_wave
 
+        # Always log the observed kernel mask, before publishing or any
+        # early-return on MISSING peers, so the operator has visibility
+        # into what each rank's NIXL EP kernel reports at every check --
+        # not only when the comparison fully completes. Essential for
+        # debugging post-kill behavior where peers may be stuck and the
+        # comparison never reaches the success/divergence dump.
+        logger.info(
+            "NIXL EP REPRO: observed kernel mask on dp_rank=%d wall_t=%.6f "
+            "wave=%d mask=%s "
+            "(1=dead, 0=alive; first %d EP slots, unused tail trimmed)",
+            self.dp_rank,
+            my_ts,
+            my_wave,
+            my_kernel_mask,
+            num_ep_ranks,
+        )
+
         # Publish my latest kernel mask under a wave-tagged key. Using
         # `_wave{N}` in the key (not just `_dp{rank}`) ensures that when a
         # rank advances from wave N to wave N+1, its wave-N mask is NOT
@@ -2158,15 +2175,24 @@ class DPEngineCoreProc(EngineCoreProc):
                 missing.add(r)
 
         if missing:
+            present_rendered = []
+            for r in sorted(peer_payloads):
+                p = peer_payloads[r]
+                if isinstance(p, dict):
+                    present_rendered.append(f"    dp{r}: mask={p['mask']}")
+                else:
+                    present_rendered.append(f"    dp{r}: {p}")
             logger.warning(
                 "NIXL EP REPRO: skipping wave-%d consensus check at "
                 "dp_rank=%d wall_t=%.6f -- ranks %s have no wave-%d "
-                "mask yet. Will retry on next call.",
+                "mask yet. Will retry on next call.\n"
+                "  Partial state (what we DID see):\n%s",
                 my_wave,
                 self.dp_rank,
                 my_ts,
                 sorted(missing),
                 my_wave,
+                "\n".join(present_rendered),
             )
             return
 
