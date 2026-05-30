@@ -1767,6 +1767,12 @@ class DPEngineCoreProc(EngineCoreProc):
         self.current_wave = 0
         self.last_counts = (0, 0)
 
+        # ft-nixl-ep-kernel-mask-repro: monotonic, never-resets-across-waves
+        # counter used to tag each NIXL EP kernel-mask consensus check. Lets
+        # peers tell "this is the mask my engine published on iteration N"
+        # vs a stale value from a previous wave.
+        self._kernel_mask_repro_seq = 0
+
         # Two-phase pause protocol state. When pending_pause is True, the
         # engine keeps stepping (dummy batches) while waiting for all DP
         # ranks to also set pending_pause. Once all ranks agree via
@@ -1979,7 +1985,146 @@ class DPEngineCoreProc(EngineCoreProc):
 
         raise SystemExit
 
+    def _verify_kernel_mask_consensus_or_crash(self) -> None:
+        """ft-nixl-ep-kernel-mask-repro: cross-DP kernel-mask consensus check.
+
+        Reads the raw NIXL EP kernel mask from each worker, publishes it to
+        a per-rank TCPStore slot, and compares against every other surviving
+        rank's freshly-published mask. If any pair disagrees at the same
+        wall-clock window, every surviving engine crashes with a per-rank
+        kernel-mask dump so the NIXL team has a clean repro.
+
+        Run before every cross-DP all_reduce (called from
+        ``_has_global_unfinished_reqs``). Gated on
+        ``VLLM_FT_EP_KERNEL_MASK_REPRO=1`` so the check is off by default.
+        """
+        if os.environ.get("VLLM_FT_EP_KERNEL_MASK_REPRO", "0") != "1":
+            return
+
+        import json
+        from datetime import timedelta
+
+        if not hasattr(self, "dp_store"):
+            return
+
+        # Query the raw kernel mask straight from the NIXL EP workers.
+        try:
+            masks: list[Any] = self.collective_rpc("query_nixl_ep_mask")
+        except Exception as e:
+            logger.warning(
+                "NIXL EP REPRO: collective_rpc(query_nixl_ep_mask) raised "
+                "%s; skipping kernel-mask check this step.",
+                e,
+            )
+            return
+
+        raw = next((m for m in masks if m is not None), None)
+        if raw is None:
+            return
+        try:
+            my_kernel_mask = [int(x) for x in raw.tolist()]
+        except Exception:
+            return
+
+        self._kernel_mask_repro_seq += 1
+        seq = self._kernel_mask_repro_seq
+        my_ts = time.time()
+
+        # Publish my latest kernel mask (overwrite under a single key).
+        my_key = f"nixl_kernel_mask_dp{self.dp_rank}"
+        self.dp_store.set(
+            my_key,
+            json.dumps({"mask": my_kernel_mask, "ts": my_ts, "seq": seq}).encode(),
+        )
+
+        dp_world_size = self.dp_group.size()
+        peer_keys = [
+            f"nixl_kernel_mask_dp{r}" for r in range(dp_world_size) if r != self.dp_rank
+        ]
+        try:
+            if peer_keys:
+                self.dp_store.wait(peer_keys, timedelta(seconds=3))
+        except Exception:
+            pass
+
+        # Collect all per-rank payloads.
+        peer_payloads: dict[int, dict[str, Any] | str] = {
+            self.dp_rank: {"mask": my_kernel_mask, "ts": my_ts, "seq": seq}
+        }
+        for r in range(dp_world_size):
+            if r == self.dp_rank:
+                continue
+            key = f"nixl_kernel_mask_dp{r}"
+            if not self.dp_store.check([key]):
+                peer_payloads[r] = "MISSING"
+                continue
+            try:
+                payload = json.loads(self.dp_store.get(key).decode())
+                peer_payloads[r] = payload
+            except Exception:
+                peer_payloads[r] = "PARSE_ERROR"
+
+        # Freshness: peer must have written within the last 3 seconds. Older
+        # values are remnants from a previous step and don't tell us
+        # anything about current divergence.
+        stale: set[int] = set()
+        fresh_masks: dict[int, list[int]] = {}
+        for r, p in peer_payloads.items():
+            if not isinstance(p, dict):
+                stale.add(r)
+                continue
+            try:
+                ts = float(p["ts"])
+            except Exception:
+                stale.add(r)
+                continue
+            if abs(my_ts - ts) > 3.0:
+                stale.add(r)
+                continue
+            fresh_masks[r] = [int(x) for x in p["mask"]]
+
+        unique = {tuple(m) for m in fresh_masks.values()}
+        diverged = len(unique) > 1
+
+        if diverged or stale:
+            rendered: list[str] = []
+            for r in sorted(peer_payloads):
+                p = peer_payloads[r]
+                if isinstance(p, str):
+                    rendered.append(f"    dp{r}: {p}")
+                else:
+                    age = my_ts - float(p["ts"])
+                    rendered.append(
+                        f"    dp{r}: mask={p['mask']} "
+                        f"ts={p['ts']:.6f} (age={age:+.3f}s) "
+                        f"seq={p['seq']}"
+                    )
+            logger.error(
+                "NIXL EP KERNEL MASK REPRO -- divergence detected.\n"
+                "  dp_rank=%d wall_t=%.6f seq=%d\n"
+                "  Per-rank raw NIXL kernel masks "
+                "(1=dead, 0=alive, -1=unused slot):\n%s\n"
+                "Crashing -- the NIXL kernel mask disagrees across "
+                "surviving DP ranks within the same wall-clock window.",
+                self.dp_rank,
+                my_ts,
+                seq,
+                "\n".join(rendered),
+            )
+            raise RuntimeError(
+                f"NIXL EP kernel-mask divergence "
+                f"(dp_rank={self.dp_rank}, seq={seq}): "
+                f"stale={sorted(stale)}, unique_masks={len(unique)}"
+            )
+
     def _has_global_unfinished_reqs(self, local_unfinished: bool) -> bool:
+        # ft-nixl-ep-kernel-mask-repro: run the consensus check on EVERY
+        # call (not gated by step_counter % 32). The whole point is to
+        # catch the kernel divergence before the cluster tears down on
+        # a dead-peer all_reduce; gating it to every 32 steps would skip
+        # almost every opportunity in the post-kill ~10s window.
+        self._verify_kernel_mask_consensus_or_crash()
+
         # Optimization - only perform finish-sync all-reduce every 32 steps.
         self.step_counter += 1
         if self.step_counter % 32 != 0:

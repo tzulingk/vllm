@@ -504,6 +504,27 @@ class NixlEPAll2AllManager(All2AllManagerBase):
         buffer = NixlEPAll2AllManager._buffer.buffer
         buffer.set_tcp_store_group(None)
 
+    # ft-nixl-ep-kernel-mask-repro: read the NIXL EP kernel's per-rank mask
+    # buffer. The buffer is mutated autonomously by the dispatch / combine
+    # kernels on per-(warp, src_rank) timeout. Used by
+    # DPEngineCoreProc._verify_kernel_mask_consensus_or_crash to detect
+    # cross-rank disagreement on who the kernel thinks is dead.
+    _mask_read_buf: torch.Tensor | None = None
+
+    def query_mask(self) -> torch.Tensor | None:
+        if NixlEPAll2AllManager._buffer is None:
+            return None
+        buffer = NixlEPAll2AllManager._buffer[0]
+        width = getattr(buffer, "group_size", 0)
+        if not isinstance(width, int) or width <= 0:
+            return None
+        buf = NixlEPAll2AllManager._mask_read_buf
+        if buf is None or buf.numel() != width:
+            buf = torch.zeros(width, dtype=torch.int32, device="cpu")
+            NixlEPAll2AllManager._mask_read_buf = buf
+        buffer.query_mask_buffer(buf)
+        return buf.clone()
+
     # NIXL EP uses RDMA so no SMs are used for communication
     def max_sms_used(self) -> int | None:
         return 0

@@ -1188,6 +1188,27 @@ class Worker(WorkerBase):
     def elastic_ep_execute(self, execute_method: str, *args, **kwargs):
         return self.elastic_ep_executor.execute(execute_method, *args, **kwargs)
 
+    # ft-nixl-ep-kernel-mask-repro: collective_rpc hook for the engine-core
+    # to read this worker's raw NIXL EP kernel mask. The engine-core
+    # gathers masks across DP ranks and crashes if any pair of survivors
+    # disagrees -- isolating the NIXL kernel as the divergent layer.
+    def query_nixl_ep_mask(self) -> torch.Tensor | None:
+        from vllm.distributed import get_ep_group
+        from vllm.distributed.device_communicators.all2all import (
+            NixlEPAll2AllManager,
+        )
+
+        try:
+            ep_group = get_ep_group()
+        except Exception:
+            return None
+        if ep_group is None or getattr(ep_group, "device_communicator", None) is None:
+            return None
+        manager = getattr(ep_group.device_communicator, "all2all_manager", None)
+        if not isinstance(manager, NixlEPAll2AllManager):
+            return None
+        return manager.query_mask()
+
 
 def init_worker_distributed_environment(
     vllm_config: VllmConfig,
