@@ -1713,6 +1713,14 @@ class EngineCoreProc(EngineCore):
 
         # Step the engine core.
         outputs, model_executed = self.step_fn()
+        # FT EP: if a dying-peer state machine started during this
+        # step, the tokens just produced for the requests that were
+        # in-flight at kill time are unreliable -- the dispatch
+        # missed the dead peer's expert contribution. Override those
+        # outputs to FinishReason.ERROR (HTTP 500 to the client) and
+        # mark the requests as finished so subsequent steps don't
+        # re-run them. See FtDyingPeerState._in_flight_req_ids_at_kill.
+        self._maybe_override_outputs_for_ft_kill_event(outputs)
         # Put EngineCoreOutputs into the output queue.
         for output in outputs.items() if outputs else ():
             self.output_queue.put_nowait(output)
@@ -1727,6 +1735,67 @@ class EngineCoreProc(EngineCore):
             time.sleep(0.001)
 
         return model_executed
+
+    def _maybe_override_outputs_for_ft_kill_event(self, outputs) -> None:
+        """Override tokens of in-flight-at-kill requests with FinishReason.ERROR.
+
+        Runs after every step_fn call. Cheap when no dying-peer state
+        machine is active (early-exit). When one is active, replace the
+        tokens that just came out of the forward pass for any request
+        that was running on this engine at the moment the kill event
+        arrived: those tokens came from a dispatch where the dead peer's
+        expert contribution was missing, so the sampled token is
+        unreliable. Returning HTTP 500 to the client is more honest
+        than returning a wrong token.
+
+        Also marks those requests as FINISHED_ERROR in the scheduler so
+        subsequent steps don't re-run them.
+
+        This is the engine-side half of the recovery design that
+        deliberately does NOT abort in-flight requests in
+        FtDyingPeerState._progress_redistribute -- aborting idles the
+        engine, idling makes peers' kernels time out on this engine's
+        slot, and that cascades into divergent state.active_ranks
+        across the cluster (DYN-3121 root cause). Letting the
+        forward pass complete naturally and overriding the output
+        instead keeps every survivor active through the kill window.
+        """
+        ft_state = getattr(self, "ft_dying_peer_state", None)
+        if ft_state is None:
+            return
+        in_flight = getattr(ft_state, "_in_flight_req_ids_at_kill", None)
+        if not in_flight or not outputs:
+            return
+        from vllm.v1.engine import FinishReason
+        from vllm.v1.request import RequestStatus
+
+        affected: list[str] = []
+        for _client_idx, eo in outputs.items():
+            for out in eo.outputs:
+                if out.request_id in in_flight:
+                    out.new_token_ids = []
+                    out.new_logprobs = None
+                    out.finish_reason = FinishReason.ERROR
+                    affected.append(out.request_id)
+                    in_flight.discard(out.request_id)
+        if affected:
+            logger.warning(
+                "FT EP: dying-peer override -- %d request(s) had their "
+                "post-kill forward-pass output replaced with "
+                "FinishReason.ERROR (dp_rank=%s dead_dp_rank=%d): %s",
+                len(affected),
+                getattr(self, "dp_rank", "n/a"),
+                ft_state.dead_dp_rank,
+                affected,
+            )
+            try:
+                self.scheduler.finish_requests(affected, RequestStatus.FINISHED_ERROR)
+            except Exception as e:
+                logger.warning(
+                    "FT EP: dying-peer override -- finish_requests failed for %s: %s",
+                    affected,
+                    e,
+                )
 
     def _notify_idle_state_callbacks(self) -> None:
         while self._idle_state_callbacks:

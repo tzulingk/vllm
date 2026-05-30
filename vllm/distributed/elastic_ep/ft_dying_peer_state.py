@@ -108,6 +108,22 @@ class FtDyingPeerState:
         self._announced_arrival: bool = False
         # Current state of the machine.
         self.state: DyingPeerEngineState = DyingPeerEngineState.ENTER_BARRIER
+        # Snapshot of request IDs that were in-flight on this engine when
+        # the kill event arrived. Used by the "let-this-round-finish,
+        # return-error" recovery path: we DON'T abort these requests
+        # immediately (that would idle the engine, exposing the
+        # asymmetric-work cascade where peers can't observe our buffer
+        # service and false-flag us). Instead, we let the in-flight
+        # forward pass complete naturally (the NIXL EP kernel's per-warp
+        # timeout guarantees termination), then *intercept the output*:
+        # for any request_id in this snapshot, we replace the
+        # forward-pass token with FinishReason.ERROR. The token is
+        # unreliable anyway (dead peer's expert contribution missing
+        # from the dispatch), so returning HTTP 500 is more honest
+        # than returning a wrong token.
+        self._in_flight_req_ids_at_kill: set[str] = {
+            r.request_id for r in getattr(engine_core.scheduler, "running", [])
+        }
         # High-precision wall-clock for cross-engine correlation. All log
         # lines below include time.time() in floating-point epoch seconds
         # so we can match "DP 0 reached barrier at t=X" with "DP 2 reached
@@ -302,22 +318,22 @@ class FtDyingPeerState:
         from vllm.distributed.elastic_ep.peer_state import (
             PeerActiveStateManager,
         )
-        from vllm.v1.request import RequestStatus
 
         ec = self.engine_core
         ec._confirmed_dead_dp_ranks.add(self.dead_dp_rank)
 
-        # Abort any requests that are still queued -- they may have
-        # been routed to us between notify_engine_death arriving and
-        # the barrier passing. (The notify handler aborted the
-        # already-running ones; anything that came in via zmq during
-        # the barrier wait needs to be cleaned up here too.)
-        running = list(getattr(ec.scheduler, "running", []))
-        if running:
-            ec.scheduler.finish_requests(
-                [r.request_id for r in running],
-                RequestStatus.FINISHED_ERROR,
-            )
+        # NOTE: we deliberately do NOT abort in-flight requests here.
+        # See `_in_flight_req_ids_at_kill` docstring above: aborting
+        # idles the engine which then can't service incoming NIXL EP
+        # writes from busy peers, causing peers' kernels to time out
+        # on us and false-flag us as dead. Letting the in-flight
+        # forward pass complete (NIXL kernel timeout guarantees that)
+        # keeps every survivor active through the kill event; the
+        # natural completion writes the correct mask bit for the dead
+        # peer on every engine, keeping state.active_ranks consistent.
+        # The unreliable output tokens from that completion are
+        # overridden to FinishReason.ERROR at `EngineCore._process_engine_step`
+        # via `maybe_override_outputs_for_ft_kill_event` (see core.py).
 
         state = PeerActiveStateManager.instance()
         if state is None:
@@ -340,11 +356,12 @@ class FtDyingPeerState:
         t_redistribute_start = time.time()
         logger.warning(
             "FT EP: REDISTRIBUTE running for dead DP %d (EP slots %s, "
-            "aborted %d in-flight req(s)). dp_rank=%d wall_t=%.6f "
+            "%d in-flight-at-kill req(s) being overridden to ERROR on "
+            "their next completion). dp_rank=%d wall_t=%.6f "
             "(t_since_create=%.3fs)",
             self.dead_dp_rank,
             newly_dead_ep_slots,
-            len(running),
+            len(self._in_flight_req_ids_at_kill),
             self.dp_rank,
             t_redistribute_start,
             t_redistribute_start - self._t_create,
