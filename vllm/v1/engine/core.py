@@ -2059,6 +2059,17 @@ class DPEngineCoreProc(EngineCoreProc):
             )
             return
 
+        # The kernel mask buffer is sized to ``buffer.group_size`` (32 in
+        # this build, to support elastic scaling), but only the first
+        # ``num_ep_ranks`` slots map to actual EP ranks. Unused tail slots
+        # carry different sentinel values across ranks at startup (some
+        # report -1, some report 0); comparing them produces false
+        # divergences that have nothing to do with the kernel-mask
+        # cascade we want to catch. Truncate to the meaningful slice.
+        tp_size = self.vllm_config.parallel_config.tensor_parallel_size
+        num_ep_ranks = self.dp_group.size() * tp_size
+        my_kernel_mask = my_kernel_mask[:num_ep_ranks]
+
         my_ts = time.time()
         my_wave = self.current_wave
 
@@ -2184,14 +2195,15 @@ class DPEngineCoreProc(EngineCoreProc):
                 )
             logger.error(
                 "NIXL EP KERNEL MASK REPRO -- divergence detected.\n"
-                "  dp_rank=%d wall_t=%.6f wave=%d\n"
+                "  dp_rank=%d wall_t=%.6f wave=%d (first %d EP slots shown)\n"
                 "  Per-rank raw NIXL kernel masks "
-                "(1=dead, 0=alive, -1=unused slot):\n%s\n"
+                "(1=dead, 0=alive; unused tail slots already trimmed):\n%s\n"
                 "Crashing -- the NIXL kernel mask disagrees across "
                 "surviving DP ranks within the same wave + wall-clock window.",
                 self.dp_rank,
                 my_ts,
                 my_wave,
+                num_ep_ranks,
                 "\n".join(rendered),
             )
             raise RuntimeError(
