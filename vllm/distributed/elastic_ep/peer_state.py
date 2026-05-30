@@ -162,9 +162,28 @@ def apply_kernel_mask(state: PeerActiveState, kernel_mask: torch.Tensor) -> None
             f"PeerActiveState.active_ranks shape "
             f"{tuple(state.active_ranks.shape)}"
         )
+    # FT EP debug: log when state.active_ranks mutates so we can build a
+    # cross-rank wall-clock timeline of "who decided rank N was dead and
+    # exactly when." Without this log it's hard to tell whether the
+    # divergence comes from the kernel writing the bit, _maybe_check_ft_mask
+    # ingesting it, or apply_kernel_mask propagating it.
+    import time as _time
+
+    before = state.active_ranks_cpu.tolist()
     new_active = (kernel_mask == 0).to(state.active_ranks.dtype)
     state.active_ranks.copy_(new_active.to(state.active_ranks.device))
     state.sync_active_to_cpu()
+    after = state.active_ranks_cpu.tolist()
+    if before != after:
+        logger.warning(
+            "FT EP DEBUG apply_kernel_mask wall_t=%.6f mutated "
+            "state.active_ranks: before=%s after=%s "
+            "kernel_mask=%s (1=dead, 0=alive)",
+            _time.time(),
+            before,
+            after,
+            kernel_mask.tolist(),
+        )
 
 
 class PeerActiveStateManager:

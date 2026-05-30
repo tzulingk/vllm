@@ -259,6 +259,7 @@ class NixlEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
 
         # Dispatch
         dispatch_topk_ids = self._map_global_to_physical_ids(topk_ids)
+        self._ft_ep_debug_before("dispatch", a1.shape[0] if a1 is not None else 0)
         expert_x, expert_num_tokens, handle, _, hook = self.buffer.dispatch(
             a1,
             dispatch_topk_ids,
@@ -356,6 +357,10 @@ class NixlEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         combine_topk_ids = self._map_global_to_physical_ids(topk_ids)
         # TODO (varun) : Enable zero copy mode
         dbo_maybe_run_recv_hook()
+        self._ft_ep_debug_before(
+            "combine",
+            fused_expert_output.shape[0] if fused_expert_output is not None else 0,
+        )
         _, _, recv_hook = self.buffer.combine(
             fused_expert_output,
             combine_topk_ids,
@@ -439,6 +444,32 @@ class NixlEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             )
         return cls._ft_ep_debug_enabled_cached
 
+    def _ft_ep_debug_before(self, label: str, n_tokens: int) -> None:
+        """Wall-clock log RIGHT BEFORE entering buffer.dispatch / combine.
+
+        Paired with ``_ft_ep_debug_after``. The before/after pair gives
+        the duration of the kernel call (which captures NIXL EP's
+        per-warp clock64 timeout) and lets us see what the kernel
+        wrote to its mask buffer during this specific call. Each line
+        includes the worker's ``time.time()`` epoch wall-clock so
+        events on different ranks can be aligned on a shared timeline.
+        """
+        cls = type(self)
+        if not cls._ft_ep_debug_is_enabled():
+            return
+        if cls._ft_ep_debug_n_logged >= cls._FT_EP_DEBUG_MAX_LOGS:
+            return
+        wall_t = time.time()
+        logger.warning(
+            "FT EP DEBUG call=%d wall_t=%.6f before %s (n_tokens=%d). "
+            "buffer.group_size=%d",
+            cls._ft_ep_debug_n_calls + 1,
+            wall_t,
+            label,
+            n_tokens,
+            getattr(self.buffer, "group_size", 0),
+        )
+
     def _ft_ep_debug_after(self, label: str) -> None:
         """Snapshot the NIXL EP kernel mask after a dispatch / combine call.
 
@@ -497,11 +528,13 @@ class NixlEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         changed = snapshot != cls._ft_ep_debug_last_mask
         cls._ft_ep_debug_last_mask = snapshot
         cls._ft_ep_debug_n_logged += 1
+        wall_t = time.time()
         logger.warning(
-            "FT EP DEBUG call=%d t_total=%dms t_delta=%dms after %s "
+            "FT EP DEBUG call=%d wall_t=%.6f t_total=%dms t_delta=%dms after %s "
             "(changed=%s): mask=%s "
             "(1=dead, 0=alive, -1=unused slot). buffer.group_size=%d",
             cls._ft_ep_debug_n_calls,
+            wall_t,
             t_total_ms,
             t_delta_ms,
             label,

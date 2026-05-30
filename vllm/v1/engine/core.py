@@ -658,8 +658,11 @@ class EngineCore:
                     kernel_mask[ep_slot] = 0
                     self._kernel_mask_suspicion[dp_rank] = 1
                     logger.warning(
-                        "FT EP L3: rank %d kernel mask flagged "
-                        "(ep_slot %d); cleared bit, probing for re-flip.",
+                        "FT EP L3: wall_t=%.6f my_dp_rank=%s rank %d kernel "
+                        "mask flagged (ep_slot %d); cleared bit, probing "
+                        "for re-flip.",
+                        time.time(),
+                        getattr(self, "dp_rank", "n/a"),
                         dp_rank,
                         ep_slot,
                     )
@@ -670,10 +673,13 @@ class EngineCore:
                         if dp_rank not in self._suspicion_published:
                             self._suspicion_published.add(dp_rank)
                             logger.warning(
-                                "FT EP L3: rank %d re-flagged %d times; "
-                                "publishing as silent-failure suspect "
-                                "via degraded_peers (dispatcher consensus "
-                                "reduction will decide whether to escalate).",
+                                "FT EP L3: wall_t=%.6f my_dp_rank=%s rank %d "
+                                "re-flagged %d times; publishing as "
+                                "silent-failure suspect via degraded_peers "
+                                "(dispatcher consensus reduction will decide "
+                                "whether to escalate).",
+                                time.time(),
+                                getattr(self, "dp_rank", "n/a"),
                                 dp_rank,
                                 n,
                             )
@@ -857,10 +863,13 @@ class EngineCore:
         # "did all TP workers report the same mask, or did they disagree?"
         per_worker_repr = [list(m) if m is not None else None for m in per_worker]
         logger.warning(
-            "FT EP DEBUG (engine) step=%d t_total=%dms t_step=%dms "
+            "FT EP DEBUG (engine) step=%d wall_t=%.6f dp_rank=%s "
+            "t_total=%dms t_step=%dms "
             "changed=%s primary=%s per_worker=%s "
             "(1=dead, 0=alive). DP-confirmed-dead set=%s suspicion=%s.",
             self._ft_ep_dbg_engine_n,
+            time.time(),
+            getattr(self, "dp_rank", "n/a"),
             t_total_ms,
             t_step_ms,
             "Y" if changed else "n",
