@@ -2007,6 +2007,29 @@ class DPEngineCoreProc(EngineCoreProc):
         if not hasattr(self, "dp_store"):
             return
 
+        # Test-scenario shortcut: skip waiting on DP ranks we already know
+        # are going to be killed in this run. Without this, every check
+        # burns the full 3s wait waiting for the dead rank's mask to
+        # appear (it never will).
+        #
+        # VLLM_FT_EP_REPRO_DEAD_DP_RANKS is a comma-separated list of DP
+        # ranks the test will kill (e.g., "1" for the kill-DP1 test). The
+        # check excludes them from the peer wait + comparison. If THIS
+        # rank is in the list (i.e., this is the rank being killed), the
+        # check returns immediately so it doesn't crash on its own mask
+        # while still alive pre-kill.
+        import contextlib
+
+        expected_dead_ranks_env = os.environ.get("VLLM_FT_EP_REPRO_DEAD_DP_RANKS", "")
+        expected_dead_ranks: set[int] = set()
+        for token in expected_dead_ranks_env.split(","):
+            token = token.strip()
+            if token:
+                with contextlib.suppress(ValueError):
+                    expected_dead_ranks.add(int(token))
+        if self.dp_rank in expected_dead_ranks:
+            return
+
         # Query the raw kernel mask straight from the NIXL EP workers.
         try:
             masks: list[Any] = self.collective_rpc("query_nixl_ep_mask")
@@ -2049,16 +2072,21 @@ class DPEngineCoreProc(EngineCoreProc):
         )
 
         dp_world_size = self.dp_group.size()
-        peer_keys = [
-            f"nixl_kernel_mask_dp{r}" for r in range(dp_world_size) if r != self.dp_rank
+        expected_peers = [
+            r
+            for r in range(dp_world_size)
+            if r != self.dp_rank and r not in expected_dead_ranks
         ]
+        peer_keys = [f"nixl_kernel_mask_dp{r}" for r in expected_peers]
         try:
             if peer_keys:
                 self.dp_store.wait(peer_keys, timedelta(seconds=3))
         except Exception:
             pass
 
-        # Collect all per-rank payloads.
+        # Collect all per-rank payloads. Only expected survivors are
+        # checked -- ranks in VLLM_FT_EP_REPRO_DEAD_DP_RANKS are skipped
+        # entirely (their slots will never be written this run).
         peer_payloads: dict[int, dict[str, Any] | str] = {
             self.dp_rank: {
                 "mask": my_kernel_mask,
@@ -2067,9 +2095,7 @@ class DPEngineCoreProc(EngineCoreProc):
                 "wave": my_wave,
             }
         }
-        for r in range(dp_world_size):
-            if r == self.dp_rank:
-                continue
+        for r in expected_peers:
             key = f"nixl_kernel_mask_dp{r}"
             if not self.dp_store.check([key]):
                 peer_payloads[r] = "MISSING"
