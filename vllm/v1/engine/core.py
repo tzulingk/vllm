@@ -2182,17 +2182,22 @@ class DPEngineCoreProc(EngineCoreProc):
         unique = {tuple(m) for m in peer_masks.values()}
         diverged = len(unique) > 1
 
+        # Render the per-rank mask payload for logging. Used by both the
+        # match path (info log so the operator can confirm what the kernel
+        # reports across ranks) and the divergence path (error log + crash).
+        rendered: list[str] = []
+        for r in sorted(peer_payloads):
+            p = peer_payloads[r]
+            assert isinstance(p, dict)
+            age = my_ts - float(p["ts"])
+            rendered.append(
+                f"    dp{r}: mask={p['mask']} "
+                f"ts={p['ts']:.6f} (age={age:+.3f}s) "
+                f"wave={p.get('wave')}"
+            )
+        per_rank_block = "\n".join(rendered)
+
         if diverged:
-            rendered: list[str] = []
-            for r in sorted(peer_payloads):
-                p = peer_payloads[r]
-                assert isinstance(p, dict)
-                age = my_ts - float(p["ts"])
-                rendered.append(
-                    f"    dp{r}: mask={p['mask']} "
-                    f"ts={p['ts']:.6f} (age={age:+.3f}s) "
-                    f"wave={p.get('wave')}"
-                )
             logger.error(
                 "NIXL EP KERNEL MASK REPRO -- divergence detected.\n"
                 "  dp_rank=%d wall_t=%.6f wave=%d (first %d EP slots shown)\n"
@@ -2211,6 +2216,18 @@ class DPEngineCoreProc(EngineCoreProc):
                 f"(dp_rank={self.dp_rank}, wave={my_wave}): "
                 f"unique_masks={len(unique)}"
             )
+
+        logger.info(
+            "NIXL EP KERNEL MASK REPRO -- match.\n"
+            "  dp_rank=%d wall_t=%.6f wave=%d (first %d EP slots shown)\n"
+            "  Per-rank raw NIXL kernel masks "
+            "(1=dead, 0=alive; unused tail slots already trimmed):\n%s",
+            self.dp_rank,
+            my_ts,
+            my_wave,
+            num_ep_ranks,
+            per_rank_block,
+        )
 
     def _has_global_unfinished_reqs(self, local_unfinished: bool) -> bool:
         # ft-nixl-ep-kernel-mask-repro: run the consensus check on EVERY
