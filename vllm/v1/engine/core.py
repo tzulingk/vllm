@@ -1767,12 +1767,6 @@ class DPEngineCoreProc(EngineCoreProc):
         self.current_wave = 0
         self.last_counts = (0, 0)
 
-        # ft-nixl-ep-kernel-mask-repro: monotonic, never-resets-across-waves
-        # counter used to tag each NIXL EP kernel-mask consensus check. Lets
-        # peers tell "this is the mask my engine published on iteration N"
-        # vs a stale value from a previous wave.
-        self._kernel_mask_repro_seq = 0
-
         # Two-phase pause protocol state. When pending_pause is True, the
         # engine keeps stepping (dummy batches) while waiting for all DP
         # ranks to also set pending_pause. Once all ranks agree via
@@ -2004,6 +1998,8 @@ class DPEngineCoreProc(EngineCoreProc):
         import json
         from datetime import timedelta
 
+        from torch.distributed import DistStoreError
+
         if not hasattr(self, "dp_store"):
             return
 
@@ -2043,29 +2039,46 @@ class DPEngineCoreProc(EngineCoreProc):
 
         raw = next((m for m in masks if m is not None), None)
         if raw is None:
+            logger.warning(
+                "NIXL EP REPRO: query_nixl_ep_mask returned no mask from "
+                "any worker on dp_rank=%d (got %d entries, all None). "
+                "Skipping kernel-mask check this step.",
+                self.dp_rank,
+                len(masks),
+            )
             return
         try:
             my_kernel_mask = [int(x) for x in raw.tolist()]
-        except Exception:
+        except (AttributeError, TypeError, ValueError) as e:
+            logger.warning(
+                "NIXL EP REPRO: failed to convert worker mask tensor to a "
+                "list of ints on dp_rank=%d: %s. Skipping kernel-mask "
+                "check this step.",
+                self.dp_rank,
+                e,
+            )
             return
 
-        self._kernel_mask_repro_seq += 1
-        seq = self._kernel_mask_repro_seq
         my_ts = time.time()
         my_wave = self.current_wave
 
-        # Publish my latest kernel mask (overwrite under a single key).
-        # `wave` tags the mask with this engine's current wave number; the
-        # comparison below only fires when every rank agrees on the wave,
-        # so we never compare masks from different post-kill timelines.
-        my_key = f"nixl_kernel_mask_dp{self.dp_rank}"
+        # Publish my latest kernel mask under a wave-tagged key. Using
+        # `_wave{N}` in the key (not just `_dp{rank}`) ensures that when a
+        # rank advances from wave N to wave N+1, its wave-N mask is NOT
+        # overwritten -- peers can still look up the wave-N value for the
+        # comparison even if one rank races ahead. The key is also the
+        # synchronization point: peers compare wave-N masks by reading
+        # `..._wave{N}` keys, so all entries we compare are from the
+        # same logical wave by construction.
+        key_prefix = "nixl_kernel_mask_dp"
+        key_suffix = f"_wave{my_wave}"
+        my_key = f"{key_prefix}{self.dp_rank}{key_suffix}"
         self.dp_store.set(
             my_key,
             json.dumps(
                 {
                     "mask": my_kernel_mask,
                     "ts": my_ts,
-                    "seq": seq,
                     "wave": my_wave,
                 }
             ).encode(),
@@ -2077,97 +2090,114 @@ class DPEngineCoreProc(EngineCoreProc):
             for r in range(dp_world_size)
             if r != self.dp_rank and r not in expected_dead_ranks
         ]
-        peer_keys = [f"nixl_kernel_mask_dp{r}" for r in expected_peers]
-        try:
-            if peer_keys:
+        peer_keys = [f"{key_prefix}{r}{key_suffix}" for r in expected_peers]
+        if peer_keys:
+            try:
                 self.dp_store.wait(peer_keys, timedelta(seconds=3))
-        except Exception:
-            pass
+            except DistStoreError as e:
+                # Expected case: at least one peer hasn't reached wave
+                # `my_wave` yet within the 3s window. Surface the timeout
+                # rather than swallowing it so the operator can tell
+                # "peers running slow" apart from "real kernel divergence."
+                # The MISSING-key path below handles the bookkeeping; this
+                # log is purely so the timeout is visible.
+                logger.warning(
+                    "NIXL EP REPRO: dp_store.wait timed out at "
+                    "dp_rank=%d wall_t=%.6f wave=%d -- some expected "
+                    "survivor has not published their wave-%d mask yet. "
+                    "Skipping the comparison this iteration. "
+                    "(store error: %s)",
+                    self.dp_rank,
+                    my_ts,
+                    my_wave,
+                    my_wave,
+                    e,
+                )
 
-        # Collect all per-rank payloads. Only expected survivors are
-        # checked -- ranks in VLLM_FT_EP_REPRO_DEAD_DP_RANKS are skipped
-        # entirely (their slots will never be written this run).
+        # Collect each peer's wave-N payload. A MISSING peer means that
+        # peer hasn't reached wave N yet (still on wave N-1 or earlier);
+        # log a warning and skip the comparison this iteration.
         peer_payloads: dict[int, dict[str, Any] | str] = {
             self.dp_rank: {
                 "mask": my_kernel_mask,
                 "ts": my_ts,
-                "seq": seq,
                 "wave": my_wave,
             }
         }
+        missing: set[int] = set()
         for r in expected_peers:
-            key = f"nixl_kernel_mask_dp{r}"
+            key = f"{key_prefix}{r}{key_suffix}"
             if not self.dp_store.check([key]):
                 peer_payloads[r] = "MISSING"
+                missing.add(r)
                 continue
             try:
                 payload = json.loads(self.dp_store.get(key).decode())
                 peer_payloads[r] = payload
-            except Exception:
+            except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                logger.warning(
+                    "NIXL EP REPRO: failed to decode wave-%d payload for "
+                    "dp%d (key=%s): %s",
+                    my_wave,
+                    r,
+                    key,
+                    e,
+                )
                 peer_payloads[r] = "PARSE_ERROR"
+                missing.add(r)
 
-        # Wave check: skip the comparison entirely unless every rank is on
-        # the same wave. Different waves means the ranks are not at the
-        # same logical point in the engine loop, so comparing their kernel
-        # masks is meaningless. Skip (do NOT crash) -- the check fires
-        # again on the next call and will land once waves re-align.
+        if missing:
+            logger.warning(
+                "NIXL EP REPRO: skipping wave-%d consensus check at "
+                "dp_rank=%d wall_t=%.6f -- ranks %s have no wave-%d "
+                "mask yet. Will retry on next call.",
+                my_wave,
+                self.dp_rank,
+                my_ts,
+                sorted(missing),
+                my_wave,
+            )
+            return
+
+        # Collect masks. wave-in-key already guarantees we're comparing
+        # the same wave, so the only remaining check is divergence itself.
+        # No freshness/timestamp filter needed: each `_wave{N}` key is
+        # written exactly once, at the moment that rank is on wave N.
+        peer_masks: dict[int, list[int]] = {}
         for r, p in peer_payloads.items():
-            if not isinstance(p, dict):
-                # Missing peer -- can't establish same-wave consensus yet.
-                return
-            if p.get("wave") != my_wave:
-                return
+            assert isinstance(p, dict)  # MISSING check above gated this
+            peer_masks[r] = [int(x) for x in p["mask"]]
 
-        # Freshness: peer must have written within the last 3 seconds. Older
-        # values are remnants from a previous step and don't tell us
-        # anything about current divergence.
-        stale: set[int] = set()
-        fresh_masks: dict[int, list[int]] = {}
-        for r, p in peer_payloads.items():
-            assert isinstance(p, dict)  # wave check above already gated this
-            try:
-                ts = float(p["ts"])
-            except Exception:
-                stale.add(r)
-                continue
-            if abs(my_ts - ts) > 3.0:
-                stale.add(r)
-                continue
-            fresh_masks[r] = [int(x) for x in p["mask"]]
-
-        unique = {tuple(m) for m in fresh_masks.values()}
+        unique = {tuple(m) for m in peer_masks.values()}
         diverged = len(unique) > 1
 
-        if diverged or stale:
+        if diverged:
             rendered: list[str] = []
             for r in sorted(peer_payloads):
                 p = peer_payloads[r]
-                if isinstance(p, str):
-                    rendered.append(f"    dp{r}: {p}")
-                else:
-                    age = my_ts - float(p["ts"])
-                    rendered.append(
-                        f"    dp{r}: mask={p['mask']} "
-                        f"ts={p['ts']:.6f} (age={age:+.3f}s) "
-                        f"seq={p['seq']} wave={p.get('wave')}"
-                    )
+                assert isinstance(p, dict)
+                age = my_ts - float(p["ts"])
+                rendered.append(
+                    f"    dp{r}: mask={p['mask']} "
+                    f"ts={p['ts']:.6f} (age={age:+.3f}s) "
+                    f"wave={p.get('wave')}"
+                )
             logger.error(
                 "NIXL EP KERNEL MASK REPRO -- divergence detected.\n"
-                "  dp_rank=%d wall_t=%.6f seq=%d wave=%d\n"
+                "  dp_rank=%d wall_t=%.6f wave=%d\n"
                 "  Per-rank raw NIXL kernel masks "
                 "(1=dead, 0=alive, -1=unused slot):\n%s\n"
                 "Crashing -- the NIXL kernel mask disagrees across "
                 "surviving DP ranks within the same wave + wall-clock window.",
                 self.dp_rank,
                 my_ts,
-                seq,
                 my_wave,
                 "\n".join(rendered),
             )
             raise RuntimeError(
                 f"NIXL EP kernel-mask divergence "
-                f"(dp_rank={self.dp_rank}, seq={seq}, wave={my_wave}): "
-                f"stale={sorted(stale)}, unique_masks={len(unique)}"
+                f"(dp_rank={self.dp_rank}, wave={my_wave}): "
+                f"unique_masks={len(unique)}"
             )
 
     def _has_global_unfinished_reqs(self, local_unfinished: bool) -> bool:
