@@ -2574,11 +2574,138 @@ class DPEngineCoreProc(EngineCoreProc):
         )
         raise SystemExit
 
+    def _verify_active_mask_matches_consensus_or_crash(self, generation: int) -> None:
+        """Ground-truth assert: every alive survivor must agree on the
+        expected ``state.active_ranks`` value.
+
+        For the DYN-3121 kill-DP1 test we know the exact ground truth:
+        only DP1 was killed, so DP0/DP2/DP3 must all show up at the
+        consensus point and report ``active_ranks == expected_mask``
+        (derived from ``self._confirmed_dead_dp_ranks``). Anything
+        else is the divergence we're chasing -- crash with a payload
+        dump so the next step is to look at the kernel-mask history
+        in the worker logs and figure out which rank false-flagged
+        whom and when.
+
+        Uses TCPStore (not gloo) so the check itself never hangs on a
+        busted process group: ``store.wait`` has a hard 2 s timeout.
+
+        Gated on ``VLLM_FT_EP_ASSERT_MASK_CONSENSUS=1`` so prod isn't
+        crashed by transient kernel-mask blips between a kernel flip
+        and the corresponding notify_engine_death arrival. Turn on for
+        the DYN-3121 reproduction test.
+        """
+        if os.environ.get("VLLM_FT_EP_ASSERT_MASK_CONSENSUS", "0") != "1":
+            return
+
+        import json
+        from datetime import timedelta
+
+        from vllm.distributed.elastic_ep.peer_state import (
+            PeerActiveStateManager,
+        )
+
+        state = PeerActiveStateManager.instance()
+        if state is None or not hasattr(self, "dp_store"):
+            return
+
+        my_mask = list(int(x) for x in state.active_ranks_cpu.tolist())
+
+        # Build the expected mask from Ray-confirmed deaths only.
+        confirmed_dead = sorted(getattr(self, "_confirmed_dead_dp_ranks", set()))
+        tp_size = state.tp_size if state.tp_size > 0 else 1
+        expected_mask = [
+            0 if (slot // tp_size) in confirmed_dead else 1
+            for slot in range(state.active_ranks_cpu.numel())
+        ]
+        dp_world_size = self.dp_group.size()
+        expected_survivors = [
+            r for r in range(dp_world_size) if r not in confirmed_dead
+        ]
+
+        # Phase 1: publish my mask under a generation-tagged key.
+        key_prefix = f"ft_ep_mask_consensus_gen{generation}"
+        my_key = f"{key_prefix}_dp{self.dp_rank}"
+        self.dp_store.set(my_key, json.dumps(my_mask).encode())
+
+        # Phase 2: wait for every expected survivor to publish theirs.
+        peer_keys = [
+            f"{key_prefix}_dp{r}" for r in expected_survivors if r != self.dp_rank
+        ]
+        try:
+            if peer_keys:
+                self.dp_store.wait(peer_keys, timedelta(seconds=2))
+        except Exception:
+            # Some peer's key never showed up. Fall through to the
+            # bad-set evaluation below; "MISSING" is treated as bad.
+            pass
+
+        # Phase 3: collect every present mask and compare to expected.
+        all_masks: dict[int, list[int] | str] = {self.dp_rank: my_mask}
+        missing: set[int] = set()
+        for r in expected_survivors:
+            if r == self.dp_rank:
+                continue
+            key = f"{key_prefix}_dp{r}"
+            if self.dp_store.check([key]):
+                try:
+                    all_masks[r] = [
+                        int(x) for x in json.loads(self.dp_store.get(key).decode())
+                    ]
+                except Exception:
+                    all_masks[r] = "PARSE_ERROR"
+                    missing.add(r)
+            else:
+                all_masks[r] = "MISSING"
+                missing.add(r)
+
+        bad = [
+            r
+            for r, m in all_masks.items()
+            if not (isinstance(m, list) and m == expected_mask)
+        ]
+        if missing or bad:
+            logger.error(
+                "FT EP MASK ASSERT FAILED: gen=%d dp_rank=%d wall_t=%.6f\n"
+                "  confirmed_dead set=%s -> expected_mask=%s\n"
+                "  missing survivors=%s\n"
+                "  per-rank masks:\n%s\n"
+                "Crashing -- this is the DYN-3121 mask divergence "
+                "we are tracking.",
+                generation,
+                self.dp_rank,
+                time.time(),
+                confirmed_dead,
+                expected_mask,
+                sorted(missing),
+                "\n".join(f"    dp{r}: {m}" for r, m in sorted(all_masks.items())),
+            )
+            raise RuntimeError(
+                f"FT EP mask assert failed at gen {generation} "
+                f"(dp_rank={self.dp_rank}): expected={expected_mask}, "
+                f"missing={sorted(missing)}, "
+                f"non-matching ranks={sorted(bad)}"
+            )
+
     def _has_global_unfinished_reqs(self, local_unfinished: bool) -> bool:
         # Optimization - only perform finish-sync all-reduce every 32 steps.
         self.step_counter += 1
         if self.step_counter % 32 != 0:
             return True
+
+        # FT EP DYN-3121: before the cross-DP all_reduce, verify every
+        # surviving rank still agrees on who is alive. Without this
+        # check the cluster silently splits into per-engine views of
+        # `state.active_ranks` (a kernel-mask flip on one rank that
+        # never happens on another) and the FT-gloo subgroup rebuilds
+        # into incompatible per-rank sub-sub-groups. With this check
+        # we crash loudly the first time a survivor's mask deviates
+        # from the expected-alive set, which makes the divergence
+        # debuggable instead of silent. Gated on env var so prod
+        # deployments don't crash on transient kernel-mask blips.
+        self._verify_active_mask_matches_consensus_or_crash(
+            generation=self.step_counter
+        )
 
         has_unfinished, pause_consensus = ParallelConfig.sync_dp_state(
             self.dp_group,
