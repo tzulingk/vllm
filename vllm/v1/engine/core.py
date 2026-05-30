@@ -2029,12 +2029,23 @@ class DPEngineCoreProc(EngineCoreProc):
         self._kernel_mask_repro_seq += 1
         seq = self._kernel_mask_repro_seq
         my_ts = time.time()
+        my_wave = self.current_wave
 
         # Publish my latest kernel mask (overwrite under a single key).
+        # `wave` tags the mask with this engine's current wave number; the
+        # comparison below only fires when every rank agrees on the wave,
+        # so we never compare masks from different post-kill timelines.
         my_key = f"nixl_kernel_mask_dp{self.dp_rank}"
         self.dp_store.set(
             my_key,
-            json.dumps({"mask": my_kernel_mask, "ts": my_ts, "seq": seq}).encode(),
+            json.dumps(
+                {
+                    "mask": my_kernel_mask,
+                    "ts": my_ts,
+                    "seq": seq,
+                    "wave": my_wave,
+                }
+            ).encode(),
         )
 
         dp_world_size = self.dp_group.size()
@@ -2049,7 +2060,12 @@ class DPEngineCoreProc(EngineCoreProc):
 
         # Collect all per-rank payloads.
         peer_payloads: dict[int, dict[str, Any] | str] = {
-            self.dp_rank: {"mask": my_kernel_mask, "ts": my_ts, "seq": seq}
+            self.dp_rank: {
+                "mask": my_kernel_mask,
+                "ts": my_ts,
+                "seq": seq,
+                "wave": my_wave,
+            }
         }
         for r in range(dp_world_size):
             if r == self.dp_rank:
@@ -2064,15 +2080,25 @@ class DPEngineCoreProc(EngineCoreProc):
             except Exception:
                 peer_payloads[r] = "PARSE_ERROR"
 
+        # Wave check: skip the comparison entirely unless every rank is on
+        # the same wave. Different waves means the ranks are not at the
+        # same logical point in the engine loop, so comparing their kernel
+        # masks is meaningless. Skip (do NOT crash) -- the check fires
+        # again on the next call and will land once waves re-align.
+        for r, p in peer_payloads.items():
+            if not isinstance(p, dict):
+                # Missing peer -- can't establish same-wave consensus yet.
+                return
+            if p.get("wave") != my_wave:
+                return
+
         # Freshness: peer must have written within the last 3 seconds. Older
         # values are remnants from a previous step and don't tell us
         # anything about current divergence.
         stale: set[int] = set()
         fresh_masks: dict[int, list[int]] = {}
         for r, p in peer_payloads.items():
-            if not isinstance(p, dict):
-                stale.add(r)
-                continue
+            assert isinstance(p, dict)  # wave check above already gated this
             try:
                 ts = float(p["ts"])
             except Exception:
@@ -2097,23 +2123,24 @@ class DPEngineCoreProc(EngineCoreProc):
                     rendered.append(
                         f"    dp{r}: mask={p['mask']} "
                         f"ts={p['ts']:.6f} (age={age:+.3f}s) "
-                        f"seq={p['seq']}"
+                        f"seq={p['seq']} wave={p.get('wave')}"
                     )
             logger.error(
                 "NIXL EP KERNEL MASK REPRO -- divergence detected.\n"
-                "  dp_rank=%d wall_t=%.6f seq=%d\n"
+                "  dp_rank=%d wall_t=%.6f seq=%d wave=%d\n"
                 "  Per-rank raw NIXL kernel masks "
                 "(1=dead, 0=alive, -1=unused slot):\n%s\n"
                 "Crashing -- the NIXL kernel mask disagrees across "
-                "surviving DP ranks within the same wall-clock window.",
+                "surviving DP ranks within the same wave + wall-clock window.",
                 self.dp_rank,
                 my_ts,
                 seq,
+                my_wave,
                 "\n".join(rendered),
             )
             raise RuntimeError(
                 f"NIXL EP kernel-mask divergence "
-                f"(dp_rank={self.dp_rank}, seq={seq}): "
+                f"(dp_rank={self.dp_rank}, seq={seq}, wave={my_wave}): "
                 f"stale={sorted(stale)}, unique_masks={len(unique)}"
             )
 
