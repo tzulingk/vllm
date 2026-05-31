@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+
 import torch
 import torch.distributed as dist
 
@@ -49,6 +51,48 @@ def _run_ar(
     tensor_cpu[1][dp_rank] = padded_num_tokens_per_ubatch
     tensor_cpu[2][dp_rank] = 1 if should_ubatch else 0
     tensor_cpu[3][dp_rank] = cudagraph_mode
+    if os.environ.get("VLLM_FT_EP_SKIP_DP_BATCH_SYNC", "0") == "1":
+        fixed_pad = os.environ.get("VLLM_FT_EP_SKIP_DP_BATCH_SYNC_PAD_TOKENS")
+        if fixed_pad:
+            try:
+                padded_tokens = int(fixed_pad)
+            except ValueError:
+                logger.warning_once(
+                    "FT EP REPRO: invalid "
+                    "VLLM_FT_EP_SKIP_DP_BATCH_SYNC_PAD_TOKENS=%r; using "
+                    "local padded token count %d.",
+                    fixed_pad,
+                    padded_num_tokens_per_ubatch,
+                )
+                padded_tokens = padded_num_tokens_per_ubatch
+            if padded_tokens < padded_num_tokens_per_ubatch:
+                logger.warning_once(
+                    "FT EP REPRO: fixed DP batch-sync padding %d is smaller "
+                    "than local padded token count %d on dp_rank=%d; using "
+                    "the local padded token count.",
+                    padded_tokens,
+                    padded_num_tokens_per_ubatch,
+                    dp_rank,
+                )
+                padded_tokens = padded_num_tokens_per_ubatch
+        else:
+            padded_tokens = padded_num_tokens_per_ubatch
+
+        tensor_cpu[0, :] = orig_num_tokens_per_ubatch
+        tensor_cpu[1, :] = padded_tokens
+        # Ubatching requires real cross-DP agreement. CUDA graph mode is kept
+        # for this repro so we can isolate the DP batch-sync collective.
+        tensor_cpu[2, :] = 0
+        tensor_cpu[3, :] = cudagraph_mode
+        logger.warning_once(
+            "FT EP REPRO: skipping DP batch sync on dp_rank=%d; pretending "
+            "all DP ranks use padded_tokens=%d and cudagraph_mode=%d. "
+            "Ubatching is disabled.",
+            dp_rank,
+            padded_tokens,
+            cudagraph_mode,
+        )
+        return tensor_cpu.to(device, non_blocking=True)
     tensor = tensor_cpu.to(device, non_blocking=True)
     # ft-nixl-ep-kernel-mask-repro: guard the cross-DP all_reduce against
     # the c10d cascade that fires when one DP rank dies. Without this
