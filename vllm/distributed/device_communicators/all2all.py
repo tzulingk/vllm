@@ -518,12 +518,17 @@ class NixlEPAll2AllManager(All2AllManagerBase):
         width = getattr(buffer, "group_size", 0)
         if not isinstance(width, int) or width <= 0:
             return None
+        # query_mask_buffer launches a CUDA kernel that stores into the
+        # destination tensor. Passing a pageable CPU tensor produces
+        # unsynchronized GPU->host writes that race with the subsequent
+        # CPU read. Allocate on the worker's CUDA device and use .cpu()
+        # for the synchronized copy back to host.
         buf = NixlEPAll2AllManager._mask_read_buf
-        if buf is None or buf.numel() != width:
-            buf = torch.zeros(width, dtype=torch.int32, device="cpu")
+        if buf is None or buf.numel() != width or not buf.is_cuda:
+            buf = torch.empty(width, dtype=torch.int32, device="cuda")
             NixlEPAll2AllManager._mask_read_buf = buf
         buffer.query_mask_buffer(buf)
-        return buf.clone()
+        return buf.cpu()
 
     # NIXL EP uses RDMA so no SMs are used for communication
     def max_sms_used(self) -> int | None:
