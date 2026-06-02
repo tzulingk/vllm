@@ -65,7 +65,13 @@ def mark_dead_columns_inplace(
     ep_world_size = num_physical // num_local_experts
     for ep_rank in dead_ep_ranks:
         if ep_rank < 0 or ep_rank >= ep_world_size:
-            continue
+            raise ValueError(
+                f"FT EP: ep_rank={ep_rank} is out of bounds for "
+                f"ep_world_size={ep_world_size} (num_physical="
+                f"{num_physical}, num_local_experts={num_local_experts}). "
+                "The caller passed an invalid dead-EP-rank -- this is a "
+                "programming error, not a recoverable runtime state."
+            )
         start = ep_rank * num_local_experts
         end = start + num_local_experts
         physical_to_logical_map[:, start:end] = -1
