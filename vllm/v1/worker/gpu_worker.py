@@ -160,11 +160,14 @@ class Worker(WorkerBase):
     def eplb_redistribute_for_dead_peers(self, dead_ep_ranks: list[int]) -> bool:
         """Update EPLB placement after one or more EP peers die.
 
-        Called by ``EngineCore._maybe_check_ft_mask`` via ``collective_rpc``
-        once per detected mask change. Each surviving worker runs the same
-        deterministic algorithm against its own ``eplb_state`` (which
-        starts in sync across ranks), so the resulting placement table is
-        consistent across all survivors -- no cross-rank coordination needed.
+        Called via ``collective_rpc`` from
+        ``DPEngineCoreProc._maybe_redistribute_on_newly_dead_peers`` in
+        ``vllm/v1/engine/core.py`` -- exactly once per newly-dead EP peer,
+        guarded by the per-engine ``_redistributed_for_peers`` set on the
+        engine side. Each surviving worker runs the same deterministic
+        algorithm against its own ``eplb_state`` (which starts in sync
+        across ranks), so the resulting placement table is consistent
+        across all survivors -- no cross-rank coordination needed.
 
         Steps:
         1. ``mark_dead_columns_inplace`` marks the dead ranks' columns
@@ -326,15 +329,20 @@ class Worker(WorkerBase):
     def query_nixl_ep_mask(self) -> torch.Tensor | None:
         """Return the current NIXL EP kernel mask, or None if N/A.
 
-        FT NIXL EP hook called once per forward step from the engine-core
-        (``EngineCore._maybe_check_ft_mask``) via ``collective_rpc``. The
-        engine-core ingests the mask into its ``PeerActiveState``; on
-        change, it aborts the just-executed batch with
-        ``FinishReason.ERROR``.
+        Called via ``collective_rpc("query_nixl_ep_mask")`` from
+        ``DPEngineCoreProc._query_local_kernel_mask`` (in
+        ``vllm/v1/engine/core.py``), which is invoked from
+        ``_verify_kernel_mask_consensus_or_crash`` and
+        ``_maybe_redistribute_on_newly_dead_peers`` inside
+        ``_has_global_unfinished_reqs``. The engine reads the returned
+        mask, compares slot indices to the local ``dp_rank``, and on
+        seeing a newly non-zero slot triggers
+        ``eplb_redistribute_for_dead_peers`` exactly once for that
+        peer.
 
-        Returns a cloned ``[ep_size]`` int CPU tensor (1=dead, 0=alive)
-        so the engine-core sees a stable snapshot independent of the
-        manager's reusable read buffer.
+        Returns a cloned ``[group_size]`` int CPU tensor
+        (1=dead, 0=alive) so the engine sees a stable snapshot
+        independent of the manager's reusable read buffer.
         """
         from vllm.distributed import get_ep_group
         from vllm.distributed.device_communicators.all2all import (
