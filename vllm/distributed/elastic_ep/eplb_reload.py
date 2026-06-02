@@ -37,8 +37,6 @@ end-to-end for the disk-reload case on a comparable model.
 
 from __future__ import annotations
 
-import json
-import os
 from collections.abc import Generator
 
 import torch
@@ -166,33 +164,3 @@ def reload_experts_from_disk(
             sorted(reload_set)[:8],
         )
     return len(loaded)
-
-
-def expected_tensors_per_expert(checkpoint_index_path: str | None = None) -> int:
-    """Best-effort hint: how many tensors are stored per (layer, expert).
-
-    For DeepSeek-style MoE this is 3 (gate_proj, up_proj, down_proj),
-    or sometimes 2 if gate+up are pre-fused. Used only for log lines
-    and basic sanity in tests; do not rely on this for correctness.
-
-    Returns ``3`` as a conservative default when no index is supplied.
-    """
-    if not checkpoint_index_path or not os.path.exists(checkpoint_index_path):
-        return 3
-    try:
-        with open(checkpoint_index_path) as f:
-            index = json.load(f)
-        weight_map = index.get("weight_map", {})
-        per_expert: dict[tuple[int, int], int] = {}
-        for name in weight_map:
-            parsed = _parse_layer_expert(name)
-            if parsed is None:
-                continue
-            per_expert[parsed] = per_expert.get(parsed, 0) + 1
-        if not per_expert:
-            return 3
-        # Mode of the counts.
-        values = list(per_expert.values())
-        return max(set(values), key=values.count)
-    except Exception:
-        return 3
