@@ -12,29 +12,31 @@ route tokens to the wrong weights.
 
 This module closes that gap by reading the affected expert tensors from
 the HF safetensors checkpoint on disk and writing them into the slot.
-We reuse two pieces of vLLM's existing loader path:
+We reuse the same two pieces of vLLM's loader path used at startup:
 
-* :func:`vllm.model_executor.model_loader.weight_utils.safetensors_weights_iterator`
-  to read only the experts we need (the ``local_expert_ids`` kwarg
-  skips reads for experts this rank doesn't care about).
+* :class:`~vllm.model_executor.model_loader.default_loader.DefaultModelLoader`
+  to enumerate every tensor in the checkpoint. We explicitly **disable**
+  its iterator-level expert filter (``loader.local_expert_ids = None``)
+  because that filter uses ``compute_local_expert_ids(...)`` which
+  doesn't know about the placement-table mutation we just performed.
 * The model's own ``load_weights(weights)`` method to route each
   ``(name, tensor)`` pair through ``FusedMoE.weight_loader``. The
   loader consults the *current* placement table via
-  ``_map_global_expert_id_to_local_expert_id`` to decide which (if
-  any) local physical slot to write into. Because we've already updated
-  the table, this naturally routes each reassigned slot to the right
-  rank.
+  ``_map_global_expert_id_to_local_expert_id`` (which reads the
+  just-rebuilt ``_expert_map``) to decide which (if any) local
+  physical slot to write into. A Python-level filter narrows the
+  iterator output to the reassigned ``(layer, logical)`` pairs so we
+  don't pay disk I/O for experts that haven't moved.
 
-Cost: roughly one safetensors mmap read per (layer, expert) pair, plus
-a small Host→GPU copy per expert. For DeepSeek-V2-Lite, a single expert
-is a few hundred KB; reloading ~half the model's experts across all
-layers is on the order of seconds. PR #38862 measured 3.81s end-to-end
-for the disk-reload case on a comparable model.
+Cost: one safetensors mmap pass over the checkpoint, but only the
+selected expert tensors are actually copied to GPU. For DeepSeek-V2-Lite
+a single expert is a few hundred KB; reloading ~half the experts across
+all layers is on the order of seconds. PR #38862 measured 3.81s
+end-to-end for the disk-reload case on a comparable model.
 """
 
 from __future__ import annotations
 
-import glob
 import json
 import os
 from collections.abc import Generator
@@ -43,57 +45,8 @@ import torch
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.model_executor.model_loader.weight_utils import (
-    download_weights_from_hf,
-    filter_duplicate_safetensors_files,
-    filter_files_not_needed_for_inference,
-    safetensors_weights_iterator,
-)
 
 logger = init_logger(__name__)
-
-
-def _resolve_hf_weight_files(vllm_config: VllmConfig) -> list[str]:
-    """Locate the safetensors files for the configured model.
-
-    Returns absolute paths. Downloads from HF if the cache is empty
-    (rare on the recovery path -- normally the cache is populated by
-    the initial model load at engine startup).
-    """
-    model_config = vllm_config.model_config
-    load_config = vllm_config.load_config
-    model_name_or_path = model_config.model
-    revision = model_config.revision
-
-    if os.path.isdir(model_name_or_path):
-        hf_folder = model_name_or_path
-    else:
-        # Pull from HF (no-op if cache already has it; mirrors the
-        # path DefaultModelLoader uses at startup).
-        hf_folder = download_weights_from_hf(
-            model_name_or_path,
-            cache_dir=load_config.download_dir,
-            allow_patterns=["*.safetensors", "*.bin", "*.pt"],
-            revision=revision,
-            ignore_patterns=getattr(load_config, "ignore_patterns", None) or [],
-        )
-
-    files: list[str] = []
-    for pattern in ("*.safetensors",):
-        files.extend(glob.glob(os.path.join(hf_folder, pattern)))
-    if not files:
-        raise RuntimeError(
-            "FT EP disk reload requires safetensors weights; none found in "
-            f"{hf_folder}. Reload from .bin/.pt is not supported."
-        )
-
-    # Dedupe against an index file if one exists, then drop optimizer
-    # state etc. Mirrors DefaultModelLoader._prepare_weights.
-    index_file = "model.safetensors.index.json"
-    if os.path.exists(os.path.join(hf_folder, index_file)):
-        files = filter_duplicate_safetensors_files(files, hf_folder, index_file)
-    files = filter_files_not_needed_for_inference(files)
-    return files
 
 
 def _parse_layer_expert(name: str) -> tuple[int, int] | None:
@@ -156,33 +109,50 @@ def reload_experts_from_disk(
     if not reload_set:
         return 0
 
-    hf_weights_files = _resolve_hf_weight_files(vllm_config)
-    wanted_logical_ids = {lid for _, lid in reload_set}
+    # Go through the same DefaultModelLoader path used at startup, but
+    # with its iterator-level expert filter disabled. The iterator-level
+    # filter (should_skip_weight in ep_weight_filter.py) decides yield-vs-
+    # skip based on the static compute_local_expert_ids set computed at
+    # __init__. After mark_dead_columns + reassign_missing_experts, that
+    # set no longer matches which experts this rank actually hosts -- the
+    # placement table is the authority now, not the static computation.
+    # Setting loader.local_expert_ids = None hits the early-return branch
+    # in should_skip_weight (returns False, "never skip"), so every
+    # expert tensor flows through.
+    #
+    # Per-rank routing is then handled by FusedMoE.weight_loader, which
+    # consults the just-rebuilt _expert_map via
+    # _map_global_expert_id_to_local_expert_id. If a tensor's logical
+    # expert isn't local to this rank after reassignment, weight_loader
+    # returns False and model.load_weights moves on; no harm done.
+    from vllm.model_executor.model_loader.default_loader import (
+        DefaultModelLoader,
+    )
+
+    loader = DefaultModelLoader(vllm_config.load_config)
+    loader.local_expert_ids = None
+
+    all_weights = loader.get_all_weights(vllm_config.model_config, model)
 
     def filtered_iter() -> Generator[tuple[str, torch.Tensor], None, None]:
-        # local_expert_ids prunes IO inside the iterator -- it only
-        # reads tensors whose expert id is in this set. Pass the
-        # logical ids we want; layer filtering happens here in the
-        # outer loop.
-        for name, tensor in safetensors_weights_iterator(
-            hf_weights_files,
-            use_tqdm_on_load=False,
-            local_expert_ids=wanted_logical_ids,
-        ):
+        # Python-level filter narrows to the reassigned (layer, logical)
+        # pairs we want to overwrite. The weight_loader would skip non-
+        # local tensors anyway, but this avoids re-loading expert
+        # weights that haven't moved (saves disk -> GPU bandwidth).
+        # Non-expert tensors (layernorms, embeddings, etc.) are dropped
+        # too -- they don't need reloading.
+        for name, tensor in all_weights:
             parsed = _parse_layer_expert(name)
             if parsed is None:
-                # Non-expert tensor (e.g. layernorm) -- iterator may
-                # yield those when local_expert_ids is set. Skip; we
-                # only want expert reloads.
                 continue
             if parsed in reload_set:
                 yield name, tensor
 
     logger.info(
-        "FT EP: reloading %d (layer, logical-expert) pair(s) from %d "
-        "safetensors file(s).",
+        "FT EP: reloading %d (layer, logical-expert) pair(s) via "
+        "DefaultModelLoader (iterator filter disabled; per-rank "
+        "routing via FusedMoE.weight_loader + rebuilt _expert_map).",
         len(reload_set),
-        len(hf_weights_files),
     )
 
     loaded = model.load_weights(filtered_iter())
