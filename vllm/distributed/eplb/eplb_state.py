@@ -26,6 +26,7 @@ MoE layer. If we have 32 EP ranks, then each GPU will hold 288 / 32 = 9 local
 physical experts.
 """
 
+import os
 import threading
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -499,6 +500,15 @@ class EplbState:
             - `max_tokens`: The maximum load across ranks.
             - `balancedness`: The ratio of average load to maximum load.
         """
+        # FT EP work-in-progress: skip every cross-rank EP collective in
+        # EPLB while a dead peer is in the EP group. Local load tracking
+        # is also skipped (no rearrangement can fire without it), which
+        # is fine because rearrangement would all-reduce on the broken
+        # EP group and hang. Recovery-driven redistribution is triggered
+        # out-of-band by the engine on dead-peer detection.
+        if os.environ.get("VLLM_FT_EP_SKIP_EPLB_SYNC", "0") == "1":
+            self.expert_rearrangement_step += 1
+            return
         ep_group = get_ep_group().device_group
         if is_profile:
             self.rearrange(is_profile=True)
