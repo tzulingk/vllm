@@ -96,9 +96,19 @@ def reassign_missing_experts_inplace(
          donor below ``1`` replica.
 
     ``num_logical`` is taken from the caller (typically
-    ``eplb_model_state.logical_replica_count.shape[1]``) rather than
-    inferred from the data, because a logical id with zero surviving
-    replicas would otherwise be invisible.
+    ``eplb_model_state.logical_replica_count.shape[1]``, which always
+    carries one column per logical expert regardless of how many
+    replicas survive) rather than inferred from
+    ``physical_to_logical_map`` (the input tensor this function reads
+    and rewrites). Inferring from ``physical_to_logical_map`` would be
+    wrong here because that tensor only encodes logical ids that
+    currently occupy at least one physical slot -- a logical id whose
+    last physical replica was just zeroed out by
+    ``mark_dead_columns_inplace`` leaves no trace in the tensor and
+    would be silently treated as "doesn't exist" instead of "missing."
+    That logical expert is precisely the one this function is supposed
+    to find and reassign, so the cardinality has to come from outside
+    the tensor.
 
     Returns the set of ``(layer_idx, logical_id)`` pairs that were
     reassigned. Each pair indicates a slot whose placement-table entry
