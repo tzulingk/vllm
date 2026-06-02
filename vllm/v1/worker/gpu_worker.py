@@ -244,6 +244,28 @@ class Worker(WorkerBase):
             return False
         rebuild_derived_maps_inplace(p2l, l2p, lrc)
 
+        # Debug: hash the placement table after the deterministic transforms
+        # and log it. If every survivor logs the same hash, the in-sync
+        # invariant (same start + same args + deterministic ops) is holding
+        # empirically. A divergence here would point at non-determinism
+        # somewhere in mark_dead / reassign_missing / rebuild_derived, or
+        # at a divergent input that crept in.
+        try:
+            import hashlib
+
+            p2l_bytes = p2l.detach().cpu().contiguous().numpy().tobytes()
+            p2l_hash = hashlib.sha1(p2l_bytes).hexdigest()[:16]
+            logger.info(
+                "FT EP DEBUG: physical_to_logical_map hash after "
+                "redistribute on this worker = %s (dead_ep_ranks=%s, "
+                "reassignments=%d).",
+                p2l_hash,
+                sorted(dead_ep_ranks),
+                len(reassignments),
+            )
+        except Exception as e:
+            logger.warning("FT EP DEBUG: hash check skipped: %s", e)
+
         # Rebuild each FusedMoE layer's _expert_map so the loader (and
         # subsequent dispatch) see the just-updated placement table.
         # _expert_map is a per-rank cache derived from the EPLB state;
