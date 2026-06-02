@@ -22,6 +22,72 @@ table lies. ``reassign_missing_experts_inplace`` therefore returns the
 set of ``(layer_idx, new_logical_id)`` pairs it created so the caller
 can reload those expert weights from the HF checkpoint via
 :func:`vllm.distributed.elastic_ep.eplb_reload.reload_experts_from_disk`.
+
+How ``eplb_state`` stays in sync across surviving ranks
+-------------------------------------------------------
+
+Every surviving worker runs the three primitives in this module
+(``mark_dead_columns_inplace``, ``reassign_missing_experts_inplace``,
+``rebuild_derived_maps_inplace``) on its **own** copy of the EPLB
+state, with **no cross-rank communication** during the recovery itself.
+The result is identical on every rank because the inputs are identical
+on every rank. The invariants:
+
+1. **Initial state is deterministic.** ``EplbState.add_model`` builds
+   ``physical_to_logical_map`` from a pure function of the model config
+   (``num_routed_experts``, ``num_redundant_experts``) -- see
+   ``EplbState.build_initial_global_physical_to_logical_map`` in
+   ``vllm/distributed/eplb/eplb_state.py``. No RNG, no broadcasts. Every
+   worker constructs the same tensor at startup.
+
+2. **Any rearrangement that happens later syncs its inputs.**
+   ``EplbState.step``/``rearrange`` are the only normal-operation paths
+   that mutate the placement table. Before recomputing it, they call
+   ``_allreduce_list`` over the EP group to make the load tensors
+   identical on every rank, then feed those to the deterministic
+   ``policy.rebalance_experts`` (sort-by-load, greedy assignment, no
+   RNG). Identical input + deterministic algorithm = identical output.
+   (In the FT-validation branch this path is short-circuited by
+   ``VLLM_FT_EP_SKIP_EPLB_SYNC=1`` so it never runs.)
+
+3. **Recovery broadcasts identical args, then runs deterministic ops.**
+   The engine calls ``self.collective_rpc("eplb_redistribute_for_dead_peers",
+   args=(newly_dead,))`` once. ``collective_rpc`` delivers the same
+   ``newly_dead`` tuple to every worker. Each worker then runs the
+   three primitives against its (still-in-sync) placement table:
+
+   * ``mark_dead_columns_inplace``: for each ``ep_rank`` in
+     ``dead_ep_ranks``, write ``-1`` to the contiguous slice. No order
+     dependence beyond the (stable) integer iteration over a set.
+   * ``reassign_missing_experts_inplace``: iterates layer-by-layer, then
+     ``phys_idx`` from 0 upward to build ``replica_count``. The donor
+     candidate list is sorted by ``(redundancy, phys_idx)`` -- stable
+     tie-break. The ``missing`` set is ``sorted(...)`` before
+     assignment. Donor counts are decremented in lock-step. No RNG.
+   * ``rebuild_derived_maps_inplace``: nested ``layer_idx`` / ``phys_idx``
+     loops with the same iteration order on every rank.
+
+   Same input + same args + deterministic algorithms = same output on
+   every rank.
+
+Together these mean ``eplb_state.physical_to_logical_map`` (and the
+derived ``logical_to_physical_map`` / ``logical_replica_count``) stay
+**bit-identical** across surviving ranks after recovery, with no
+explicit cross-rank handshake during the recovery itself.
+
+Note that the local ``expert_load_pass`` / ``expert_load_window``
+tensors are explicitly **not** in sync across ranks during normal
+operation -- each rank only counts the tokens it actually processed.
+That divergence is normalized by ``_allreduce_list`` inside
+``rearrange``. The recovery path does not read these tensors, so their
+divergence is irrelevant here.
+
+If you suspect sync has broken: the
+``Worker.eplb_redistribute_for_dead_peers`` orchestration in
+``vllm/v1/worker/gpu_worker.py`` logs a SHA-1 hash of
+``physical_to_logical_map`` after every redistribute. A mismatch
+across survivors is a smoking gun for an in-sync invariant violation
+in one of the three places above.
 """
 
 from __future__ import annotations
