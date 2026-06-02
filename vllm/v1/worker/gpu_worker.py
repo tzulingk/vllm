@@ -243,11 +243,37 @@ class Worker(WorkerBase):
             rebuild_derived_maps_inplace(p2l, l2p, lrc)
             return False
         rebuild_derived_maps_inplace(p2l, l2p, lrc)
+
+        # Rebuild each FusedMoE layer's _expert_map so the loader (and
+        # subsequent dispatch) see the just-updated placement table.
+        # _expert_map is a per-rank cache derived from the EPLB state;
+        # rebuild_derived_maps_inplace updates the EPLB tensors but not
+        # this cache, so without an explicit rebuild the loader would
+        # query a stale mapping -- either silently skipping the write
+        # (cached slot is -1) or writing to a slot that no longer hosts
+        # the target logical expert. Pattern lifted from PR #38862's
+        # ElasticEPScalingExecutor._perform_eplb_reshuffle.
+        model = self.model_runner.model
+        rebuilt = 0
+        for module in model.modules():
+            if (
+                hasattr(module, "update_expert_map")
+                and getattr(module, "_expert_map", None) is not None
+            ):
+                module.update_expert_map()
+                rebuilt += 1
+        if rebuilt:
+            logger.info(
+                "FT EP: rebuilt _expert_map on %d FusedMoE module(s) after "
+                "dead peers %s.",
+                rebuilt,
+                sorted(dead_ep_ranks),
+            )
+
         if reassignments:
             # The placement table now points reassigned slots at logical
             # ids whose weights live elsewhere. Pull those weights from
             # the HF checkpoint into the donor slot's GPU buffer.
-            model = self.model_runner.model
             try:
                 loaded_count = reload_experts_from_disk(
                     model, self.vllm_config, reassignments
