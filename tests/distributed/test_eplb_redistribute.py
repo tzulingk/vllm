@@ -62,11 +62,25 @@ def test_mark_dead_columns_multiple_ranks():
     assert p2l[0, 2].item() == 2
 
 
-def test_mark_dead_columns_silently_ignores_out_of_range():
+def test_mark_dead_columns_raises_on_out_of_range():
+    """An out-of-range ep_rank means the caller passed bad data; that's a
+    programming error, not a recoverable runtime state, so fail fast."""
+    import pytest
+
     p2l = torch.arange(8, dtype=torch.int32).view(1, 8)
-    mark_dead_columns_inplace(p2l, dead_ep_ranks={99}, num_local_experts=2)
-    # No change.
+    with pytest.raises(ValueError, match="out of bounds"):
+        mark_dead_columns_inplace(p2l, dead_ep_ranks={99}, num_local_experts=2)
+    # Sanity: the original tensor is unchanged because the raise happens
+    # before any in-place write for this ep_rank.
     assert p2l.tolist() == [[0, 1, 2, 3, 4, 5, 6, 7]]
+
+
+def test_mark_dead_columns_raises_on_negative():
+    import pytest
+
+    p2l = torch.arange(8, dtype=torch.int32).view(1, 8)
+    with pytest.raises(ValueError, match="out of bounds"):
+        mark_dead_columns_inplace(p2l, dead_ep_ranks={-1}, num_local_experts=2)
 
 
 # --------------------- reassign_missing_experts_inplace ------------------ #
