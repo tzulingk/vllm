@@ -2129,23 +2129,74 @@ class DPEngineCoreProc(EngineCoreProc):
         # almost every opportunity in the post-kill ~10s window.
         self._verify_kernel_mask_consensus_or_crash()
 
-        # Optimization - only perform finish-sync all-reduce every 32 steps.
+        # Inspect the local kernel mask to detect peers the dispatch
+        # kernel has just observed as dead. Trigger EPLB redistribute
+        # exactly once per newly-dead peer; subsequent ticks see the
+        # peer already in _redistributed_for_peers and short-circuit.
+        self._maybe_redistribute_on_newly_dead_peers()
+
+        # FT EP work-in-progress: do not run the per-32-step finish-sync
+        # all_reduce. With a dead peer in dp_group it hangs on gloo, and
+        # the cascade guard's local-only fallback returns a possibly-
+        # wrong answer about whether anyone has work. While we validate
+        # the EPLB recovery path, assume engines_running=True so the
+        # busy loop keeps stepping and we observe the redistribute
+        # behavior. Production pause/idle fidelity is lost.
         self.step_counter += 1
-        if self.step_counter % 32 != 0:
-            return True
+        return True
 
-        has_unfinished, pause_consensus = ParallelConfig.sync_dp_state(
-            self.dp_group,
-            has_unfinished=local_unfinished,
-            pending_pause=self.pending_pause,
+    def _maybe_redistribute_on_newly_dead_peers(self) -> None:
+        """Trigger EPLB redistribute when the kernel mask reports a new
+        dead peer.
+
+        Idempotent: each (dead) rank is processed exactly once across
+        the lifetime of this engine. The remembered set
+        ``self._redistributed_for_peers`` lives on the instance; we
+        initialize it lazily so we don't need to touch ``__init__``.
+
+        Best-effort: failures from the underlying ``collective_rpc`` are
+        logged but do not crash the engine. The next tick will retry.
+        """
+        if os.environ.get("VLLM_FT_EP_KERNEL_MASK_REPRO", "0") != "1":
+            return
+        my_mask = self._query_local_kernel_mask()
+        if my_mask is None:
+            return
+
+        already = getattr(self, "_redistributed_for_peers", None)
+        if already is None:
+            already = set()
+            self._redistributed_for_peers = already
+
+        # Mask convention: 1 = dead per nixl_ep_ll.cu:47-55. Drop our
+        # own slot defensively; the kernel writes 0 there but we don't
+        # want to ever "redistribute for ourselves" if that invariant
+        # flips.
+        newly_dead = sorted(
+            r
+            for r, v in enumerate(my_mask)
+            if v != 0 and r != self.dp_rank and r not in already
         )
+        if not newly_dead:
+            return
 
-        if pause_consensus:
-            self.ignore_start_dp_wave = True
-            self.pending_pause = False
-            logger.debug("DP pause consensus reached, ignoring START_DP_WAVE.")
-
-        return has_unfinished
+        logger.warning(
+            "FT EP: kernel reports newly-dead EP peer(s) %s on dp_rank=%d; "
+            "triggering eplb_redistribute_for_dead_peers via collective_rpc.",
+            newly_dead,
+            self.dp_rank,
+        )
+        try:
+            self.collective_rpc("eplb_redistribute_for_dead_peers", args=(newly_dead,))
+        except Exception as e:
+            logger.warning(
+                "FT EP: eplb_redistribute_for_dead_peers RPC failed for "
+                "peers %s: %s (will retry on the next tick).",
+                newly_dead,
+                e,
+            )
+            return
+        already.update(newly_dead)
 
     def reinitialize_distributed(
         self, reconfig_request: ReconfigureDistributedRequest
