@@ -274,24 +274,62 @@ class Worker(WorkerBase):
         except Exception as e:
             logger.warning("FT EP DEBUG: hash check skipped: %s", e)
 
-        # Rebuild each FusedMoE layer's _expert_map so the loader (and
-        # subsequent dispatch) see the just-updated placement table.
-        # _expert_map is a per-rank cache derived from the EPLB state;
-        # rebuild_derived_maps_inplace updates the EPLB tensors but not
-        # this cache, so without an explicit rebuild the loader would
-        # query a stale mapping -- either silently skipping the write
-        # (cached slot is -1) or writing to a slot that no longer hosts
-        # the target logical expert. Pattern lifted from PR #38862's
-        # ElasticEPScalingExecutor._perform_eplb_reshuffle.
+        # Rebuild each FusedMoE layer's _expert_map directly from the
+        # updated placement table.
+        #
+        # Why we don't call FusedMoE.update_expert_map() here: that method
+        # routes through ExpertMapManager.update() ->
+        # _calculate_expert_maps() -> determine_expert_map(), which is a
+        # pure function of (ep_size, ep_rank). It regenerates the same
+        # static linear/round-robin assignment that was built at startup
+        # -- it does NOT read the placement-table mutation that
+        # reassign_missing_experts_inplace just performed. In PR #38862's
+        # scale-down path this is fine because ep_size changes and the
+        # static formula returns a different range; in our in-place
+        # design ep_size is unchanged, so update_expert_map() is a no-op
+        # for our purposes.
+        #
+        # The fix: for each MoE layer, read this rank's slot range out of
+        # physical_to_logical_map and set _expert_map[logical_id] =
+        # local_slot for every logical hosted on this rank. After this:
+        #   - FusedMoE.weight_loader will write reassigned tensors into
+        #     the new donor slots (instead of returning -1 and skipping).
+        #   - The MoE compute kernels (which receive _expert_map via the
+        #     .expert_map property) will route tokens to the right local
+        #     slot for any logical the placement table now puts here.
         model = self.model_runner.model
         rebuilt = 0
-        for module in model.modules():
-            if (
-                hasattr(module, "update_expert_map")
-                and getattr(module, "_expert_map", None) is not None
-            ):
-                module.update_expert_map()
+        moe_layers = getattr(model, "moe_layers", None)
+        if moe_layers is not None:
+            for moe_layer_idx, layer in enumerate(moe_layers):
+                expert_map = getattr(layer, "_expert_map", None)
+                if expert_map is None:
+                    continue
+                cfg = layer.moe_parallel_config
+                num_physical = p2l.shape[1]
+                num_local = num_physical // cfg.ep_size
+                local_start = cfg.ep_rank * num_local
+                p2l_row_cpu = p2l[moe_layer_idx].detach().cpu()
+
+                new_map = torch.full_like(expert_map, -1)
+                hosted = 0
+                for local_idx in range(num_local):
+                    logical_id = int(p2l_row_cpu[local_start + local_idx].item())
+                    if 0 <= logical_id < expert_map.shape[0]:
+                        new_map[logical_id] = local_idx
+                        hosted += 1
+                expert_map.copy_(new_map)
                 rebuilt += 1
+                if moe_layer_idx == 0:
+                    # Sanity log: confirm the first MoE layer's rebuilt
+                    # map actually points at the right slots.
+                    logger.info(
+                        "FT EP: rebuilt _expert_map on layer=0 dp_rank=%s: "
+                        "%d logicals hosted locally (size=%d).",
+                        sorted(dead_ep_ranks),
+                        hosted,
+                        expert_map.shape[0],
+                    )
         if rebuilt:
             logger.info(
                 "FT EP: rebuilt _expert_map on %d FusedMoE module(s) after "
