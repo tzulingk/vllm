@@ -3542,3 +3542,128 @@ This is a counting artifact, not a correctness issue: every
 reassigned logical lives at exactly one physical slot, so each
 disk-loaded tensor lands in one rank's GPU buffer. The aggregate
 across DP0 + DP2 covers all 832 reassigned logicals.
+
+## 2026-06-22 — DYN-3253 FT-gloo: foundation + step-1 wiring (re-enable `_run_ar`)
+
+Start of the work to re-enable the per-step `_run_ar` DP batch-sync over a
+survivors-only group after a peer dies, replacing the
+`VLLM_FT_EP_SKIP_DP_BATCH_SYNC` stub. Tracked in
+[DYN-3253](https://linear.app/nvidia/issue/DYN-3253). Branch
+`ft-nixl-ep-ftgloo-run-ar`, cut from `ft-nixl-ep-eplb-disk-reload` @ `1f61faf982`.
+
+Design decisions feeding this (from the session discussion):
+
+- **Trust the local NIXL-EP mask.** No `PeerActiveState` — survivors are
+  derived from the kernel mask (`query_mask`, `1=dead`). Masks are already
+  verified consistent across survivors (mask-consensus-or-crash), so each
+  survivor independently computes the same survivor set and rebuilds to the
+  same group.
+- **Rebuild only at the consensus-confirmed beat.** Ordering trace confirms
+  `_run_ar` runs *before* the per-step consensus check
+  (`_process_engine_step` → `_run_ar`, then `_has_global_unfinished_reqs` →
+  `_verify_kernel_mask_consensus_or_crash` → recovery trigger). So the rebuild
+  is hung off the post-consensus recovery RPC; `_run_ar` only *consumes* the
+  current group, never rebuilds. The death step degrades local-only for one
+  step; step N+1 uses the rebuilt survivor group.
+- **Holder = process-local singleton (option a)**, but the
+  `FaultTolerantGlooGroup` class is kept pure/testable; the singleton is a thin
+  accessor (`get_dp_ft_gloo` / `init_dp_ft_gloo` / `reset_dp_ft_gloo`). Build
+  (`recover_from_dead_peers` RPC) and read (`_run_ar`) are both in the worker
+  process, so no cross-process staleness (the hazard that bit `PeerActiveState`).
+
+### What landed this session
+
+- New `vllm/distributed/elastic_ep/ft_gloo.py` — `FaultTolerantGlooGroup`
+  (rebuild-only, **content-keyed rendezvous** keyed on the sorted survivor set
+  instead of a per-process generation counter; **master = lowest surviving
+  rank** publishing `host:port`; TOCTOU-free `listen_socket`) + thin singleton
+  accessor. `rebuild_for_survivors()` is separate from `all_reduce()` so the
+  consume path cannot rebuild.
+- `vllm/v1/worker/gpu_worker.py` — `init_dp_ft_gloo` at the end of
+  `init_device` (reuses the coordinator's TCPStore via
+  `get_cached_tcp_store_client`; no new DP group → avoids the demo's stale-port
+  hang); new `recover_from_dead_peers` (encapsulates
+  `rebuild_dp_ft_gloo_for_survivors` **then** `eplb_redistribute_for_dead_peers`
+  — gloo rebuild first so its rendezvous is the cross-survivor barrier);
+  `rebuild_dp_ft_gloo_for_survivors` derives the **cumulative** survivor set
+  from the live kernel mask (truncated to real EP slots per DYN-3138).
+- `vllm/v1/engine/core.py` — renamed the trigger
+  `_maybe_redistribute_on_newly_dead_peers` → `_maybe_recover_on_newly_dead_peers`,
+  set `_redistributed_for_peers` → `_recovered_for_peers`, RPC string
+  `eplb_redistribute_for_dead_peers` → `recover_from_dead_peers`.
+- New `tests/distributed/test_ft_gloo.py` — 3 single-process unit tests + a real
+  4-process kill test (`survivors=[0,2,3]`, dead rank 1) that actually
+  rebuilds and all-reduces over survivors (the demo's tests only mocked the
+  group).
+
+### What I ran into
+
+The 4-process kill test can't complete on this **bare Mac precompiled venv**:
+`stateless_init_torch_distributed_process_group` imports `vllm.config` (for the
+gloo timeout), which transitively pulls the full runtime dep tree
+(`transformers` → `requests` → `openai_harmony` → …). Installing them one by
+one just surfaced the next missing leaf. **Not a logic bug** — every run shows
+all three survivors reaching the rendezvous at the **same content-keyed port**
+with `survivors=[0,2,3]` and master=rank 0; only the final `all_reduce` is
+blocked by the missing deps. Guarded the test with
+`pytest.importorskip`-style `import vllm.config` so it skips cleanly here and
+runs fully in the CUDA/image env (where the rest of `tests/distributed/` runs).
+
+### Commands
+
+```bash
+# branch
+git checkout -b ft-nixl-ep-ftgloo-run-ar          # from ft-nixl-ep-eplb-disk-reload @ 1f61faf982
+
+# unit-test gate (runbook "Step 1" pattern; test_peer_state intentionally absent)
+.venv/bin/python -m pytest tests/distributed/test_ft_gloo.py \
+    tests/distributed/test_eplb_redistribute.py --noconftest -q
+# -> 18 passed, 1 skipped  (test_ft_gloo: 3 pass + 1 env-gated skip; test_eplb_redistribute: 15 pass)
+
+# local dev deps the stripped Mac venv was missing (uv at ~/.local/bin/uv, not on PATH)
+/Users/tzulingk/.local/bin/uv pip install --python .venv/bin/python transformers requests ruff
+
+# syntax + lint + format
+.venv/bin/python -m py_compile vllm/distributed/elastic_ep/ft_gloo.py \
+    vllm/v1/worker/gpu_worker.py vllm/v1/engine/core.py tests/distributed/test_ft_gloo.py
+.venv/bin/python -m ruff check vllm/distributed/elastic_ep/ft_gloo.py \
+    tests/distributed/test_ft_gloo.py vllm/v1/worker/gpu_worker.py vllm/v1/engine/core.py   # All checks passed
+.venv/bin/python -m ruff format vllm/distributed/elastic_ep/ft_gloo.py
+```
+
+### Step 3 (done) — `_run_ar` consumes the survivor group
+
+`vllm/v1/worker/dp_utils.py` — removed the `VLLM_FT_EP_SKIP_DP_BATCH_SYNC`
+stub entirely. `_run_ar` now:
+
+- When `get_dp_ft_gloo().has_group` (a peer died and the survivor group was
+  rebuilt): all-reduce the **CPU** tensor over the survivors-only gloo group
+  (gloo is CPU-only; engages only post-death, so steady-state NCCL path is
+  untouched). Then **backfill dead-rank columns** with this rank's own
+  contribution so the dead rank's zero column can't veto the ubatch (`all==1`),
+  cudagraph (`min`), or padding (`max/min`) consensus among survivors —
+  ubatching + CUDA-graph come back on once the survivor group is in place.
+- Otherwise: the normal full-group `all_reduce`, wrapped in the cascade guard
+  (absorbs the death-step failure before the survivor group is rebuilt →
+  local-only for that one step).
+
+`_run_ar` never rebuilds; it only consumes the group `recover_from_dead_peers`
+last built at the consensus-confirmed beat.
+
+```bash
+git grep -n "VLLM_FT_EP_SKIP_DP_BATCH_SYNC" -- '*.py'   # (no matches — stub removed)
+.venv/bin/python -m py_compile vllm/v1/worker/dp_utils.py
+.venv/bin/python -m ruff check vllm/v1/worker/dp_utils.py
+.venv/bin/python -m ruff format --check vllm/v1/worker/dp_utils.py    # already formatted
+.venv/bin/python -m pytest tests/distributed/test_ft_gloo.py \
+    tests/distributed/test_eplb_redistribute.py --noconftest -q       # 18 passed, 1 skipped
+```
+
+### State / what's left for the E2E gate
+
+- ✅ Unit-test gate passes; rebuild rendezvous logic proven by the multiprocess test.
+- ✅ **Step 3 done:** `_run_ar` consumes `get_dp_ft_gloo()`; stub removed.
+- ⏳ Runbook E2E gate (next): `git push fork ft-nixl-ep-ftgloo-run-ar` →
+  in-cluster GB200 build (`VLLM_USE_PRECOMPILED=1` recipe) → pod → `kill -9`
+  DP1 → assert `FT NIXL EP: rebuilt DP FT-gloo survivor group [0,2,3]` +
+  ubatching/cudagraph re-enabled + no cascade/recapture.
