@@ -2242,8 +2242,8 @@ class DPEngineCoreProc(EngineCoreProc):
         # Inspect the local kernel mask to detect peers the dispatch
         # kernel has just observed as dead. Trigger EPLB redistribute
         # exactly once per newly-dead peer; subsequent ticks see the
-        # peer already in _redistributed_for_peers and short-circuit.
-        self._maybe_redistribute_on_newly_dead_peers()
+        # peer already in _recovered_for_peers and short-circuit.
+        self._maybe_recover_on_newly_dead_peers()
 
         # FT EP work-in-progress: do not run the per-32-step finish-sync
         # all_reduce. With a dead peer in dp_group it hangs on gloo, and
@@ -2255,13 +2255,19 @@ class DPEngineCoreProc(EngineCoreProc):
         self.step_counter += 1
         return True
 
-    def _maybe_redistribute_on_newly_dead_peers(self) -> None:
-        """Trigger EPLB redistribute when the kernel mask reports a new
+    def _maybe_recover_on_newly_dead_peers(self) -> None:
+        """Trigger survivor recovery when the kernel mask reports a new
         dead peer.
+
+        Recovery (the ``recover_from_dead_peers`` RPC) rebuilds the DP
+        FT-gloo survivor group *and* runs the EPLB redistribute + disk
+        reload, in that order -- the gloo rendezvous doubles as the
+        cross-survivor barrier so everyone enters the slow reload on the
+        same beat.
 
         Idempotent: each (dead) rank is processed exactly once across
         the lifetime of this engine. The remembered set
-        ``self._redistributed_for_peers`` lives on the instance; we
+        ``self._recovered_for_peers`` lives on the instance; we
         initialize it lazily so we don't need to touch ``__init__``.
 
         Best-effort: failures from the underlying ``collective_rpc`` are
@@ -2273,10 +2279,10 @@ class DPEngineCoreProc(EngineCoreProc):
         if my_mask is None:
             return
 
-        already = getattr(self, "_redistributed_for_peers", None)
+        already = getattr(self, "_recovered_for_peers", None)
         if already is None:
             already = set()
-            self._redistributed_for_peers = already
+            self._recovered_for_peers = already
 
         # Mask convention: 1 = dead per nixl_ep_ll.cu:47-55. Drop our
         # own slot defensively; the kernel writes 0 there but we don't
@@ -2292,15 +2298,15 @@ class DPEngineCoreProc(EngineCoreProc):
 
         logger.warning(
             "FT EP: kernel reports newly-dead EP peer(s) %s on dp_rank=%d; "
-            "triggering eplb_redistribute_for_dead_peers via collective_rpc.",
+            "triggering recover_from_dead_peers via collective_rpc.",
             newly_dead,
             self.dp_rank,
         )
         try:
-            self.collective_rpc("eplb_redistribute_for_dead_peers", args=(newly_dead,))
+            self.collective_rpc("recover_from_dead_peers", args=(newly_dead,))
         except Exception as e:
             logger.warning(
-                "FT EP: eplb_redistribute_for_dead_peers RPC failed for "
+                "FT EP: recover_from_dead_peers RPC failed for "
                 "peers %s: %s (will retry on the next tick).",
                 newly_dead,
                 e,

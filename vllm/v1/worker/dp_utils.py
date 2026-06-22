@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import os
-
 import torch
 import torch.distributed as dist
 
@@ -51,69 +49,56 @@ def _run_ar(
     tensor_cpu[1][dp_rank] = padded_num_tokens_per_ubatch
     tensor_cpu[2][dp_rank] = 1 if should_ubatch else 0
     tensor_cpu[3][dp_rank] = cudagraph_mode
-    if os.environ.get("VLLM_FT_EP_SKIP_DP_BATCH_SYNC", "0") == "1":
-        fixed_pad = os.environ.get("VLLM_FT_EP_SKIP_DP_BATCH_SYNC_PAD_TOKENS")
-        if fixed_pad:
-            try:
-                padded_tokens = int(fixed_pad)
-            except ValueError:
-                logger.warning_once(
-                    "FT EP REPRO: invalid "
-                    "VLLM_FT_EP_SKIP_DP_BATCH_SYNC_PAD_TOKENS=%r; using "
-                    "local padded token count %d.",
-                    fixed_pad,
-                    padded_num_tokens_per_ubatch,
-                )
-                padded_tokens = padded_num_tokens_per_ubatch
-            if padded_tokens < padded_num_tokens_per_ubatch:
-                logger.warning_once(
-                    "FT EP REPRO: fixed DP batch-sync padding %d is smaller "
-                    "than local padded token count %d on dp_rank=%d; using "
-                    "the local padded token count.",
-                    padded_tokens,
-                    padded_num_tokens_per_ubatch,
-                    dp_rank,
-                )
-                padded_tokens = padded_num_tokens_per_ubatch
-        else:
-            padded_tokens = padded_num_tokens_per_ubatch
+    # FT NIXL EP: after a peer dies, ``recover_from_dead_peers`` rebuilds a
+    # survivors-only gloo group. When that group exists, run the per-step DP
+    # coordination over the survivors only. The gloo group is CPU-only, so we
+    # reduce the CPU tensor regardless of the deployment's normal NCCL/CPU
+    # choice; this path engages only after a death, so steady state keeps the
+    # normal full-group all_reduce below with zero overhead. ``_run_ar`` never
+    # rebuilds -- it only consumes the group the recovery RPC last built at a
+    # consensus-confirmed beat (see ft_gloo.py).
+    from vllm.distributed.elastic_ep.ft_gloo import get_dp_ft_gloo
 
-        tensor_cpu[0, :] = orig_num_tokens_per_ubatch
-        tensor_cpu[1, :] = padded_tokens
-        # Ubatching requires real cross-DP agreement. CUDA graph mode is kept
-        # for this repro so we can isolate the DP batch-sync collective.
-        tensor_cpu[2, :] = 0
-        tensor_cpu[3, :] = cudagraph_mode
-        logger.warning_once(
-            "FT EP REPRO: skipping DP batch sync on dp_rank=%d; pretending "
-            "all DP ranks use padded_tokens=%d and cudagraph_mode=%d. "
-            "Ubatching is disabled.",
-            dp_rank,
-            padded_tokens,
-            cudagraph_mode,
-        )
+    ft = get_dp_ft_gloo()
+    if ft is not None and ft.has_group:
+        _, valid = ft.all_reduce(tensor_cpu, dist.ReduceOp.SUM)
+        if valid:
+            # Dead-rank columns are 0 after the survivors-only reduce.
+            # Backfill them with this rank's own contribution so they don't
+            # veto the ubatch (all==1), cudagraph (min), or padding (max/min)
+            # consensus among survivors. This rank is itself a survivor, so
+            # the survivor consensus is unchanged.
+            survivors = ft.current_survivors or frozenset()
+            for d in range(dp_size):
+                if d not in survivors:
+                    tensor_cpu[0, d] = orig_num_tokens_per_ubatch
+                    tensor_cpu[1, d] = padded_num_tokens_per_ubatch
+                    tensor_cpu[2, d] = 1 if should_ubatch else 0
+                    tensor_cpu[3, d] = cudagraph_mode
+        else:
+            logger.warning_once(
+                "FT NIXL EP: survivor DP all_reduce returned invalid on "
+                "dp_rank=%d; proceeding with local-only contribution this "
+                "step. Ubatching + CUDA-graph disabled this step.",
+                dp_rank,
+            )
         return tensor_cpu.to(device, non_blocking=True)
+
     tensor = tensor_cpu.to(device, non_blocking=True)
-    # ft-nixl-ep-kernel-mask-repro: guard the cross-DP all_reduce against
-    # the c10d cascade that fires when one DP rank dies. Without this
-    # guard, the surviving Workers raise `Connection closed by peer`
-    # (chained with `Process group ... is not initialized in the world
-    # group map`), which their busy_loop doesn't recover from -- the
-    # whole cluster cascade-dies. With the guard, the local Worker
-    # absorbs the failure, keeps stepping with its local contribution
-    # only (degraded for this step, no ubatching / cudagraph), and the
-    # actor's run_busy_loop stays alive long enough for the kernel-mask
-    # consensus check to fire and observe what each rank's NIXL EP
-    # kernel reports about the dead peer.
+    # Cascade guard: on the death step itself -- before
+    # ``recover_from_dead_peers`` has rebuilt the survivor group -- the
+    # full-group all_reduce can fail on the just-dead peer (gloo
+    # `Connection closed by peer`, chained with c10d's `Process group ... is
+    # not initialized`). Absorb it and proceed local-only for this one step;
+    # the next step uses the rebuilt survivor group above. Without the guard
+    # the surviving Workers' busy loop would cascade-die.
     try:
         dist.all_reduce(tensor, group=group)
     except (RuntimeError, ValueError) as e:
-        import logging
-
-        logging.getLogger(__name__).warning(
-            "FT EP CASCADE GUARD: dp_group all_reduce on dp_rank=%d failed "
-            "(%s: %s); proceeding with local-only contribution for this "
-            "step. Ubatching + cudagraph will be disabled.",
+        logger.warning_once(
+            "FT NIXL EP cascade guard: DP all_reduce on dp_rank=%d failed "
+            "(%s: %s); proceeding with local-only contribution this step. "
+            "Ubatching + CUDA-graph disabled this step.",
             dp_rank,
             type(e).__name__,
             e,

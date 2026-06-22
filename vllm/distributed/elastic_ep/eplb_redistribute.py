@@ -51,10 +51,12 @@ on every rank. The invariants:
    ``VLLM_FT_EP_SKIP_EPLB_SYNC=1`` so it never runs.)
 
 3. **Recovery broadcasts identical args, then runs deterministic ops.**
-   The engine calls ``self.collective_rpc("eplb_redistribute_for_dead_peers",
-   args=(newly_dead,))`` once. ``collective_rpc`` delivers the same
-   ``newly_dead`` tuple to every worker. Each worker then runs the
-   three primitives against its (still-in-sync) placement table:
+   The engine calls ``self.collective_rpc("recover_from_dead_peers",
+   args=(newly_dead,))`` once; that worker method rebuilds the FT-gloo
+   survivor group and then runs ``eplb_redistribute_for_dead_peers``.
+   ``collective_rpc`` delivers the same ``newly_dead`` tuple to every
+   worker. Each worker then runs the three primitives against its
+   (still-in-sync) placement table:
 
    * ``mark_dead_columns_inplace``: for each ``ep_rank`` in
      ``dead_ep_ranks``, write ``-1`` to the contiguous slice. No order

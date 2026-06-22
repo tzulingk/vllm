@@ -162,13 +162,86 @@ class Worker(WorkerBase):
         # pending non-blocking PP send work from the previous iteration
         self._pp_send_work: list[Handle] = []
 
+    def recover_from_dead_peers(self, dead_ep_ranks: list[int]) -> bool:
+        """Survivor recovery for newly-dead EP peers (single RPC entry point).
+
+        Called via ``collective_rpc("recover_from_dead_peers")`` from
+        ``DPEngineCoreProc._maybe_recover_on_newly_dead_peers`` at a
+        consensus-confirmed beat. Runs two units in order:
+
+        1. ``rebuild_dp_ft_gloo_for_survivors`` -- (re)build the survivors-only
+           DP FT-gloo group. Its rendezvous doubles as the cross-survivor
+           barrier, so every survivor enters the slow disk reload on the same
+           beat (avoids the step-skew that reopens the kernel cascade).
+        2. ``eplb_redistribute_for_dead_peers`` -- deterministic local EPLB
+           placement update + disk reload.
+
+        Returns whatever the redistribute step returns (True if any expert
+        was reassigned).
+        """
+        self.rebuild_dp_ft_gloo_for_survivors(dead_ep_ranks)
+        return self.eplb_redistribute_for_dead_peers(dead_ep_ranks)
+
+    def rebuild_dp_ft_gloo_for_survivors(self, dead_ep_ranks: list[int]) -> bool:
+        """Rebuild the DP FT-gloo group to exclude all currently-dead peers.
+
+        ``dead_ep_ranks`` is this call's newly-dead set, but the survivor
+        group must reflect *every* dead peer so far -- a later death must not
+        re-include an earlier-dead rank. So we derive the cumulative dead set
+        from the live NIXL-EP kernel mask (``1=dead``), union the passed
+        newly-dead list, and fold EP slots down to DP ranks (a DP rank is dead
+        only if all its TP siblings are; for TP=1 the EP index is the DP
+        index).
+
+        No-op (returns False) when the FT-gloo holder isn't initialized
+        (non-NIXL-EP deployments), this rank is itself masked dead, or the
+        survivor set is unchanged.
+        """
+        from vllm.distributed.elastic_ep.ft_gloo import get_dp_ft_gloo
+
+        ft = get_dp_ft_gloo()
+        if ft is None:
+            return False
+
+        dp_size = self.parallel_config.data_parallel_size
+        tp_size = self.parallel_config.tensor_parallel_size
+        ep_size = dp_size * tp_size
+
+        dead: set[int] = set(dead_ep_ranks)
+        mask = self.query_nixl_ep_mask()
+        if mask is not None:
+            # Truncate to real EP slots; tail slots carry inconsistent
+            # sentinels across ranks (DYN-3138).
+            dead |= {i for i, v in enumerate(mask.tolist()[:ep_size]) if v != 0}
+
+        survivors = frozenset(
+            d
+            for d in range(dp_size)
+            if not all((d * tp_size + t) in dead for t in range(tp_size))
+        )
+        if self.parallel_config.data_parallel_rank not in survivors:
+            return False
+        if ft.current_survivors == survivors:
+            return False
+
+        ft.rebuild_for_survivors(survivors)
+        logger.info(
+            "FT NIXL EP: rebuilt DP FT-gloo survivor group %s (gen=%d) after "
+            "dead EP peers %s.",
+            sorted(survivors),
+            ft.generation,
+            sorted(dead),
+        )
+        return True
+
     def eplb_redistribute_for_dead_peers(self, dead_ep_ranks: list[int]) -> bool:
         """Update EPLB placement after one or more EP peers die.
 
-        Called via ``collective_rpc`` from
-        ``DPEngineCoreProc._maybe_redistribute_on_newly_dead_peers`` in
+        Runs as the second step of ``recover_from_dead_peers`` (after the
+        FT-gloo rebuild), itself dispatched via ``collective_rpc`` from
+        ``DPEngineCoreProc._maybe_recover_on_newly_dead_peers`` in
         ``vllm/v1/engine/core.py`` -- exactly once per newly-dead EP peer,
-        guarded by the per-engine ``_redistributed_for_peers`` set on the
+        guarded by the per-engine ``_recovered_for_peers`` set on the
         engine side. Each surviving worker runs the same deterministic
         algorithm against its own ``eplb_state`` (which starts in sync
         across ranks), so the resulting placement table is consistent
@@ -376,12 +449,12 @@ class Worker(WorkerBase):
         ``DPEngineCoreProc._query_local_kernel_mask`` (in
         ``vllm/v1/engine/core.py``), which is invoked from
         ``_verify_kernel_mask_consensus_or_crash`` and
-        ``_maybe_redistribute_on_newly_dead_peers`` inside
+        ``_maybe_recover_on_newly_dead_peers`` inside
         ``_has_global_unfinished_reqs``. The engine reads the returned
         mask, compares slot indices to the local ``dp_rank``, and on
-        seeing a newly non-zero slot triggers
-        ``eplb_redistribute_for_dead_peers`` exactly once for that
-        peer.
+        seeing a newly non-zero slot triggers ``recover_from_dead_peers``
+        exactly once for that peer. (``rebuild_dp_ft_gloo_for_survivors``
+        also reads this mask locally to derive the cumulative survivor set.)
 
         Returns a cloned ``[group_size]`` int CPU tensor
         (1=dead, 0=alive) so the engine sees a stable snapshot
@@ -570,6 +643,39 @@ class Worker(WorkerBase):
                 self.local_rank,
                 current_platform.dist_backend,
             )
+
+            # FT NIXL EP: initialize the per-worker DP FT-gloo holder.
+            # `_run_ar` consults it (via get_dp_ft_gloo) to run the per-step
+            # DP coordination all_reduce over surviving ranks after a peer
+            # dies; `recover_from_dead_peers` rebuilds it at the
+            # consensus-confirmed beat. We reuse the coordinator's TCPStore as
+            # the rendezvous side-channel (FT-gloo keys are uniquely prefixed
+            # `ft_gloo_rdzv_*`, so no collision) -- creating a fresh DP group
+            # here would risk the stale-port rendezvous hang seen on the demo
+            # branch. Gated on the coord store existing (always true on the
+            # elastic-EP path NIXL EP requires).
+            if parallel_config.all2all_backend == "nixl_ep" and (
+                parallel_config._coord_store_port
+            ):
+                from vllm.distributed.elastic_ep.ft_gloo import init_dp_ft_gloo
+                from vllm.distributed.utils import get_cached_tcp_store_client
+
+                coord_store = get_cached_tcp_store_client(
+                    parallel_config.data_parallel_master_ip,
+                    parallel_config._coord_store_port,
+                )
+                init_dp_ft_gloo(
+                    store=coord_store,
+                    master_addr=parallel_config.data_parallel_master_ip,
+                    my_global_rank=parallel_config.data_parallel_rank,
+                    total_world_size=parallel_config.data_parallel_size,
+                )
+                logger.info(
+                    "FT NIXL EP: initialized DP FT-gloo holder "
+                    "(dp_rank=%d, dp_size=%d).",
+                    parallel_config.data_parallel_rank,
+                    parallel_config.data_parallel_size,
+                )
 
             if self.use_v2_model_runner:
                 logger.info_once("Using V2 Model Runner")
