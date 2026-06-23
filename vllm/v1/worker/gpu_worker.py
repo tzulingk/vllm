@@ -347,38 +347,55 @@ class Worker(WorkerBase):
         except Exception as e:
             logger.warning("FT EP DEBUG: hash check skipped: %s", e)
 
-        # Rebuild each FusedMoE layer's _expert_map directly from the
-        # updated placement table.
+        # Rebuild each MoE layer's _expert_map directly from the updated
+        # placement table.
         #
-        # Why we don't call FusedMoE.update_expert_map() here: that method
-        # routes through ExpertMapManager.update() ->
-        # _calculate_expert_maps() -> determine_expert_map(), which is a
-        # pure function of (ep_size, ep_rank). It regenerates the same
-        # static linear/round-robin assignment that was built at startup
-        # -- it does NOT read the placement-table mutation that
-        # reassign_missing_experts_inplace just performed. In PR #38862's
-        # scale-down path this is fine because ep_size changes and the
-        # static formula returns a different range; in our in-place
-        # design ep_size is unchanged, so update_expert_map() is a no-op
-        # for our purposes.
+        # Why we don't call update_expert_map() here: that method routes
+        # through ExpertMapManager.update() -> _calculate_expert_maps() ->
+        # determine_expert_map(), which is a pure function of (ep_size,
+        # ep_rank). It regenerates the same static linear/round-robin
+        # assignment built at startup -- it does NOT read the placement-table
+        # mutation that reassign_missing_experts_inplace just performed. In
+        # PR #38862's scale-down path that's fine because ep_size changes; in
+        # our in-place design ep_size is unchanged, so update_expert_map() is
+        # a no-op for our purposes.
         #
-        # The fix: for each MoE layer, read this rank's slot range out of
-        # physical_to_logical_map and set _expert_map[logical_id] =
-        # local_slot for every logical hosted on this rank. After this:
-        #   - FusedMoE.weight_loader will write reassigned tensors into
-        #     the new donor slots (instead of returning -1 and skipping).
-        #   - The MoE compute kernels (which receive _expert_map via the
-        #     .expert_map property) will route tokens to the right local
-        #     slot for any logical the placement table now puts here.
+        # We resolve state through ``layer.expert_map_manager`` rather than
+        # ``layer._expert_map``. ``model.moe_layers`` entries are MoERunner
+        # objects (the FusedMoE factory returns a MoERunner), which expose no
+        # ``_expert_map`` attribute -- only an ``expert_map_manager`` property
+        # delegating to their RoutedExperts child. Reading ``layer._expert_map``
+        # returns None on every layer, silently no-opping the whole rebuild
+        # (the FusedMoE->MoERunner refactor stranded the original loop, which
+        # was written when moe_layers held modules with a real _expert_map
+        # buffer). The manager is exposed identically by the pre-refactor
+        # module, RoutedExperts, and MoERunner, and its ``_expert_map`` is the
+        # same tensor the dispatch kernels read via ``RoutedExperts.expert_map``
+        # -- so an in-place copy_ here updates both weight-loading and dispatch.
         model = self.model_runner.model
         rebuilt = 0
+        skipped_no_manager = 0
+        skipped_ep_disabled = 0
+        anomalous_no_map = 0
         moe_layers = getattr(model, "moe_layers", None)
         if moe_layers is not None:
             for moe_layer_idx, layer in enumerate(moe_layers):
-                expert_map = getattr(layer, "_expert_map", None)
-                if expert_map is None:
+                mgr = getattr(layer, "expert_map_manager", None)
+                if mgr is None:
+                    # Not an EP-aware MoE layer; nothing to rebuild.
+                    skipped_no_manager += 1
                     continue
-                cfg = layer.moe_parallel_config
+                expert_map = mgr.expert_map
+                cfg = mgr.moe_parallel_config
+                if expert_map is None:
+                    # ep_size == 1 -> EP disabled, no per-rank map exists
+                    # (legit skip). ep_size > 1 -> we expected a map and
+                    # there isn't one, which is an anomaly worth surfacing.
+                    if cfg.ep_size > 1:
+                        anomalous_no_map += 1
+                    else:
+                        skipped_ep_disabled += 1
+                    continue
                 num_physical = p2l.shape[1]
                 num_local = num_physical // cfg.ep_size
                 local_start = cfg.ep_rank * num_local
@@ -403,12 +420,38 @@ class Worker(WorkerBase):
                         hosted,
                         expert_map.shape[0],
                     )
+        if anomalous_no_map:
+            logger.warning(
+                "FT EP: %d MoE layer(s) had EP enabled (ep_size>1) but no "
+                "_expert_map to rebuild after dead peers %s; their routing "
+                "may be stale.",
+                anomalous_no_map,
+                sorted(dead_ep_ranks),
+            )
         if rebuilt:
             logger.info(
-                "FT EP: rebuilt _expert_map on %d FusedMoE module(s) after "
-                "dead peers %s.",
+                "FT EP: rebuilt _expert_map on %d MoE module(s) after dead "
+                "peers %s (skipped: %d no-manager, %d ep-disabled).",
                 rebuilt,
                 sorted(dead_ep_ranks),
+                skipped_no_manager,
+                skipped_ep_disabled,
+            )
+
+        # Fail-fast: we were asked to move experts but updated zero maps.
+        # This is the silent no-op that produced garbled output after the
+        # FusedMoE->MoERunner refactor -- the disk reload below would then
+        # write against a stale _expert_map and corrupt routing. Refuse to
+        # proceed rather than serve wrong tokens. (Cannot false-positive on
+        # legitimate non-EP runs: those have reassignments == 0.)
+        if reassignments and rebuilt == 0:
+            layer_type = type(moe_layers[0]).__name__ if moe_layers else "n/a"
+            raise RuntimeError(
+                f"FT EP: {len(reassignments)} expert reassignment(s) after "
+                f"dead peers {sorted(dead_ep_ranks)} but rebuilt 0 "
+                f"_expert_map(s); moe_layers entries ({layer_type}) did not "
+                f"expose a usable expert_map_manager. Recovery cannot proceed "
+                f"without corrupting MoE routing."
             )
 
         if reassignments:
