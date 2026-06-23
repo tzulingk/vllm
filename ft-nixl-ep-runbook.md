@@ -3663,7 +3663,95 @@ git grep -n "VLLM_FT_EP_SKIP_DP_BATCH_SYNC" -- '*.py'   # (no matches — stub r
 
 - ✅ Unit-test gate passes; rebuild rendezvous logic proven by the multiprocess test.
 - ✅ **Step 3 done:** `_run_ar` consumes `get_dp_ft_gloo()`; stub removed.
-- ⏳ Runbook E2E gate (next): `git push fork ft-nixl-ep-ftgloo-run-ar` →
-  in-cluster GB200 build (`VLLM_USE_PRECOMPILED=1` recipe) → pod → `kill -9`
-  DP1 → assert `FT NIXL EP: rebuilt DP FT-gloo survivor group [0,2,3]` +
-  ubatching/cudagraph re-enabled + no cascade/recapture.
+- ✅ Runbook E2E gate (done 2026-06-23): kill DP1 on GB200 → FT-gloo survivor
+  group rebuilt, survivors keep serving, no cascade. See next section.
+
+## 2026-06-23 — GB200 E2E kill test: FT-gloo rebuild validated (DYN-3253)
+
+Built + deployed branch `ft-nixl-ep-ftgloo-run-ar` and ran the kill test. The
+first two attempts surfaced **two pre-existing rebase regressions** that
+blocked the kill path *before* any FT-gloo code ran; both are now fixed on all
+three branches (`ft-nixl-ep-eplb-disk-reload`, `ft-nixl-ep-ftgloo-run-ar`,
+`ft-nixl-ep-kernel-mask-repro`).
+
+### Bug 1 — `query_mask` TypeError (rebase regression)
+
+A rebase wrapped `NixlEPAll2AllManager._buffer` in a `_NixlEPBufferState`
+(it used to be a plain list), but `all2all.py:query_mask` still did
+`_buffer[0]` → `TypeError: '_NixlEPBufferState' object is not subscriptable`
+on every kernel-mask consensus tick. The recovery trigger could never read the
+mask, and the exception storm on surviving workers cascaded the server down on
+a kill. Fix: `_buffer[0]` → `_buffer.buffer` (matches every other method).
+**This is why prior runs "passed": pre-rebase `query_mask` worked.**
+
+### Bug 2 — MPClient cascades on single actor death (uncommitted on this lineage)
+
+With bug 1 fixed, the kill still cascaded: `MPClient.start_engine_core_monitor`
+tears the whole client down on the first actor death (`engine core exited
+unexpectedly` → `EngineDeadError` → shutdown), before the kernel mask flips or
+`recover_from_dead_peers` runs. The per-engine tolerance (`6e0f88e27`, on
+`ft-nixl-ep-demo`) was **never committed to the disk-reload lineage** — prior
+validated runs must have live-patched `core_client.py`. Cherry-picked it onto
+all three branches (conflict resolved against the rebased file) + folded in the
+dispatcher-skip (`get_core_engine_for_request` skips `dead_engine_indices`).
+
+### Result (after both fixes, live-patched then re-served)
+
+Kill DP1 (`ray::DPMoEEngineCoreActor.run`, 2nd-lowest pid):
+
+```
+core_client.py:1484  FT NIXL EP: DP engine 1 died (RayActorError ...).
+                     Dispatcher will skip rank 1; survivors continue serving.   # no cascade
+dp_utils.py:98       FT NIXL EP cascade guard: DP all_reduce on dp_rank=0 failed
+                     (...); local-only this step.                               # death-step degrade
+core.py:2299         FT EP: kernel reports newly-dead EP peer(s) [1, 3] ...;
+                     triggering recover_from_dead_peers via collective_rpc.
+ft_gloo.py:204       FT gloo: rebuild gen=1 survivors=[0, 2] my_new_rank=0
+                     master=True host=192.168.88.243 port=34079                 # content-keyed rdzv
+gpu_worker.py:228    FT NIXL EP: rebuilt DP FT-gloo survivor group [0, 2]
+                     (gen=1) after dead EP peers [1, 3].
+gpu_worker.py:422    FT EP: disk-reloaded 2400 expert tensor(s) covering
+                     832 (layer, logical-id) pair(s) after dead peers [1, 3].
+```
+
+- `/health` 200 throughout; post-kill curl served by survivors
+  (`"the capital of Japan. The"`); **0** shutdown/`EngineDeadError`/all-dead.
+- Post-rebuild `_run_ar` produced no further cascade-guard warnings → the
+  survivor FT-gloo `all_reduce` consume path engages cleanly.
+
+**Nuance (pre-existing, not FT-gloo):** the NIXL kernel flagged `[1, 3]` dead,
+not just `1` — DP3's Ray actor stayed alive but the kernel false-flagged it
+~36s post-kill (the known kernel-mask cascade, DYN-3121/DYN-3139). FT-gloo
+correctly consumed the consensus survivor set `[0, 2]`; the over-broad mask is
+a separate issue.
+
+### Commands
+
+```bash
+# build (fast precompiled recipe; image's nixl-cu13 resolves to 1.3.0, which
+# renamed the module to nixl_ep_cu13 and breaks `from nixl_ep import Buffer`)
+kubectl apply -f /tmp/build-vllm-ft-gloo-run-ar.yaml   # VLLM_USE_PRECOMPILED=1, merge-base f2069b005b
+# -> nvcr.io/nvidian/dynamo-dev/tzulingk-vllm:ft-gloo-run-ar  (sha256:600d21e7...)
+
+kubectl apply -f /tmp/ft-gloo-serve-pod.yaml           # 4xGB200 + ComputeDomain; VLLM_FT_EP_KERNEL_MASK_REPRO=1
+
+# in-pod runtime setup (image deps + nixl pin)
+pip install --force-reinstall --no-deps nixl-cu13==1.1.0   # 1.3.0 ships nixl_ep_cu13, not nixl_ep
+pip install pytest ray
+python3 -c "from nixl_ep import Buffer; Buffer(rank=0, low_latency_mode=True, timeout_ms=5000, explicitly_destroy=True)"  # smoke OK
+
+# live-patch the two fixes (Python-only) then serve
+kubectl cp vllm/distributed/device_communicators/all2all.py  <pod>:.../vllm/distributed/device_communicators/all2all.py
+kubectl cp vllm/v1/engine/core_client.py                     <pod>:.../vllm/v1/engine/core_client.py
+setsid bash /tmp/serve.sh </dev/null >/tmp/vllm-serve.log 2>&1 &   # serve cmd: + --eplb-config '{"num_redundant_experts":64,"use_async":false}'
+
+# kill test
+VICTIM=$(ps -eo pid,cmd --no-headers | grep "[r]ay::DPMoEEngineCoreActor.run" | sort -k1,1n | awk 'NR==2{print $1}')
+kill -9 "$VICTIM"
+```
+
+Config note: rebased main now rejects `--enable-elastic-ep` + async EPLB —
+must pass `--eplb-config '{"num_redundant_experts": 64, "use_async": false}'`.
+
+Commits (signed): query_mask fix on all 3 branches; MPClient tolerance
+cherry-pick on all 3 (`c758171ce2` / `5ad4e526e0` / `bee1499b57`).
