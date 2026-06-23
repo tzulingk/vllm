@@ -3965,3 +3965,38 @@ slowness only); (b) debug the disk-reload correctness — compare
 slot-filtering against the validated `ft-nixl-ep-eplb-disk-reload` state, and
 check whether the rebase (`_NixlEPBufferState`, expert-map APIs) or the FT-gloo
 `_run_ar` survivor padding shifted which slots get written.
+
+### Step-1 confirm attempts + step-2 localization (2026-06-23, later)
+
+**Test-methodology bug found:** `kill -9` of the "2nd-lowest-PID actor" does NOT
+reliably kill DP rank 1 — **sorted-PID order != DP-rank order** (varies per serve
+instance; one run had `pid=19835 -> dp_rank=1`). A confirm run accidentally
+killed ranks `[0,3]` while `DEAD_DP_RANKS=1,3`, causing a mismatch cascade. **To
+kill a specific rank: map PID->rank from the logs** (`DPMoEEngineCoreActor
+pid=N ... dp_rank=R`), and `DEAD_DP_RANKS` MUST equal the ranks actually killed.
+With `DEAD_DP_RANKS=1,3` set, ranks 1,3 skip consensus logging, so identify
+ranks 0,2 from logs and the **other two actor PIDs are {1,3} by elimination**.
+
+**Restart cleanly:** graceful `kill -TERM` of the API server + `ray stop`
+restarts without wedging (procs -> 0); repeated in-place restarts otherwise
+accrete stale actors (saw 5 actor PIDs for DP=4). When in doubt, recreate the pod.
+
+**Step-2 localization — the disk-reload code on this branch is NOT the
+Run-15-validated code.** `d181d04f0` (the fix the runbook credits for Run 15) is
+**not an ancestor on this lineage**. This branch carries a *reworked* disk-reload
+/ `_expert_map` implementation that landed after Run 15 and was **never
+output-validated on a two-rank kill** (single-rank has `reassignments=0`, so it
+never exercises disk reload). Suspect commits, newest first:
+
+- `273868f01a` Rebuild `_expert_map` from placement table, not static topology
+- `5087327c19` Defer reload per-rank filtering to `FusedMoE.weight_loader`
+- `503cb70bd3` Rebuild FusedMoE `_expert_map` after EPLB redistribute
+
+`reload_experts_from_disk` itself (eplb_reload.py) reads fine and is unchanged by
+the FT-gloo work; the regression is in the `_expert_map` rebuild
+(`gpu_worker.eplb_redistribute_for_dead_peers`, lines ~300-339) interacting with
+how the rebased `FusedMoE.weight_loader` / `_map_global_expert_id_to_local_expert_id`
+route. **Next debug step:** add a post-reload assertion that each reassigned
+`(layer, logical)`'s `_expert_map[logical]` points at a slot whose GPU weights
+match the checkpoint, and bisect the three commits above (start `273868f01a`).
+The single-rank kill (clean) and DYN-3253's FT-gloo survivor path are unaffected.
