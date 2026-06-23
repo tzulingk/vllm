@@ -3981,22 +3981,43 @@ ranks 0,2 from logs and the **other two actor PIDs are {1,3} by elimination**.
 restarts without wedging (procs -> 0); repeated in-place restarts otherwise
 accrete stale actors (saw 5 actor PIDs for DP=4). When in doubt, recreate the pod.
 
-**Step-2 localization — the disk-reload code on this branch is NOT the
-Run-15-validated code.** `d181d04f0` (the fix the runbook credits for Run 15) is
-**not an ancestor on this lineage**. This branch carries a *reworked* disk-reload
-/ `_expert_map` implementation that landed after Run 15 and was **never
-output-validated on a two-rank kill** (single-rank has `reassignments=0`, so it
-never exercises disk reload). Suspect commits, newest first:
+**Step-2 ROOT CAUSE (corrected) — the rebase moved expert-map state into
+`ExpertMapManager`; the recovery's in-place `_expert_map.copy_` no longer
+updates the derived routing structures.**
 
-- `273868f01a` Rebuild `_expert_map` from placement table, not static topology
-- `5087327c19` Defer reload per-rank filtering to `FusedMoE.weight_loader`
-- `503cb70bd3` Rebuild FusedMoE `_expert_map` after EPLB redistribute
+CORRECTION to the earlier "reworked / prime-suspect 273868f01a" note: a patch
+diff shows **`273868f01a` is byte-identical to the Run-15-validated `d181d04f0`**
+(only a 5-line hunk-header offset from the rebase). The `_expert_map` rebuild
+logic is the *validated* fix, not a rework. The regression is NOT in the
+recovery commits — it's in what they depend on, which the rebase changed:
 
-`reload_experts_from_disk` itself (eplb_reload.py) reads fine and is unchanged by
-the FT-gloo work; the regression is in the `_expert_map` rebuild
-(`gpu_worker.eplb_redistribute_for_dead_peers`, lines ~300-339) interacting with
-how the rebased `FusedMoE.weight_loader` / `_map_global_expert_id_to_local_expert_id`
-route. **Next debug step:** add a post-reload assertion that each reassigned
-`(layer, logical)`'s `_expert_map[logical]` points at a slot whose GPU weights
-match the checkpoint, and bisect the three commits above (start `273868f01a`).
+- The rebase refactored FusedMoE expert-map handling into **`ExpertMapManager`**
+  (`expert_map_manager.py`) and moved `weight_loader` to `routed_experts.py`.
+- `routed_experts.py:229` `register_buffer("_expert_map", manager.expert_map)` —
+  the module's `_expert_map` is the manager's tensor, but the manager **also**
+  maintains derived structures `expert_mask` (:230) and `routing_tables` (:233),
+  recomputed together only via `ExpertMapManager.update()` / `update_expert_map_info()`.
+- `weight_loader` (:594) routes via `_map_global_expert_id_to_local_expert_id`
+  (:270-272) → `manager.map_global_to_local` → `manager._expert_map`.
+
+The recovery (`gpu_worker.eplb_redistribute_for_dead_peers`) does
+`layer._expert_map.copy_(new_map)` — an in-place write to the single
+`_expert_map` tensor. That was sufficient when `_expert_map` was the *sole*
+routing structure (the world `d181d04f0` was validated in). Post-rebase it
+leaves the manager's **`expert_mask` / `routing_tables` stale**, so the
+dispatch/kernels read stale derived maps → **degenerate output**. (The proper
+`update()` can't be used as-is: it regenerates from *static* topology via
+`determine_expert_map`, which is exactly why `d181d04f0` bypassed it.)
+
+`reload_experts_from_disk` (eplb_reload.py) and `5087327c19` are also intact;
+they defer routing to `weight_loader` → `manager._expert_map`, so weight *loading*
+may be correct while dispatch uses the stale `expert_mask`/`routing_tables`.
+
+**Fix direction:** route the recovery's expert-map update through the manager so
+ALL derived structures recompute from the post-reassignment placement — e.g. add
+an `ExpertMapManager` update that takes the mutated `physical_to_logical_map`
+(NOT static `determine_expert_map`) and rebuilds `_expert_map` + `expert_mask` +
+`routing_tables` + re-runs `update_expert_map_info()`. **Confirm first** with the
+assertion: after recovery, check `_expert_map`, `expert_mask`, and
+`routing_tables` are mutually consistent for each reassigned `(layer, logical)`.
 The single-rank kill (clean) and DYN-3253's FT-gloo survivor path are unaffected.
