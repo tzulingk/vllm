@@ -3891,3 +3891,34 @@ was already bounded via `FaultTolerantGlooGroup.all_reduce`.
 Validation: re-run the kill test on the fresh image with the full env set
 (incl. `SKIP_EPLB_SYNC=1`) and confirm the mask stays `[0,1,0,0]` (only DP1)
 and the survivor group rebuilds as `[0,2,3]` (not `[0,2]`).
+
+### Result (2026-06-23, fresh pod, full fix stack) — CLEAN ✅
+
+Fix stack: query_mask `_buffer.buffer` (baked) + MPClient per-engine tolerance
+(baked) + `VLLM_FT_EP_REPRO_DEAD_DP_RANKS=1` + `VLLM_FT_EP_SKIP_EPLB_SYNC=1` +
+**fail-fast `_run_ar` (1000ms, live-patched)**. Killed DP1:
+
+```
+core.py:2299     FT EP: kernel reports newly-dead EP peer(s) [1] ...        # only [1], no DP3
+ft_gloo.py:204   FT gloo: rebuild gen=1 survivors=[0, 2, 3] master=True port=43473
+gpu_worker.py:228 FT NIXL EP: rebuilt DP FT-gloo survivor group [0, 2, 3] after dead EP peers [1].
+gpu_worker.py:339 ... redistribute ... dead_ep_ranks=[1], reassignments=0   # redundancy covers 1 rank
+mask stable [0,1,0,0] across ranks; /health 200; post-kill curl -> "Tokyo."
+```
+
+Verification counts: `src_rank 3` kernel timeouts = **0** (the desync cascade is
+gone — DP0 never even times out on DP3), shutdown/EngineDeadError = **0**, alive
+engine actors = **3** `[0,2,3]`. This matches the validated Run 14 Test 1
+(single-rank kill → `[1]`, reassignments empty). **DYN-3253's FT-gloo survivor
+path now gives a clean single-rank result on a kill.**
+
+### Operational lesson — don't `pkill -9` the serve to restart it
+
+Restarting the serve in-place via `pkill -9 -f vllm ...` corrupted the pod's Ray
+state: the next serve started Ray but its `DPMoEEngineCoreActor`s never spawned
+(hung >30 min) and ~275 orphaned `ray::IDLE` workers wouldn't clear (the broad
+`pkill` also kept getting the `kubectl exec` shell SIGKILL'd, exit 137). GPU mem
+was clean, but the pod was unrecoverable in-place. **To restart a serve: prefer
+`ray stop` gracefully, or just recreate the pod** (the rebuilt image bakes in
+query_mask + MPClient, so only `dp_utils.py` needs a live-patch + the runtime
+nixl/pytest/ray setup). Recreating the pod gave an immediately clean run.
