@@ -3922,3 +3922,46 @@ was clean, but the pod was unrecoverable in-place. **To restart a serve: prefer
 `ray stop` gracefully, or just recreate the pod** (the rebuilt image bakes in
 query_mask + MPClient, so only `dp_utils.py` needs a live-patch + the runtime
 nixl/pytest/ray setup). Recreating the pod gave an immediately clean run.
+
+### Second kill (DP3 on top of DP1) — recovery OK, but OUTPUT INCORRECT (DYN-3154 Test 2)
+
+Continued the validated DYN-3154 two-rank-kill: with DP1 already dead, killed
+DP3. **Recovery mechanism worked**: `rebuilt DP FT-gloo survivor group [0, 2]
+(gen=2) after dead EP peers [1, 3]`, `reassignments=832`, `disk-reloaded 2400
+expert tensor(s)`, `/health` 200, no cascade/shutdown, LB correctly routes to
+`[0,2]` only (MPClient caught both deaths).
+
+Two findings:
+
+1. **Config gap (slowness, not correctness):** `VLLM_FT_EP_REPRO_DEAD_DP_RANKS`
+   was set to `1`, not `1,3`. So after the DP3 kill the consensus check waits a
+   3s `store.wait` **per step** for dead DP3's key
+   (`skipping step-N check -- ranks [3] have no step-N mask yet`), i.e. ~3s per
+   decode token → an 8-token request exceeds the 25s curl timeout → empty. **For
+   a two-rank kill, set `VLLM_FT_EP_REPRO_DEAD_DP_RANKS=1,3`.** (The consensus
+   check only publishes/reads masks; it cannot corrupt model output — slowness
+   only.)
+
+2. **Real correctness failure (disk reload):** with the curl timeout raised to
+   tolerate the stall, requests complete but produce **degenerate output** — the
+   model echoes the prompt instead of answering:
+   ```
+   "The capital of France is" -> " the capital of France. The"   (not Paris)
+   "2 plus 2 equals"          -> " 2 plus 2 equals"              (not 4)
+   "largest planet ... is"    -> " the largest planet in our solar" (not Jupiter)
+   ```
+   The **single-rank kill was correct because `reassignments=0` (no disk
+   reload)**; the two-rank kill is the FIRST to actually reload weights, and the
+   MoE output is wrong. This matches Run 14 Test 2's original failure mode. The
+   `_expert_map`-from-placement-table fix commits (`d181d04f0` /
+   `503cb70bd3` / `273868f01a`) ARE on this branch, yet output is still
+   degenerate → the disk-reload weight/`_expert_map` correctness is regressed
+   (rebase or FT-gloo interaction) or never fully fixed on this lineage.
+
+**Next:** (a) re-run the two-rank kill with `REPRO_DEAD_DP_RANKS=1,3` to confirm
+the garbage is independent of the stall (expected: still garbage — the stall is
+slowness only); (b) debug the disk-reload correctness — compare
+`reload_experts_from_disk` + `_expert_map` rebuild + `FusedMoE.weight_loader`
+slot-filtering against the validated `ft-nixl-ep-eplb-disk-reload` state, and
+check whether the rebase (`_NixlEPBufferState`, expert-map APIs) or the FT-gloo
+`_run_ar` survivor padding shifted which slots get written.
