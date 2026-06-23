@@ -30,9 +30,9 @@ design discussion, see DYN-3253):
   meets its peers. Since survivors agree on the mask by consensus, they
   agree on the key by construction.
 
-This module holds no mask state -- the caller passes the survivor set in
-explicitly. The active mask comes straight from the NIXL-EP kernel
-(``query_mask``); there is intentionally no ``PeerActiveState`` here.
+This module holds no mask state of its own -- the caller passes the
+survivor set in explicitly, sourced from the NIXL-EP kernel mask
+(``query_mask``).
 """
 
 from __future__ import annotations
@@ -295,9 +295,9 @@ class FaultTolerantGlooGroup:
 #
 # Build (rebuild_for_survivors, via the recover_from_dead_peers RPC) and read
 # (all_reduce, via _run_ar) both happen in the *same* worker process, so a
-# module-global holder has no cross-process staleness hazard (unlike the
-# engine-vs-worker split that bit PeerActiveState). All logic lives on the
-# class above; this is only a holder + accessor, kept testable via reset().
+# module-global holder has no cross-process staleness hazard. All logic lives
+# on the class above; this is only a holder + accessor, kept testable via
+# reset().
 # --------------------------------------------------------------------------- #
 
 _DP_FT_GLOO: FaultTolerantGlooGroup | None = None
