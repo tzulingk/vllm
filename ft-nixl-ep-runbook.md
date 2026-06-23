@@ -4096,3 +4096,25 @@ Full validation summary for `ft-nixl-ep-ftgloo-run-ar`:
 - DYN-3253 FT-gloo `_run_ar` survivor path + fail-fast: ✅.
 - Required fixes, all committed: query_mask `_buffer.buffer`; MPClient per-engine
   tolerance; `_run_ar` fail-fast; `_expert_map` rebuild via `expert_map_manager`.
+
+### Fork branch topology (`github.com/tzulingk/vllm`) — 2026-06-23
+
+| Branch | What it is |
+|---|---|
+| `ft-nixl-ep-ftgloo-run-ar` | the DYN-3253 work (FT-gloo + the 4 fixes + runbook), validated. = `1f61faf982` + 14 commits. |
+| **`ft-nixl-ep-eplb-disk-reload-rebased`** | **NEW** — points at `1f61faf982`, the *rebased* `disk-reload` base that `ftgloo` actually branched from. Created as a clean, **auto-mergeable** compare/PR base (the original `disk-reload` can't auto-merge — see below). |
+| `ft-nixl-ep-eplb-disk-reload` | the ORIGINAL (pre-rebase) branch, untouched. |
+
+**Why the `-rebased` branch exists:** the fork's `ft-nixl-ep-eplb-disk-reload`
+is the *pre-rebase* version; it and `ftgloo` share only an ancient merge-base
+(`4e597b749`) — disk-reload is 25 commits past it, `ftgloo` is 1043 (the local
+`disk-reload`@`1f61faf982` had been rebased onto recent upstream main). So
+`disk-reload...ftgloo` on GitHub dumps ~1000 unrelated upstream commits and
+"can't automatically merge." Pushing the fork-point SHA `1f61faf982` to the new
+`-rebased` branch makes `ftgloo` a clean linear 14-commit descendant.
+
+**Clean review/PR compare (14 commits, auto-mergeable):**
+`https://github.com/tzulingk/vllm/compare/ft-nixl-ep-eplb-disk-reload-rebased...ft-nixl-ep-ftgloo-run-ar`
+
+Created via `git push fork 1f61faf982:refs/heads/ft-nixl-ep-eplb-disk-reload-rebased`
+(new branch, no force-push, original branches preserved).
