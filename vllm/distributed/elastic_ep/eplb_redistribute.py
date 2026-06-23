@@ -47,8 +47,9 @@ on every rank. The invariants:
    identical on every rank, then feed those to the deterministic
    ``policy.rebalance_experts`` (sort-by-load, greedy assignment, no
    RNG). Identical input + deterministic algorithm = identical output.
-   (In the FT-validation branch this path is short-circuited by
-   ``VLLM_FT_EP_SKIP_EPLB_SYNC=1`` so it never runs.)
+   (Under FT NIXL EP the load all-reduce reroutes onto the FT-gloo
+   survivors after a death; the rearrangement weight shuffle itself is
+   suppressed while a peer is dead -- see ``EplbState._ep_all_reduce``.)
 
 3. **Recovery broadcasts identical args, then runs deterministic ops.**
    The engine calls ``self.collective_rpc("recover_from_dead_peers",

@@ -26,7 +26,6 @@ MoE layer. If we have 32 EP ranks, then each GPU will hold 288 / 32 = 9 local
 physical experts.
 """
 
-import os
 import threading
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -500,15 +499,13 @@ class EplbState:
             - `max_tokens`: The maximum load across ranks.
             - `balancedness`: The ratio of average load to maximum load.
         """
-        # FT EP work-in-progress: skip every cross-rank EP collective in
-        # EPLB while a dead peer is in the EP group. Local load tracking
-        # is also skipped (no rearrangement can fire without it), which
-        # is fine because rearrangement would all-reduce on the broken
-        # EP group and hang. Recovery-driven redistribution is triggered
-        # out-of-band by the engine on dead-peer detection.
-        if os.environ.get("VLLM_FT_EP_SKIP_EPLB_SYNC", "0") == "1":
-            self.expert_rearrangement_step += 1
-            return
+        # FT NIXL EP: EPLB's cross-rank load aggregation runs normally over
+        # the full EP NCCL group in steady state. After a DP peer dies and
+        # ``recover_from_dead_peers`` rebuilds the FT-gloo survivor group,
+        # ``_ep_all_reduce`` reroutes the load all-reduce onto the survivors
+        # so it does not hang on the dead peer. The rearrangement weight
+        # shuffle (which moves expert weights over the full EP group) is
+        # suppressed while degraded -- see the gate below.
         ep_group = get_ep_group().device_group
         if is_profile:
             self.rearrange(is_profile=True)
@@ -614,7 +611,21 @@ class EplbState:
                 self._update_layer_should_record(log_stats=log_stats)
                 return
             self.expert_rearrangement_step = 0
-            self.rearrange()
+            if self._ft_survivor_group() is not None:
+                # Degraded: a DP peer is dead. Load aggregation above already
+                # ran over the survivors (FT-gloo), but the rearrangement
+                # weight shuffle moves expert weights over the full EP NCCL
+                # group and would hang on the dead peer. Survivor-aware weight
+                # movement is a separate effort; suppress rearrangement while
+                # degraded. Recovery-time disk reload already redistributed
+                # the dead rank's experts onto the survivors.
+                logger.warning_once(
+                    "FT NIXL EP: skipping EPLB expert rearrangement while a "
+                    "DP peer is dead (survivor-aware weight shuffle not yet "
+                    "implemented); load aggregation continues over survivors."
+                )
+            else:
+                self.rearrange()
 
         self._update_layer_should_record(log_stats=log_stats)
 
@@ -835,6 +846,54 @@ class EplbState:
                 is_profile=is_profile,
             )
 
+    def _ft_survivor_group(self):
+        """Return the FT-gloo survivors-only group if a DP peer has died.
+
+        After ``recover_from_dead_peers`` rebuilds the survivor group, EPLB's
+        cross-rank collectives must run over the survivors only -- the full
+        EP NCCL group would block forever on the dead peer. Returns ``None`` in
+        steady state (no death), so the normal full-group NCCL path runs with
+        zero overhead.
+
+        Note: the FT-gloo group is indexed by DP rank. For TP=1 (current FT
+        deployments) the EP group equals the DP group, so the survivor set
+        lines up with the EP ranks. TP>1 would need an EP-indexed survivor
+        group; tracked as future work.
+        """
+        from vllm.distributed.elastic_ep.ft_gloo import get_dp_ft_gloo
+
+        ft = get_dp_ft_gloo()
+        if ft is not None and ft.has_group:
+            return ft
+        return None
+
+    def _ep_all_reduce(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Sum-all-reduce ``tensor`` across the EP group, fault-tolerantly.
+
+        Steady state: NCCL all-reduce over the full EP device group.
+        Degraded (a DP peer died; FT-gloo survivor group rebuilt): copy to
+        CPU, all-reduce over the survivors-only gloo group, copy back. The
+        reduce is a sum over per-physical-expert load; a dead rank's physical
+        slots carry zero load on every survivor (nothing routes to a dead
+        rank), so the survivor sum is already correct -- no dead-column
+        backfill is needed. On a survivor-reduce failure the tensor keeps this
+        rank's local load.
+        """
+        ft = self._ft_survivor_group()
+        if ft is None:
+            all_reduce(tensor, group=get_ep_group().device_group)
+            return tensor
+        cpu_tensor = tensor.detach().to("cpu")
+        reduced, valid = ft.all_reduce(cpu_tensor)
+        if valid:
+            tensor.copy_(reduced.to(tensor.device))
+        else:
+            logger.warning_once(
+                "FT NIXL EP: EPLB survivor load all_reduce returned invalid; "
+                "proceeding with local-only expert load this pass."
+            )
+        return tensor
+
     def _all_ranks_result_ready(self, model_state: EplbModelState) -> bool:
         parallel_state = get_ep_group()
         has_result = int(model_state.pending_result is not None)
@@ -861,7 +920,7 @@ class EplbState:
         All-reduce a list of tensors.
         """
         if len(tensor_list) == 1:
-            all_reduce(tensor_list[0], group=get_ep_group().device_group)
+            self._ep_all_reduce(tensor_list[0])
             return tensor_list
         assert all(t.dim() == 2 for t in tensor_list), "All tensors must be 2D."
         assert all(t.shape[1] == tensor_list[0].shape[1] for t in tensor_list), (
@@ -873,8 +932,7 @@ class EplbState:
         shapes = [t.shape for t in tensor_list]
         concat_tensor = torch.cat(tensor_list, dim=0)
 
-        ep_group = get_ep_group().device_group
-        all_reduce(concat_tensor, group=ep_group)
+        self._ep_all_reduce(concat_tensor)
 
         all_reduce_list = []
         offset = 0
