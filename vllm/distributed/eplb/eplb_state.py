@@ -29,12 +29,15 @@ physical experts.
 import threading
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import timedelta
 
 import torch
+import torch.distributed as dist
 from torch.distributed import ProcessGroup, all_reduce
 
 from vllm.config import ModelConfig, ParallelConfig
 from vllm.distributed.parallel_state import (
+    get_dp_group,
     get_ep_group,
     get_eplb_group,
     get_node_count,
@@ -56,6 +59,16 @@ from .rebalance_execute import (
 )
 
 logger = init_logger(__name__)
+
+# FT NIXL EP: fail-fast bound (ms) for EPLB's cross-rank load all_reduce while a
+# peer may be dead. Mirrors _run_ar's _RUN_AR_FAILFAST_TIMEOUT_MS: in the window
+# between a DP peer's death and recovery rebuilding the FT-gloo survivor group,
+# the full-group all_reduce still includes the dead peer; an unbounded wait there
+# blocks the survivor's forward so the engine never runs the recovery trigger
+# (the cluster hangs). A bounded gloo wait lets the survivor degrade to local-only
+# and keep stepping until recovery rebuilds the survivor group. Kept under the 5s
+# NIXL window.
+_EPLB_ALLREDUCE_FAILFAST_MS = 1000
 
 
 @dataclass
@@ -742,6 +755,21 @@ class EplbState:
         # Perform all-reduce to get the expert load across all ranks for each model
         global_expert_load_windows = self._allreduce_list(global_expert_load_windows)
 
+        # FT NIXL EP: if the load all-reduce above degraded to local-only (a DP
+        # peer died and the fail-fast bound elapsed before recovery rebuilt the
+        # survivor group), the per-rank load views diverge -- a weight shuffle
+        # would compute inconsistent placements AND block on the dead peer
+        # (rearrange_expert_weights_inplace uses the unbounded EP NCCL group).
+        # Skip rearrangement; the recovery-time disk reload redistributes the
+        # dead rank's experts, and once the survivor group is rebuilt the step()
+        # gate suppresses rearrangement entirely while degraded.
+        if not getattr(self, "_ep_all_reduce_valid", True):
+            logger.warning_once(
+                "FT NIXL EP: skipping EPLB expert rearrangement (load "
+                "all-reduce degraded; a DP peer is likely dead)."
+            )
+            return None
+
         # TODO(bowen): Treat differently for prefill and decode nodes
         eplb_model_state = next(iter(self.model_states.values()))
         model = eplb_model_state.model
@@ -870,28 +898,65 @@ class EplbState:
     def _ep_all_reduce(self, tensor: torch.Tensor) -> torch.Tensor:
         """Sum-all-reduce ``tensor`` across the EP group, fault-tolerantly.
 
-        Steady state: NCCL all-reduce over the full EP device group.
-        Degraded (a DP peer died; FT-gloo survivor group rebuilt): copy to
-        CPU, all-reduce over the survivors-only gloo group, copy back. The
-        reduce is a sum over per-physical-expert load; a dead rank's physical
-        slots carry zero load on every survivor (nothing routes to a dead
-        rank), so the survivor sum is already correct -- no dead-column
-        backfill is needed. On a survivor-reduce failure the tensor keeps this
-        rank's local load.
+        Always runs over a **gloo** group with a bounded wait, never the
+        unbounded EP NCCL device group -- a stalled collective on a dead peer
+        would block the survivor's forward so the engine never reaches the
+        recovery trigger (the whole cluster hangs). Three regimes:
+
+        * Post-recovery (FT-gloo survivor group rebuilt): all-reduce over the
+          survivors only. A dead rank's physical slots carry zero load on every
+          survivor (nothing routes to a dead rank), so the survivor sum needs no
+          dead-column backfill.
+        * Steady state (all peers alive): full DP gloo group, completes in well
+          under the fail-fast bound.
+        * Death window (peer dead, recovery not yet done): the full-group
+          all-reduce includes the dead peer and times out at the fail-fast bound;
+          we degrade to this rank's local load and keep stepping.
+
+        Sets ``self._ep_all_reduce_valid`` so :meth:`rearrange` can skip the EP
+        weight shuffle (an unbounded NCCL collective) when the load all-reduce
+        degraded -- the per-rank load views diverge then, and a shuffle would
+        both be inconsistent and block on the dead peer.
+
+        Note: the gloo group is the DP group (== EP group for TP=1, the current
+        FT deployment); TP>1 would need an EP-indexed gloo group (future work).
         """
         ft = self._ft_survivor_group()
-        if ft is None:
-            all_reduce(tensor, group=get_ep_group().device_group)
+        if ft is not None and ft.has_group:
+            cpu_tensor = tensor.detach().to("cpu")
+            reduced, valid = ft.all_reduce(cpu_tensor)
+            if valid:
+                tensor.copy_(reduced.to(tensor.device))
+            else:
+                logger.warning_once(
+                    "FT NIXL EP: EPLB survivor load all_reduce returned "
+                    "invalid; proceeding with local-only expert load this pass."
+                )
+            self._ep_all_reduce_valid = valid
             return tensor
+
+        cpu_group = get_dp_group().cpu_group
+        if cpu_group is None or cpu_group.size() <= 1:
+            self._ep_all_reduce_valid = True
+            return tensor
+
         cpu_tensor = tensor.detach().to("cpu")
-        reduced, valid = ft.all_reduce(cpu_tensor)
-        if valid:
-            tensor.copy_(reduced.to(tensor.device))
-        else:
+        work = dist.all_reduce(cpu_tensor, group=cpu_group, async_op=True)
+        try:
+            work.wait(timeout=timedelta(milliseconds=_EPLB_ALLREDUCE_FAILFAST_MS))
+        except (RuntimeError, ValueError, TimeoutError) as e:
             logger.warning_once(
-                "FT NIXL EP: EPLB survivor load all_reduce returned invalid; "
-                "proceeding with local-only expert load this pass."
+                "FT NIXL EP: EPLB load all_reduce failed/timed out after %dms "
+                "(%s: %s); a DP peer is likely dead. Proceeding with local-only "
+                "expert load this pass; rearrangement is skipped until recovery.",
+                _EPLB_ALLREDUCE_FAILFAST_MS,
+                type(e).__name__,
+                e,
             )
+            self._ep_all_reduce_valid = False
+            return tensor
+        tensor.copy_(cpu_tensor.to(tensor.device))
+        self._ep_all_reduce_valid = True
         return tensor
 
     def _all_ranks_result_ready(self, model_state: EplbModelState) -> bool:
