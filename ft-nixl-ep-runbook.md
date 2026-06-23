@@ -3755,3 +3755,80 @@ must pass `--eplb-config '{"num_redundant_experts": 64, "use_async": false}'`.
 
 Commits (signed): query_mask fix on all 3 branches; MPClient tolerance
 cherry-pick on all 3 (`c758171ce2` / `5ad4e526e0` / `bee1499b57`).
+
+## 2026-06-23 — CANONICAL kill-test env set + the DP3 false-positive explained
+
+**Read this before any future kill test — it is the difference between a
+clean single-rank result and a confusing multi-rank cascade.**
+
+### The validated kill-test env (the "known-good" config)
+
+| Env / flag | Effect |
+|---|---|
+| `VLLM_FT_EP_KERNEL_MASK_REPRO=1` | Enables the kernel-mask consensus check + the redistribute/recover driver. Without it `recover_from_dead_peers` never fires. |
+| `VLLM_FT_EP_REPRO_DEAD_DP_RANKS=1` | Marks DP1 as expected-dead so the consensus check doesn't burn the 3s `store.wait` per step waiting for the dead rank's key (else recovery stalls ~36s). |
+| `VLLM_FT_EP_SKIP_DP_BATCH_SYNC=1` | Bypasses the per-step `_run_ar` cross-DP all_reduce. |
+| `VLLM_FT_EP_SKIP_DP_BATCH_SYNC_PAD_TOKENS=256` | Pre-agreed padded-tokens value all ranks use without syncing. |
+| `VLLM_FT_EP_SKIP_EPLB_SYNC=1` | Bypasses EPLB cross-rank load aggregation. |
+| `VLLM_NIXL_EP_TIMEOUT_MS=5000` | NIXL EP kernel dispatch timeout (how long before the kernel flips a mask bit). |
+| `--cpu-distributed-timeout-seconds 10` | Bounds gloo's 1800s default so a dead-peer collective fails fast. |
+
+### Why the validated runs had NO false positive
+
+The validated runs set **all three SKIP flags**, so when DP1 was killed **no
+cross-DP collective blocked on the dead peer**. The survivors stepped smoothly,
+the NIXL-EP all-to-all stayed synchronized, and the kernel flagged **only the
+truly-dead DP1** → `kernel reports newly-dead EP peer(s) [1]`, reassignments
+empty (redundancy covers a single-rank loss). See Run 14 Test 1.
+
+### Why DYN-3253 (`ft-nixl-ep-ftgloo-run-ar`) re-introduced a DP3 false positive
+
+DYN-3253 **removes the `VLLM_FT_EP_SKIP_DP_BATCH_SYNC` stub** (the whole point:
+run the real `_run_ar` over a survivors-only FT-gloo group). So on this branch:
+
+- `VLLM_FT_EP_SKIP_DP_BATCH_SYNC` / `..._PAD_TOKENS` are **no-ops** (the stub
+  they gated is gone — confirmed: 0 hits in `dp_utils.py`).
+- `VLLM_FT_EP_SKIP_EPLB_SYNC` is **still live** in `eplb_state.py` (1 hit) and
+  **must still be set** — the first serve scripts forgot it.
+
+With the DP-batch-sync stub gone, at the **death step** (before the FT-gloo
+survivor group is rebuilt) `_run_ar` attempts a **full-group gloo all_reduce
+that includes dead DP1** and blocks up to `--cpu-distributed-timeout-seconds`
+(10s) before the cascade guard falls back to local-only. That multi-second
+per-step stall (plus EPLB sync, if `SKIP_EPLB_SYNC` is unset) **desyncs the
+survivors' forward passes**, the NIXL-EP all-to-all desyncs, and DP0's kernel
+genuinely times out receiving from **DP3** as well as DP1:
+
+```
+RayWorkerProc DP0: NIXL-EP timeout for dispatch receive, rank 0, ..., src_rank 1
+RayWorkerProc DP0: NIXL-EP timeout for dispatch receive, rank 0, ..., src_rank 3   # <-- DP3, alive
+-> consistent mask [0,1,0,1] across survivors -> recover for [1,3] -> 832 reassignments
+```
+
+This is a **consistent** mask (verified across ranks), so it is NOT the
+DYN-3139 CPU-read race (the GPU-buffer read is present and working). It is the
+**death-step cross-DP collective disruption** that the SKIP bypass used to hide.
+
+### Consequence for DYN-3253 (the real remaining problem)
+
+Re-enabling `_run_ar` correctly means the **death-step transition must not
+block on the dead peer**. The current cascade guard still issues the
+full-group all_reduce first and eats the ~10s gloo timeout each step until
+recovery rebuilds the survivor group. To match the validated clean result,
+`_run_ar` must **fail fast / pre-switch to local-only (or the survivor group)
+the moment a peer is known dead**, instead of blocking on the full group. Until
+that lands, expect the DP3-type cascade on this branch even though the FT-gloo
+rebuild mechanism itself is proven correct (it correctly recovered the `[0,2]`
+survivor set).
+
+### Checklist for the next kill test on `ftgloo-run-ar`
+
+1. Set env: `KERNEL_MASK_REPRO=1`, `REPRO_DEAD_DP_RANKS=1`,
+   **`SKIP_EPLB_SYNC=1`**, `NIXL_EP_TIMEOUT_MS=5000`, `FT_EP_DEBUG=1`;
+   serve with `--cpu-distributed-timeout-seconds 10` (or the env equivalent)
+   and `--eplb-config '{"num_redundant_experts":64,"use_async":false}'`.
+   (`SKIP_DP_BATCH_SYNC` / `..._PAD_TOKENS` are no-ops here — the stub is gone.)
+2. To validate the FT-gloo rebuild **mechanism** in isolation, accept the DP3
+   cascade for now (it recovers correctly for whatever survivor set consensus
+   produces). To get a **clean single-rank** result, the death-step `_run_ar`
+   fail-fast change above is required first.
