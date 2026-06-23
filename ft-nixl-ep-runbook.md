@@ -3832,3 +3832,62 @@ survivor set).
    cascade for now (it recovers correctly for whatever survivor set consensus
    produces). To get a **clean single-rank** result, the death-step `_run_ar`
    fail-fast change above is required first.
+
+## 2026-06-23 — Why the kill lands in "Case 2" + the `_run_ar` fail-fast fix
+
+### Two cases for where a `kill -9` lands (within-step ordering)
+
+Per step the collectives run in a fixed order: **`_run_ar` (gloo DP sync, 1st)
+→ MoE all-to-all (NIXL, 2nd, 5s kernel timeout) → CPU tail
+(`_has_global_unfinished_reqs` incl. the consensus check) → next step's
+`_run_ar`**. `_run_ar` always uses `get_dp_group().cpu_group`, whose membership
+**still includes the dead rank** until recovery rebuilds the survivor group.
+
+- **Case 1** — DP1 dies *during a step's forward (MoE)*: that step's MoE
+  detects it (5s timeout), recovery rebuilds at the step's end, and the **next
+  step's `_run_ar` uses the survivor group → fine, no block.**
+- **Case 2** — DP1 dies *between steps* (after a step's MoE, before the next
+  `_run_ar`): the next `_run_ar` is the **first** collective to hit the dead
+  rank, before any MoE detection / recovery this step → it blocks/desyncs.
+
+### Why idle `kill -9` lands in Case 2 (not Case 1)
+
+It's about *which collective the survivors hit first*, not which phase is
+longest. Case 1's window ≈ the forward duration; Case 2's window ≈ everything
+else (the CPU tail + inter-step gap). In the **idle dummy-batch loop** the
+forward is a sub-millisecond sliver, while the CPU tail is large — *especially*
+because `VLLM_FT_EP_KERNEL_MASK_REPRO=1` runs the consensus check
+(`_verify_kernel_mask_consensus_or_crash` → store publish + `store.wait` up to
+3s) **every step**. So a uniformly-random kill lands in the fat CPU tail the
+large majority of the time → next collective is a `_run_ar` → Case 2. (Under
+real sustained traffic the forward is no longer a sliver, so Case 1 becomes
+likely — another reason Run 14's single kill looked clean.)
+
+### Why the 10s gloo timeout didn't bound `_run_ar`
+
+- The **synchronous** `dist.all_reduce(group=...)` has **no per-call timeout**;
+  it only honors the process group's configured timeout.
+- The DP `cpu_group`'s timeout depends on creation path
+  ([parallel_state.py:410-433](vllm/distributed/parallel_state.py#L410-L433)):
+  the legacy `new_group` path passes `get_cpu_distributed_timeout_or_none()`
+  (the 10s), but the `split_group` path
+  (`VLLM_DISTRIBUTED_USE_SPLIT_GROUP=1`) creates it **without** a timeout →
+  gloo's 1800s default.
+- For `kill -9` the failure actually comes from the socket closing
+  (connection-reset, fast) — not a timeout at all. Only a **hung** peer waits
+  the full PG timeout.
+
+### Fix (shipped) — explicit fail-fast bound in `_run_ar`
+
+`vllm/v1/worker/dp_utils.py`: the death-step full-group path now issues the
+all_reduce with `async_op=True` and bounds it with
+`work.wait(timeout=_RUN_AR_FAILFAST_TIMEOUT_MS)` (**1000ms**, well under the 5s
+NIXL window) instead of the synchronous call. On failure/timeout → local-only
+for that one step. This makes the death step cheap regardless of (a) PG-timeout
+config, (b) kill vs hang, keeping survivors within the NIXL window so the kernel
+only flags the genuinely-dead rank. The survivor FT-gloo path (post-recovery)
+was already bounded via `FaultTolerantGlooGroup.all_reduce`.
+
+Validation: re-run the kill test on the fresh image with the full env set
+(incl. `SKIP_EPLB_SYNC=1`) and confirm the mask stays `[0,1,0,0]` (only DP1)
+and the survivor group rebuilds as `[0,2,3]` (not `[0,2]`).

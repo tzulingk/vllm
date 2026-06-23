@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from datetime import timedelta
+
 import torch
 import torch.distributed as dist
 
@@ -13,6 +15,16 @@ from vllm.v1.worker.ubatch_utils import (
 )
 
 logger = init_logger(__name__)
+
+# FT NIXL EP: fail-fast bound for the death-step full-group DP all_reduce.
+# When a peer dies/hangs, the survivors' full-group all_reduce must not stall
+# this step beyond the NIXL all-to-all window (VLLM_NIXL_EP_TIMEOUT_MS, 5s) --
+# a longer stall desyncs the survivors so the kernel false-flags innocent peers
+# (see runbook "DP3 false-positive"). The synchronous all_reduce only honors
+# the process group's timeout (gloo's 1800s default unless the group was made
+# with --cpu-distributed-timeout-seconds), and a *hung* peer never closes its
+# socket to fail early, so we bound the wait explicitly. Kept well under 5s.
+_RUN_AR_FAILFAST_TIMEOUT_MS = 1000
 
 
 def _get_device_and_group(parallel_config: ParallelConfig):
@@ -85,21 +97,26 @@ def _run_ar(
         return tensor_cpu.to(device, non_blocking=True)
 
     tensor = tensor_cpu.to(device, non_blocking=True)
-    # Cascade guard: on the death step itself -- before
+    # Cascade guard + fail-fast: on the death step itself -- before
     # ``recover_from_dead_peers`` has rebuilt the survivor group -- the
-    # full-group all_reduce can fail on the just-dead peer (gloo
-    # `Connection closed by peer`, chained with c10d's `Process group ... is
-    # not initialized`). Absorb it and proceed local-only for this one step;
-    # the next step uses the rebuilt survivor group above. Without the guard
-    # the surviving Workers' busy loop would cascade-die.
+    # full-group all_reduce still includes the just-dead peer. We must not
+    # block here: a multi-second stall desyncs the survivors past the NIXL
+    # all-to-all window and the kernel false-flags innocent peers. So issue
+    # the all_reduce async and bound the wait to _RUN_AR_FAILFAST_TIMEOUT_MS
+    # (the synchronous form would instead wait the gloo PG timeout, and a hung
+    # peer never closes its socket to fail early). On any failure/timeout we
+    # proceed local-only for this one step; the next step uses the rebuilt
+    # survivor group above. Without the guard the survivors' loop cascade-dies.
     try:
-        dist.all_reduce(tensor, group=group)
-    except (RuntimeError, ValueError) as e:
+        work = dist.all_reduce(tensor, group=group, async_op=True)
+        work.wait(timeout=timedelta(milliseconds=_RUN_AR_FAILFAST_TIMEOUT_MS))
+    except (RuntimeError, ValueError, TimeoutError) as e:
         logger.warning_once(
-            "FT NIXL EP cascade guard: DP all_reduce on dp_rank=%d failed "
-            "(%s: %s); proceeding with local-only contribution this step. "
-            "Ubatching + CUDA-graph disabled this step.",
+            "FT NIXL EP cascade guard: DP all_reduce on dp_rank=%d failed or "
+            "timed out after %dms (%s: %s); proceeding with local-only "
+            "contribution this step. Ubatching + CUDA-graph disabled this step.",
             dp_rank,
+            _RUN_AR_FAILFAST_TIMEOUT_MS,
             type(e).__name__,
             e,
         )
