@@ -4021,3 +4021,49 @@ an `ExpertMapManager` update that takes the mutated `physical_to_logical_map`
 assertion: after recovery, check `_expert_map`, `expert_mask`, and
 `routing_tables` are mutually consistent for each reassigned `(layer, logical)`.
 The single-rank kill (clean) and DYN-3253's FT-gloo survivor path are unaffected.
+
+### CONFIRMED ROOT CAUSE + FIX (2026-06-23) — `_expert_map` rebuild was a silent no-op
+
+The speculation above (stale `expert_mask`/`routing_tables`, round-robin slot
+layout) was **wrong**. The actual root cause is much simpler and was confirmed
+by inspection:
+
+**`model.moe_layers[i]` is a `MoERunner`** (the FusedMoE factory now returns a
+`MoERunner`), which has **no `_expert_map` attribute** — only an
+`expert_map_manager` property delegating to its `RoutedExperts` child. The
+recovery loop did `expert_map = getattr(layer, "_expert_map", None)` →
+**None on every layer** → `continue` → **the entire `_expert_map` rebuild
+no-opped**. The disk reload then ran against a **stale** map → wrong MoE
+routing → degenerate output. The loop was written when `moe_layers` held
+modules with a real `_expert_map` buffer; the upstream **MoE refactor #41046**
+(`FusedMoE` → `MoERunner` / `ExpertMapManager`) stranded it. (My "stale derived
+maps / routing_tables" leads were red herrings — `routing_tables` is a static
+`% ep_size` formula, and the recovery never even reached the write.)
+
+Confirming detail: the failing two-rank run had **no "rebuilt _expert_map on N
+module(s)" log line** at all (that line in Run 14 was the OLD pre-refactor
+branch). Single-rank kill looked fine only because `reassignments==0` (no disk
+reload, so a stale `_expert_map` didn't matter).
+
+**Fix (`gpu_worker.eplb_redistribute_for_dead_peers`, commit `9c15f37877`):**
+resolve state through `layer.expert_map_manager` instead of `layer._expert_map`
+— read `mgr.expert_map` (the same tensor `RoutedExperts.expert_map` / the
+dispatch kernel reads) + `mgr.moe_parallel_config`, and `copy_` into it so both
+weight-load and dispatch see the update. The manager is exposed identically by
+the pre-refactor module, `RoutedExperts`, and `MoERunner`. Plus:
+- **Disambiguating skip counts:** no-manager (skip) / `ep_size==1` disabled
+  (legit skip) / `ep_size>1` with no map (anomaly → `logger.warning`).
+- **Fail-fast:** if `reassignments>0` but `rebuilt==0`, raise `RuntimeError`
+  (with the offending `moe_layers[0]` type) instead of proceeding into a disk
+  reload against a stale map. Cannot false-positive on non-EP runs
+  (`reassignments==0` there).
+
+**Not touched, by design:** (1) the ROCm `expert_mask` path (NVIDIA deployment
+reads `_expert_map`); (2) the `dp_utils._run_ar`/FT-gloo delta — this no-op is
+the strongest explanation for the garbled output; if anything remains after
+validating, that's the next suspect.
+
+**Verify:** next two-rank kill should log **`rebuilt _expert_map on 26 MoE
+module(s)`** (was absent in the failing run) and produce **coherent** output. If
+the rebuild still finds nothing, the `RuntimeError` fires at recovery (naming
+the `moe_layers` type) instead of serving garbled tokens.
