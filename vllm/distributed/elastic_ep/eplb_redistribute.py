@@ -55,8 +55,11 @@ on every rank. The invariants:
    args=(newly_dead,))`` once; that worker method rebuilds the FT-gloo
    survivor group and then runs ``eplb_redistribute_for_dead_peers``.
    ``collective_rpc`` delivers the same ``newly_dead`` tuple to every
-   worker. Each worker then runs the three primitives against its
-   (still-in-sync) placement table:
+   worker. Each worker then runs the three deterministic placement-table
+   primitives -- ``mark_dead_columns_inplace``,
+   ``reassign_missing_experts_inplace``, and
+   ``rebuild_derived_maps_inplace`` -- against its (still-in-sync)
+   placement table:
 
    * ``mark_dead_columns_inplace``: for each ``ep_rank`` in
      ``dead_ep_ranks``, write ``-1`` to the contiguous slice. No order
