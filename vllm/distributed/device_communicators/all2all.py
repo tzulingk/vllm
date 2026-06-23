@@ -514,7 +514,10 @@ class NixlEPAll2AllManager(All2AllManagerBase):
     def query_mask(self) -> torch.Tensor | None:
         if NixlEPAll2AllManager._buffer is None:
             return None
-        buffer = NixlEPAll2AllManager._buffer[0]
+        # _buffer is a _NixlEPBufferState wrapper (a rebase moved it from a
+        # plain list); the underlying nixl_ep Buffer is its .buffer field, as
+        # every other method here accesses it (state.buffer).
+        buffer = NixlEPAll2AllManager._buffer.buffer
         width = getattr(buffer, "group_size", 0)
         if not isinstance(width, int) or width <= 0:
             return None
