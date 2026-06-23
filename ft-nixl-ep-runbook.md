@@ -4067,3 +4067,32 @@ validating, that's the next suspect.
 module(s)`** (was absent in the failing run) and produce **coherent** output. If
 the rebuild still finds nothing, the `RuntimeError` fires at recovery (naming
 the `moe_layers` type) instead of serving garbled tokens.
+
+### VALIDATED (2026-06-23) — two-rank kill now produces coherent output ✅
+
+Fresh pod (image `:ft-gloo-run-ar` = query_mask + MPClient baked) + live-patched
+`gpu_worker.py` (this fix) + `dp_utils.py` (fail-fast), full env incl.
+`VLLM_FT_EP_REPRO_DEAD_DP_RANKS=1,3` + `SKIP_EPLB_SYNC=1`. Killed rank 1, then
+rank 3 (workers identified by `Worker_DPn_EPn pid=` log map — robust; NOT
+PID-sort).
+
+- **Kill 1 (rank 1):** `newly-dead [1]`, survivor group `[0,2,3]`,
+  `reassignments=0`, **`rebuilt _expert_map on 26 MoE module(s) (skipped: 0
+  no-manager, 0 ep-disabled)`** ← the line that was ALWAYS ABSENT before.
+- **Kill 2 (rank 3):** `newly-dead [3]`, `reassignments=832`,
+  **`rebuilt _expert_map on 26 MoE module(s)`**, `disk-reloaded 2400 expert
+  tensor(s)`.
+- **Output on `[0,2]` after disk reload — coherent** (was degenerate before):
+  France→`Paris.`, 2+2→`4`, largest planet→`Jupiter.`, opposite of hot→`cold.`,
+  gold→`Au.`, first US president→`George Washington.`
+
+The `_expert_map`-rebuild no-op was indeed the root cause; the
+`expert_map_manager` fix closes it end-to-end. **DYN-3154 Test 2 (two-rank kill
++ disk reload) now passes on the FT-gloo branch.**
+
+Full validation summary for `ft-nixl-ep-ftgloo-run-ar`:
+- Single-rank kill: ✅ clean (mask `[0,1,0,0]`, survivor group `[0,2,3]`, coherent).
+- Two-rank kill: ✅ recovers `[0,2]`, 832 reassignments + disk reload, coherent output.
+- DYN-3253 FT-gloo `_run_ar` survivor path + fail-fast: ✅.
+- Required fixes, all committed: query_mask `_buffer.buffer`; MPClient per-engine
+  tolerance; `_run_ar` fail-fast; `_expert_map` rebuild via `expert_map_manager`.
