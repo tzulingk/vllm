@@ -4118,3 +4118,106 @@ is the *pre-rebase* version; it and `ftgloo` share only an ancient merge-base
 
 Created via `git push fork 1f61faf982:refs/heads/ft-nixl-ep-eplb-disk-reload-rebased`
 (new branch, no force-push, original branches preserved).
+
+## 2026-06-23 — DYN-3266 item 1: re-enable EPLB load aggregation over FT-gloo
+
+Branch `ft-nixl-ep-ftgloo-remaining` (off `ftgloo-run-ar`). Goal: remove the
+blanket `VLLM_FT_EP_SKIP_EPLB_SYNC` bypass so EPLB's cross-rank load
+aggregation runs again, make it survive a DP-peer death, and confirm EPLB still
+redistributes experts by load. Image `:ft-gloo-eplb` (precompiled overlay,
+merge-base `f2069b005b`, same recipe as `:ft-gloo-run-ar`).
+
+### Serve config (EPLB exercised fast)
+
+`--enable-eplb --enable-elastic-ep --all2all-backend nixl_ep`,
+`--eplb-config '{"num_redundant_experts":64,"use_async":false,`
+`"step_interval":100,"window_size":50,"log_balancedness":true,`
+`"log_balancedness_interval":10}'`. Short `step_interval`/`window_size` so
+rearrangement + the `log_balancedness`-gated load-sync fire within seconds.
+`log_balancedness:true` drives `log_stats=True` → `_sync_load_pass` →
+`_allreduce_list` → `_ep_all_reduce` (the path under test). **`SKIP_EPLB_SYNC`
+is NOT set — it was removed in code.** Env otherwise the canonical kill-test set
+(`KERNEL_MASK_REPRO=1`, `REPRO_DEAD_DP_RANKS=1`, `NIXL_EP_TIMEOUT_MS=5000`,
+`--cpu-distributed-timeout-seconds 10`). Single serve session for both phases:
+`REPRO_DEAD_DP_RANKS=1` only gates the consensus check's expected-peers, not
+EPLB, so the healthy phase still rebalances over all 4 ranks.
+
+### Healthy phase — ✅ EPLB redistributes by load
+
+80 identical-prompt requests (skew). During inference: `avg_tokens=96`
+(aggregated across 4 ranks via `_ep_all_reduce`), `max_tokens` up to 224 →
+**balancedness 0.43–0.77** (genuine imbalance), and **17 rearrangements** fired
+(`Rearranged experts in 0.06 s`). With the old blanket skip `step()` returned
+immediately and none of this ran. Proves the load-agg is re-enabled and
+rebalancing by load. (Balancedness logs read `0.0000` only on idle dummy steps,
+where `expert_load_pass` is zeroed — not a measurement bug.)
+
+### Kill phase v1 — ✗ HANG (the death-window the blanket skip used to hide)
+
+First implementation routed `_ep_all_reduce` to the **NCCL EP device group**
+when healthy and only to FT-gloo *post-recovery*. Killing DP1 (idle, between
+steps) → survivors hit the `_run_ar` fail-fast (good) and the kernel timed out
+on `src_rank 1` (good) — **but recovery never fired**: no `kernel reports
+newly-dead`, no FT-gloo rebuild, then `No available shared memory broadcast
+block found in 60 seconds` repeating. Root cause: with EPLB re-enabled, its
+cross-rank collectives run every step (load-agg every 10, rearrange weight
+shuffle every 100 — even on idle dummy steps). The full-EP-group NCCL
+collective has **no fail-fast**; a survivor blocked there on dead DP1 never
+returned to the engine core, so `_maybe_recover_on_newly_dead_peers` never ran.
+This is exactly what the original skip's comment warned: *"rearrangement would
+all-reduce on the broken EP group and hang."* The validated DYN-3253 run dodged
+it only because `SKIP_EPLB_SYNC=1` kept EPLB silent.
+
+### Kill phase v2 — ✅ fixed (commit `9e33f9a83f`)
+
+Mirror `_run_ar`'s fail-fast: `_ep_all_reduce` now **always** uses a gloo group
+with a bounded wait, never the unbounded EP NCCL group — survivors-only
+post-recovery; full DP gloo group otherwise, fail-fast at
+`_EPLB_ALLREDUCE_FAILFAST_MS=1000`. It records `self._ep_all_reduce_valid`;
+`rearrange()` skips the EP weight shuffle (unbounded NCCL) when the load-agg
+degraded (per-rank load views diverge → a shuffle would be inconsistent AND
+hang). Live-patched onto a fresh pod (Python-only). Killed DP1 **mid-load**
+(more realistic; also avoids the tiny idle-loop window where a survivor could be
+inside the weight-shuffle NCCL collective at the kill instant — negligible at
+production `step_interval=3000`):
+
+```
+core.py:2299  FT EP: kernel reports newly-dead EP peer(s) [1] ...     # only [1]
+ft_gloo.py:204 FT gloo: rebuild gen=1 survivors=[0, 2, 3] ...
+gpu_worker.py:228 rebuilt DP FT-gloo survivor group [0, 2, 3] after dead EP peers [1].
+gpu_worker.py:432 rebuilt _expert_map on 26 MoE module(s) after dead peers [1]  # DYN-3154 fix present
+gpu_worker.py:339 ... reassignments=221 ; disk-reloaded 378/405 tensor(s)
+```
+
+- **No hang** (the only `shm broadcast block` lines are at 21:01, model-load
+  startup noise — before the 21:03:30 kill; log keeps growing post-kill).
+- **EPLB load-sync survives over survivors**: balancedness logs continue
+  post-recovery with `avg_tokens=72` (3-survivor aggregation via the FT-gloo
+  survivor path of `_ep_all_reduce`). **The deliverable.**
+- **Rearrange suppressed while degraded**: the step() gate fired 2×
+  (`skipping EPLB expert rearrangement while a DP peer is dead`).
+- **Post-kill output coherent**: Japan→`Tokyo.`, 2+2→`4`, largest planet→
+  `Jupiter.`, water→`oxygen.` (`/health` 200 throughout).
+
+### Scope note — what is NOT done here (by design)
+
+The **rearrangement weight shuffle** (`rearrange_expert_weights_inplace`, large
+GPU tensors over the EP NCCL group) is **suppressed while a peer is dead**, not
+made survivor-aware. So under degradation EPLB keeps its load window current but
+does not move expert weights by load; the recovery-time disk reload already
+covers the dead rank's experts. Survivor-aware weight movement (a fresh EP NCCL
+group excluding the dead rank + slot renumbering) is separate, larger work.
+Also TP>1: `_ep_all_reduce` uses the DP gloo group (== EP for TP=1); an
+EP-indexed survivor group is future work.
+
+### Commands
+
+```bash
+kubectl apply -f /tmp/build-vllm-ft-gloo-eplb.yaml      # -> :ft-gloo-eplb (transient 503 on first try; retried)
+kubectl apply -f /tmp/ft-gloo-eplb-serve-pod.yaml       # 4xGB200 + existing ComputeDomain
+# in-pod: pip install --force-reinstall --no-deps nixl-cu13==1.1.0 ; pip install pytest ray
+kubectl cp vllm/distributed/eplb/eplb_state.py <pod>:.../vllm/distributed/eplb/eplb_state.py   # v2 live-patch
+# serve: export VLLM_FT_EP_REPRO_DEAD_DP_RANKS=1 ; setsid bash /tmp/serve-eplb.sh
+bash /tmp/eplb-load.sh 80 128 16                        # healthy skew
+bash /tmp/eplb-kill-under-load.sh 1 /tmp/vllm-eplb-serve.log 8   # kill DP1 mid-load
+```
