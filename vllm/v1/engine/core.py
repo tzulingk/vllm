@@ -90,6 +90,23 @@ logger = init_logger(__name__)
 
 HANDSHAKE_TIMEOUT_MINS = 5
 
+# FT NIXL EP: fail-fast bound (ms) for the actor-side DP wave-sync all_reduce
+# (_has_global_unfinished_reqs) in the window between a peer's death and the
+# actor-side FT-gloo survivor group being rebuilt. Without it the full-group
+# all_reduce blocks on the dead peer and the busy loop never progresses. On
+# timeout we assume "someone has work" (keep stepping) -- the safe direction.
+_WAVE_SYNC_FAILFAST_MS = 1000
+
+# FT NIXL EP: max age (s) of a peer's published kernel mask for it to count in
+# the consensus check. Once pause/idle is restored a paused survivor stops
+# stepping -> stops publishing fresh masks; with step_counter resetting per
+# wave its stale mask can collide on the same step key as active ranks' fresh
+# masks and trip a false "divergence" crash. A peer whose mask is older than
+# this is paused (not doing the kernel all-to-all), so its mask is irrelevant
+# to current consensus and is ignored. Well above the sub-second active-step
+# publish cadence, well below real pause durations.
+_MASK_STALE_SEC = 5.0
+
 _R = TypeVar("_R")  # Return type for collective_rpc
 
 
@@ -1822,6 +1839,26 @@ class DPEngineCoreProc(EngineCoreProc):
         dp_group, dp_store = parallel_config.stateless_init_dp_group(return_store=True)
         self.dp_group, self.dp_store = dp_group, dp_store
 
+        # FT NIXL EP: actor-side FT-gloo survivor group for the DP wave-sync.
+        # _has_global_unfinished_reqs / resume_scheduler run in THIS (actor)
+        # process and all-reduce over self.dp_group, which still includes a dead
+        # DP peer until recovery. The worker-side FT-gloo (get_dp_ft_gloo) lives
+        # in a separate process and is unreachable here, so the actor holds its
+        # own instance, rebuilt at the recovery beat in
+        # _maybe_recover_on_newly_dead_peers. It rendezvouses via self.dp_store
+        # (the actors' shared store -- a different TCPStore from the workers'
+        # coordinator store, so the ft_gloo_rdzv_* keys do not collide).
+        self._dp_ft_gloo = None
+        if parallel_config.all2all_backend == "nixl_ep":
+            from vllm.distributed.elastic_ep.ft_gloo import FaultTolerantGlooGroup
+
+            self._dp_ft_gloo = FaultTolerantGlooGroup(
+                store=self.dp_store,
+                master_addr=parallel_config.data_parallel_master_ip,
+                my_global_rank=self.dp_rank,
+                total_world_size=self.dp_size,
+            )
+
     def shutdown(self):
         super().shutdown()
         if dp_group := getattr(self, "dp_group", None):
@@ -1878,9 +1915,10 @@ class DPEngineCoreProc(EngineCoreProc):
         # Barrier: wait for all DP ranks to have resumed (and cleared
         # ignore_start_dp_wave) before any rank starts stepping. Uses
         # the existing all-reduce which is safe because engines are
-        # stopped.
-        has_global_unfinished = ParallelConfig.has_unfinished_dp(
-            self.dp_group, self.scheduler.has_unfinished_requests()
+        # stopped. FT NIXL EP: routed through the survivor-aware,
+        # fail-fast path so a dead peer cannot hang the resume.
+        has_global_unfinished = self._ft_has_global_unfinished_reqs(
+            self.scheduler.has_unfinished_requests()
         )
 
         if has_global_unfinished:
@@ -2207,9 +2245,31 @@ class DPEngineCoreProc(EngineCoreProc):
             )
             return
 
+        # FT NIXL EP: only compare masks published within _MASK_STALE_SEC of
+        # ours. A paused survivor stops stepping (pause/idle), so it stops
+        # refreshing its mask; with step_counter resetting per wave its stale
+        # mask can land on the same step key as active ranks' fresh masks and
+        # trip a false divergence. A stale peer is paused (not in the kernel
+        # all-to-all), so exclude it rather than crash.
+        stale = [
+            r
+            for r, p in payloads.items()
+            if isinstance(p, dict) and (my_ts - float(p["ts"])) > _MASK_STALE_SEC
+        ]
+        if stale:
+            logger.info(
+                "NIXL EP REPRO: ignoring stale (paused) peer mask(s) %s on "
+                "dp_rank=%d step=%d (age > %.1fs); comparing fresh ranks only.",
+                sorted(stale),
+                self.dp_rank,
+                my_step,
+                _MASK_STALE_SEC,
+            )
         unique_masks = {
-            tuple(p["mask"]) for p in payloads.values() if isinstance(p, dict)
-        }  # noqa: E501
+            tuple(p["mask"])
+            for r, p in payloads.items()
+            if isinstance(p, dict) and r not in stale
+        }
         if len(unique_masks) > 1:
             logger.error(
                 "NIXL EP KERNEL MASK REPRO -- divergence detected at "
@@ -2245,15 +2305,60 @@ class DPEngineCoreProc(EngineCoreProc):
         # peer already in _recovered_for_peers and short-circuit.
         self._maybe_recover_on_newly_dead_peers()
 
-        # FT EP work-in-progress: do not run the per-32-step finish-sync
-        # all_reduce. With a dead peer in dp_group it hangs on gloo, and
-        # the cascade guard's local-only fallback returns a possibly-
-        # wrong answer about whether anyone has work. While we validate
-        # the EPLB recovery path, assume engines_running=True so the
-        # busy loop keeps stepping and we observe the redistribute
-        # behavior. Production pause/idle fidelity is lost.
+        # Run the per-32-step finish-sync all_reduce, fault-tolerantly. A dead
+        # peer in dp_group would hang the plain gloo all_reduce; _ft_has_global_
+        # unfinished_reqs routes it over the survivor group (post-recovery) or
+        # the full group with a fail-fast bound (death window), so the busy loop
+        # keeps stepping and pause/idle fidelity is preserved.
         self.step_counter += 1
-        return True
+        if self.step_counter % 32 != 0:
+            return True
+        return self._ft_has_global_unfinished_reqs(local_unfinished)
+
+    def _ft_has_global_unfinished_reqs(self, local_unfinished: bool) -> bool:
+        """Fault-tolerant global-unfinished wave-sync (OR == MAX over ranks).
+
+        Replaces the hard-coded ``engines_running=True``. Mirrors ``_run_ar``:
+        route the MAX all-reduce over the actor-side FT-gloo survivor group once
+        a DP peer has died, else over the full actor DP group with a fail-fast
+        bound so the death window (peer dead, recovery not yet done) cannot hang
+        the busy loop. On any degrade we return ``True`` ("someone has work" /
+        keep stepping) -- the safe direction, since a survivor that wrongly
+        idled while a peer had work would stall the wave. The result is
+        identical across survivors (all reduce over the same group, or all
+        fail-fast to ``True``), so they never desync.
+        """
+        from datetime import timedelta
+
+        import torch
+        from torch.distributed import ReduceOp
+
+        flag = torch.tensor(
+            [1 if local_unfinished else 0], dtype=torch.int32, device="cpu"
+        )
+
+        ft = self._dp_ft_gloo
+        if ft is not None and ft.has_group:
+            reduced, valid = ft.all_reduce(flag, op=ReduceOp.MAX)
+            if valid:
+                return bool(reduced.item())
+            return True
+
+        work = torch.distributed.all_reduce(
+            flag, op=ReduceOp.MAX, group=self.dp_group, async_op=True
+        )
+        try:
+            work.wait(timeout=timedelta(milliseconds=_WAVE_SYNC_FAILFAST_MS))
+        except (RuntimeError, ValueError, TimeoutError) as e:
+            logger.warning_once(
+                "FT NIXL EP: DP wave-sync all_reduce failed/timed out after "
+                "%dms (%s); a DP peer is likely dead. Assuming engines running "
+                "until recovery rebuilds the survivor group.",
+                _WAVE_SYNC_FAILFAST_MS,
+                type(e).__name__,
+            )
+            return True
+        return bool(flag.item())
 
     def _maybe_recover_on_newly_dead_peers(self) -> None:
         """Trigger survivor recovery when the kernel mask reports a new
@@ -2313,6 +2418,35 @@ class DPEngineCoreProc(EngineCoreProc):
             )
             return
         already.update(newly_dead)
+
+        # FT NIXL EP: rebuild the actor-side wave-sync survivor group. The
+        # worker FT-gloo was rebuilt inside recover_from_dead_peers (a separate
+        # process); this rebuilds the actor's own group so the per-step
+        # _has_global_unfinished_reqs wave-sync runs over the survivors instead
+        # of blocking on the dead peer. rebuild_for_survivors is a rendezvous
+        # barrier among the survivor actors, so they all switch to the survivor
+        # group on the same beat (no split where some reduce over 3 ranks and
+        # others over 4). Survivor set = all ranks minus everyone recovered-for
+        # so far (cumulative across multi-rank deaths).
+        if self._dp_ft_gloo is not None:
+            survivors = frozenset(r for r in range(self.dp_size) if r not in already)
+            try:
+                self._dp_ft_gloo.rebuild_for_survivors(survivors)
+                logger.info(
+                    "FT NIXL EP: rebuilt actor-side DP FT-gloo survivor group "
+                    "%s (gen=%d) on dp_rank=%d.",
+                    sorted(survivors),
+                    self._dp_ft_gloo.generation,
+                    self.dp_rank,
+                )
+            except Exception as e:
+                logger.warning(
+                    "FT NIXL EP: actor-side FT-gloo rebuild failed for "
+                    "survivors %s: %s (wave-sync busy-spins until the next "
+                    "recovery tick).",
+                    sorted(survivors),
+                    e,
+                )
 
     def reinitialize_distributed(
         self, reconfig_request: ReconfigureDistributedRequest
