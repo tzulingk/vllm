@@ -4221,3 +4221,72 @@ kubectl cp vllm/distributed/eplb/eplb_state.py <pod>:.../vllm/distributed/eplb/e
 bash /tmp/eplb-load.sh 80 128 16                        # healthy skew
 bash /tmp/eplb-kill-under-load.sh 1 /tmp/vllm-eplb-serve.log 8   # kill DP1 mid-load
 ```
+
+## 2026-06-24 — DYN-3266 item 2: restore `_has_global_unfinished_reqs` pause/idle
+
+Branch `ft-nixl-ep-ftgloo-remaining`. Goal: replace the hard-coded
+`engines_running=True` (busy-spin) so the engine idles when no rank has work,
+and keep that working under a dead peer. Same image `:ft-gloo-eplb`; core.py +
+eplb_state.py live-patched.
+
+### The wave-sync runs in the *actor*, not the worker
+
+`_has_global_unfinished_reqs` / `resume_scheduler` run in the **engine-core
+actor** (`DPMoEEngineCoreActor`), which builds its own DP group via
+`stateless_init_dp_group` (`self.dp_store`). The worker-side FT-gloo
+(`get_dp_ft_gloo`) lives in a **different process** and is unreachable there. So
+the actor holds its **own** `FaultTolerantGlooGroup` instance (same class),
+rendezvousing via `self.dp_store` (a distinct TCPStore from the workers' coord
+store, so `ft_gloo_rdzv_*` keys don't collide), rebuilt at recovery in
+`_maybe_recover_on_newly_dead_peers`. `_ft_has_global_unfinished_reqs` does the
+MAX all-reduce over the survivor group post-recovery / full DP gloo with a
+`_WAVE_SYNC_FAILFAST_MS=1000` bound otherwise; on degrade it returns `True`
+(keep stepping — safe direction). `resume_scheduler` routed through the same
+path.
+
+### Healthy pause/idle — ✅
+Over an 18s idle window: **EPLB step delta = 0, log-line delta = 0** — the
+engine is fully quiet (paused), where the `return True` scaffold busy-spun
+hundreds of dummy steps. Wakes on a request, drains, re-pauses.
+
+### Kill test v1 — ✗ cascade via pause/idle x the consensus-check scaffolding
+Mid-load DP1 kill recovered cleanly (`newly-dead [1]`, **actor-side** FT-gloo
+rebuild `[0,2,3]`), survivors idled — then ~1 min later, under sustained load,
+the cluster collapsed (`unique_masks=2` divergence crash → Ray restart →
+`[1,1,1,0]` → shutdown). Root cause (confirmed from the crash dump):
+
+```
+dp0: mask=[0,1,0,0]  age=+0.000s  step=0   <- fresh (active)
+dp2: mask=[0,1,0,0]  age=+0.000s  step=0   <- fresh
+dp3: mask=[0,0,0,0]  age=+96.109s step=0   <- STALE 96s (paused, pre-kill mask)
+```
+
+`_verify_kernel_mask_consensus_or_crash` keys each rank's published mask by
+`step_counter` and crashes on divergence — it assumed **lockstep step
+counters** (true only under the old busy-spin). With pause/idle, an idle
+survivor (no requests routed to it) **freezes its step_counter holding a stale
+mask**; active survivors start a fresh wave (`step_counter` resets to 0,
+core.py:1930) and publish a fresh mask on the **same** step key → stale-vs-fresh
+→ false `unique_masks=2` → crash → cascade. Item 1's run never hit this because
+it never paused.
+
+### Fix (`core.py`) + Kill test v2 — ✅
+The consensus check now **ignores stale (paused) peers' masks by age**
+(`_MASK_STALE_SEC=5s`) — a stale peer is paused, not in the kernel all-to-all,
+so its mask is irrelevant to current consensus; compare fresh ranks only. Re-run
+(killed DP1 mid-load, watched **past the 1-min mark** where v1 collapsed):
+- `newly-dead [1]`, actor-side FT-gloo rebuild `[0,2,3]`, **no cascade**, no
+  divergence crash, `/health` 200 throughout.
+- Stale-filter engaged repeatedly as survivors paused at different times:
+  `NIXL EP REPRO: ignoring stale (paused) peer mask(s) [2,3]/[3]/[0] ...
+  (age > 5.0s); comparing fresh ranks only.`
+- **Survivors pause when idle post-recovery**: EPLB step delta = **0** over 18s.
+- Wake-from-idle coherent: Japan→`Tokyo.`, 2+2→`4`, water→`two hydrogen atoms
+  and one oxygen atom.`
+
+### Note for item 3 (scaffolding removal)
+`VLLM_FT_EP_KERNEL_MASK_REPRO` gates **both** the recovery trigger (production)
+and the consensus crash-on-divergence (validation). The step-keyed mask
+comparison is fundamentally fragile under pause/idle; when this scaffolding is
+removed/decoupled in item 3 the step-keyed consensus crash should go with it
+(the age-filter is the interim fix). Tracked in the DYN-3266 comment.
