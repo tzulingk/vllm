@@ -4290,3 +4290,95 @@ and the consensus crash-on-divergence (validation). The step-keyed mask
 comparison is fundamentally fragile under pause/idle; when this scaffolding is
 removed/decoupled in item 3 the step-keyed consensus crash should go with it
 (the age-filter is the interim fix). Tracked in the DYN-3266 comment.
+
+## 2026-06-25 — Two-rank kill + EPLB-active -> GARBLED output (root cause isolated)
+
+Validating the **two-rank** kill (DP1 then DP3 -> survivors `[0,2]`, the
+DYN-3154 Test-2 case) on `ft-nixl-ep-ftgloo-remaining` surfaced a correctness
+bug.
+
+### Symptom
+Two-rank recovery mechanics all pass: `newly-dead [1]` then `[3]`, **actor-side**
+FT-gloo `[0,2]` (gen=2), worker FT-gloo `[0,2]`, `rebuilt _expert_map on 26 MoE
+module(s)` for both kills, disk reload, consistent p2l hash across survivors,
+survivors **pause when idle** (EPLB delta=0), 0 cascade, `/health` 200. **But
+the output is garbled** -- degenerate repetition: `"the capital of the capital
+of the capital..."`, `2+2 -> "422222222"`, `"the largest planet. The largest
+planet is the largest"`.
+
+### Not a regression of the `_expert_map` fix (9c15f37877)
+That fix fires (the `rebuilt _expert_map on 26 MoE module(s)` line is present)
+and single-rank kill stays coherent. The difference vs the DYN-3154 Test-2
+*coherent* run is that **EPLB is now active** (item 1 re-enabled it) and had
+rearranged the placement before the kills; DYN-3154 ran with EPLB **off**
+(`SKIP_EPLB_SYNC=1`). The two-rank recovery composing with an EPLB-rearranged
+`physical_to_logical_map` was never exercised before.
+
+### Isolation test -> EPLB-rearrangement is the trigger
+Re-ran the identical two-rank kill with EPLB rearrangement disabled
+(`--eplb-config '{... "step_interval": 100000000 ...}'`, so EPLB tracks load but
+never rearranges -> static placement):
+
+| | EPLB rearrange ON | OFF (static) |
+|---|---|---|
+| reassignments (kill 2) | 425 | **832** (== DYN-3154) |
+| disk-reloaded | 671 | **2400** (== DYN-3154) |
+| Japan / planet / water | degenerate repetition | **Tokyo. / Jupiter, 11x size / two parts hydrogen one part oxygen** ✓ |
+
+Static placement + two-rank recovery = coherent (matches DYN-3154 exactly);
+EPLB-rearranged placement + two-rank recovery = garbled. **Confirmed: EPLB
+load-rearrangement is the trigger.**
+
+### Leading hypothesis (being fixed)
+EPLB **skews redundancy** (more replicas on hot logical experts, cold ones
+dropped toward a single replica). `reassign_missing_experts_inplace` picks the
+"most-redundant surviving slot" as donor for each missing logical; on a skewed
+map this can repurpose a slot that is a cold expert's **last replica**,
+orphaning it (no correct weights anywhere) -> garbled when routed. Under the
+uniform static redundancy (64 redundant experts spread evenly) donors are always
+truly redundant. Fix direction: donor selection must not consume a logical's
+last replica (guard on `logical_replica_count`), and the cumulative two-kill
+recovery must respect post-rearrange replica counts.
+
+### Reproduce
+```bash
+# garbled: EPLB rearranging (step_interval=100) under sustained load before the kills
+setsid bash /tmp/serve-eplb.sh        # REPRO_DEAD_DP_RANKS=1,3
+bash /tmp/eplb-load.sh 600 96 16 &    # triggers EPLB rearranges
+bash /tmp/kill-dp.sh 1 ... ; (wait recovery) ; bash /tmp/kill-dp.sh 3 ...
+# coherent: EPLB never rearranges (static placement)
+setsid bash /tmp/serve-eplb-noreb.sh  # step_interval=1e8, same kill sequence
+```
+
+### FIX (commit `75f90e2a5c`) — full local-expert resync on recovery — VALIDATED ✅
+
+The orphaning hypothesis was **refuted**: `reassign_missing_experts_inplace`
+guards against taking any donor below 1 replica (only repurposes a slot whose
+logical still has `>1`, re-checking the decremented count), so the post-recovery
+`physical_to_logical_map` is a valid placement (consistent hash across
+survivors). The garble is therefore **weights not matching the valid table** at
+the *non-reassigned* slots: the recovery rebuilds `_expert_map` from `p2l` and
+then reloaded only the *reassigned* slots, assuming every other local slot
+already held the weights its placement names. That holds for the static initial
+placement but not after EPLB permutes the GPU weight buffers under its own
+bookkeeping -- the recovery's rebuilt `_expert_map` no longer matches where EPLB
+left the non-reassigned weights -> router reads wrong weights -> garble. (Single-
+rank + EPLB and two-rank + EPLB-off happened to stay aligned, hiding it.)
+
+**Fix (`gpu_worker.eplb_redistribute_for_dead_peers`):** when a death needs
+redistribution, reload **ALL local experts** (full per-rank resync) from disk,
+not just the reassigned slots. `reload_experts_from_disk` routes each
+`(layer, logical)` through `FusedMoE.weight_loader` -> the just-rebuilt
+`_expert_map`, so every local slot's weights match the placement by
+construction, overriding any prior EPLB permutation. Cost: one extra checkpoint
+mmap pass (seconds) on a rare recovery; `weight_loader` skips non-local tensors.
+
+**Validation (EPLB rearrange ON, 6 rearranges before the kills):** two-rank kill
+(DP1 then DP3) -> recovery `[0,2]`, full resync (`disk-reloaded 2720/2450 expert
+tensor(s) (full local resync; 231/414 slot(s) reassigned)`), 0 cascade,
+`/health` 200, and **coherent** output: Japan→`Tokyo.`, largest planet→
+`Jupiter, which is 11 times the size of Earth`, water→`two parts hydrogen and
+one part oxygen.`, first US president→`George Washington. He was born in 1732`
+(`2+2->0` is the same small-model arithmetic quirk seen in the EPLB-off
+baseline, not garble). Matches the EPLB-off coherent run. **Two-rank kill +
+EPLB-active now produces correct output.**
