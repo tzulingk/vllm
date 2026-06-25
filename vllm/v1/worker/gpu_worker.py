@@ -455,31 +455,52 @@ class Worker(WorkerBase):
             )
 
         if reassignments:
-            # The placement table now points reassigned slots at logical
-            # ids whose weights live elsewhere. Pull those weights from
-            # the HF checkpoint into the donor slot's GPU buffer.
+            # Reload from the HF checkpoint so every local slot's weights match
+            # the just-rebuilt _expert_map.
+            #
+            # We reload ALL local experts (a full per-rank resync), not just the
+            # reassigned slots. A reassigned-only reload is correct only if every
+            # non-reassigned local slot already holds the weights its placement
+            # entry names. That holds for the static initial placement, but NOT
+            # once EPLB has rearranged experts by load: EPLB permutes the GPU
+            # weight buffers under its own bookkeeping, and after a multi-rank
+            # death the recovery's _expert_map (rebuilt from physical_to_logical_
+            # map) no longer matches where EPLB left the non-reassigned weights
+            # -> the router reads wrong weights -> degenerate/garbled output
+            # (observed only on the two-rank kill with EPLB active; the single-
+            # rank + EPLB and two-rank + EPLB-off cases happened to stay aligned).
+            # A full resync writes each local (layer, logical) from disk through
+            # FusedMoE.weight_loader, which routes via the rebuilt _expert_map --
+            # so the weights match the placement by construction, regardless of
+            # any prior EPLB permutation. Cost: one checkpoint mmap pass
+            # (seconds), acceptable for a rare recovery event. weight_loader
+            # skips non-local tensors, so passing every (layer, logical) just
+            # resyncs this rank's own slots.
+            full_reload_set = {
+                (layer_i, lid)
+                for layer_i in range(p2l.shape[0])
+                for lid in range(num_logical)
+            }
             try:
                 loaded_count = reload_experts_from_disk(
-                    model, self.vllm_config, reassignments
+                    model, self.vllm_config, full_reload_set
                 )
                 logger.info(
-                    "FT EP: disk-reloaded %d expert tensor(s) covering "
-                    "%d (layer, logical-id) pair(s) after dead peers %s.",
+                    "FT EP: disk-reloaded %d expert tensor(s) (full local "
+                    "resync; %d slot(s) reassigned) after dead peers %s.",
                     loaded_count,
                     len(reassignments),
                     sorted(dead_ep_ranks),
                 )
             except Exception as e:
-                # Reloading a few experts shouldn't be load-bearing for
-                # the rest of the recovery -- the slots we couldn't fill
-                # will produce wrong output for tokens routed to those
-                # experts, but the engine itself stays up. Log loudly so
-                # an operator can investigate.
+                # Reloading experts shouldn't be load-bearing for the rest of
+                # the recovery -- slots we couldn't fill will produce wrong
+                # output for tokens routed to those experts, but the engine
+                # itself stays up. Log loudly so an operator can investigate.
                 logger.exception(
-                    "FT EP: disk reload failed for %d (layer, logical-id) "
-                    "pair(s) after dead peers %s: %s. Affected experts may "
-                    "produce incorrect output until next reload.",
-                    len(reassignments),
+                    "FT EP: disk reload (full local resync) failed after dead "
+                    "peers %s: %s. Affected experts may produce incorrect "
+                    "output until next reload.",
                     sorted(dead_ep_ranks),
                     e,
                 )
