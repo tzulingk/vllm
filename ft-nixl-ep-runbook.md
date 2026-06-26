@@ -4350,7 +4350,15 @@ bash /tmp/kill-dp.sh 1 ... ; (wait recovery) ; bash /tmp/kill-dp.sh 3 ...
 setsid bash /tmp/serve-eplb-noreb.sh  # step_interval=1e8, same kill sequence
 ```
 
-### FIX (commit `75f90e2a5c`) — full local-expert resync on recovery — VALIDATED ✅
+### FIX (commit `75f90e2a5c`) — full local-expert resync on recovery — ⚠️ NOT ESTABLISHED (see 2026-06-26)
+
+> **⚠️ Correction (2026-06-26):** the conclusion below was a one-garbled-run-vs-
+> one-coherent-run artifact. An instrumented A/B (next section) shows the
+> full-resync is **inert** relative to reassign-only (0 non-reassigned-row `ck`
+> diffs), because EPLB relocates *canonical* weights — a non-reassigned row
+> already holds canonical weights for its logical, so reloading it is a no-op.
+> Treat the "weights not matching the table" explanation here as **disproven**;
+> the silent-garble root cause is still open (DYN-3293).
 
 The orphaning hypothesis was **refuted**: `reassign_missing_experts_inplace`
 guards against taking any donor below 1 replica (only repurposes a slot whose
@@ -4382,3 +4390,78 @@ one part oxygen.`, first US president→`George Washington. He was born in 1732`
 (`2+2->0` is the same small-model arithmetic quirk seen in the EPLB-off
 baseline, not garble). Matches the EPLB-off coherent run. **Two-rank kill +
 EPLB-active now produces correct output.**
+
+## 2026-06-26 — Instrumented A/B + forced-degraded-rearrange (DYN-3293)
+
+Goal: stop guessing and *measure*. Added (live-patched, uncommitted):
+- File-based per-row dump in `gpu_worker._ft_ep_debug_dump` ->
+  `/tmp/ft_ep_dump_kill<N>_dp<rank>_<before|after>_reload.txt`, ALL 26 layers,
+  self-contained (raw `p2l` / `l2p` / `_expert_map` rows + batched per-row
+  weight checksum `ck`). One file per (kill, rank, tag) so Ray's multi-line log
+  compression can't eat the per-row data.
+- `VLLM_FT_EP_RELOAD_MODE={full,reassign_only}` toggle.
+- `VLLM_FT_EP_FORCE_DEGRADED_REARRANGE=1` toggle (bypass the item-1
+  rearrange-suppression gate).
+
+### A/B result — the full-resync fix (`75f90e2a5c`) is INERT
+
+A single full-mode run is a true A/B by construction: a non-reassigned row is
+left at `before_reload` by reassign-only and overwritten to canonical at
+`after_reload` by full; reassigned rows are reloaded by both. Two-rank kill
+(DP1->DP3, EPLB rearranging, 6 pre-kill rearranges), `kill=2` survivors `[0,2]`:
+
+| check | dp0 | dp2 |
+|---|---|---|
+| ck `before!=after` on **non-reassigned** rows (smoking gun) | **0** | **0** |
+| ck `before!=after` on reassigned rows (both reload — expected) | 104 | 295 |
+| `l2p` referencing a dead slot `{1,3}` (dead-dispatch hypothesis) | **0** | **0** |
+| `consistent=0` / `disp_row>1` (mismatch / dup) | 0 / 0 | 0 / 0 |
+
+Full-resync changes **nothing** reassign-only wouldn't. Reason it's generally
+inert: **EPLB relocates *canonical* expert weights, never corrupts them** -> a
+non-reassigned row already holds canonical weights for its logical, so a reload
+is a no-op. The 2026-06-25 "reassign-only garbles / full fixes" conclusion was a
+one-vs-one artifact; **not established.** (A standalone `reassign_only` run also
+came back mostly-coherent, `mismatches=0 dup_replicas=0`.) **Refuted on every
+measured placement:** dup-replica, dead-rank-dispatch, stale-non-reassigned-weights.
+
+### Forced degraded rearrange — CRASH (validates the gate), not the silent garble
+
+`FORCE_DEGRADED_REARRANGE=1` + `step_interval=20` + sustained post-kill load ->
+EPLB rearranged after both kills:
+
+```
+20:05:09 FORCING EPLB rearrangement while degraded   (gate bypassed)
+20:05:09 Rearranging experts sync mode ...           (never completes)
+20:05:09 CUDA error nixl_ep_ll.cu:1089 'device-side assert triggered'
+         -> all workers crash, health 000
+```
+
+Mechanism: degraded `rearrange()` still uses `num_gpus = ep_size = 4`, so the
+policy assigns experts to the dead ranks' slots and the nixl_ep kernel asserts
+on the invalid placement. **Confirms why item 1 suppresses degraded rearrange**
+(consequence is a hard kernel assert, worse than a hang) and that any future
+survivor-aware rearrange must shrink `num_gpus`/slot-space, not just swap the
+collective group. **But this is a crash, not the silent garble** -- and the
+original garble occurred with this gate ON. So degraded rearrange is a real but
+*separate* hazard, not the silent-garble cause.
+
+### Net
+Original intermittent silent garble is **not** the reload set, **not** degraded
+rearrange, **not** dup/dead-slot/map-mismatch (all zero on measured placements).
+Points back at the kernel-mask / consensus-cascade / kill-timing family
+(DYN-3121/3138/3139). Next: catch a *silent-garble* instance with the file dump
+and correlate garble <=> structural signal. Tracked in DYN-3293.
+
+### Commands
+```bash
+# A/B (full mode; before vs after ck per row is the A/B):
+setsid bash /tmp/serve-eplb.sh    # REPRO_DEAD_DP_RANKS=1,3 ; RELOAD_MODE=full
+# kill DP1 ; (recover) ; kill DP3 ; (recover) ; then
+kubectl cp <pod>:/tmp/ft_ep_dump_kill2_dp0_{before,after}_reload.txt .
+.venv/bin/python /tmp/analyze_ft_dump.py
+# forced degraded rearrange:
+export VLLM_FT_EP_FORCE_DEGRADED_REARRANGE=1
+setsid bash /tmp/serve-eplb-deg.sh   # step_interval=20
+bash /tmp/eplb-sustained-load.sh 2000 &   # outlasts both kills
+```
