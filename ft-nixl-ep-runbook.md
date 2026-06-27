@@ -4465,3 +4465,49 @@ export VLLM_FT_EP_FORCE_DEGRADED_REARRANGE=1
 setsid bash /tmp/serve-eplb-deg.sh   # step_interval=20
 bash /tmp/eplb-sustained-load.sh 2000 &   # outlasts both kills
 ```
+
+## 2026-06-27 — Survivor-aware degraded rearrange VALIDATED + death-window root cause
+
+Branch `11a1afe65` (survivor-aware rearrange feature + debug dump). Built fresh
+image, killed **DP1 then DP3** under load with `FORCE_DEGRADED_REARRANGE=1`,
+`step_interval=20`.
+
+### Survivor-aware rearrange works (the feature)
+- DP1 kill -> recovery survivors `[0,2,3]` (gen=1); DP3 kill -> `[0,2]` (gen=2,
+  dead `[1,3]`). Both recoveries completed.
+- `FORCING survivor-aware EPLB rearrangement` engaged on both; rearranges ran
+  (`0.08s` each) with **no device-side assert / no scatter OOB**. The two
+  `EngineCore ... fatal error` lines are just the killed ranks' own engine cores
+  (DP1 pid8838, DP3 pid8840), expected.
+- Output **coherent + stable** after both kills (3x identical `red, blue, and
+  yellow...`). The `scatter -1` clamp + `inplace_survivor` policy/commit + sync
+  `is_async` toggle all hold under a real degraded rearrange.
+
+### Death-window DETECTION is slow (the real blocker; NOT the rearrange)
+Root-caused with `py-spy --native` on survivors during the stall + `nvidia-smi`:
+- A finite nixl timeout IS armed (`timeout_ms`=5000, LL = mask-on-timeout, not
+  trap; buffer.py:80-82), **but it does not fire at 5s on hard `kill -9`** --
+  ~30s for rank 1, ~5min for rank 3 (mask `[0,1,0,0]` -> `[0,1,0,1]`).
+  `nvidia-smi`: survivor GPUs 75-81% util = dispatch/combine kernel busy-spinning
+  on the dead peer, not returning.
+- While stuck, every survivor CUDA op blocks behind it: py-spy caught DP0 in
+  `_ep_all_reduce` `tensor.detach().to("cpu")` (eplb_state.py:1105) and DP3 in
+  the recovery's own `query_nixl_ep_mask -> query_mask` (all2all.py:534). So
+  recovery can't read the mask until the kernel finally returns -- self-heals,
+  but minutes late. (Earlier "permanent deadlock" call was WRONG: slow, not
+  permanent.)
+- **Mitigation lead:** the CPU-side FT-gloo cascade guard detects the death in
+  ~1s (`DP all_reduce ... failed/timed out after 1000ms`, 1s post-kill). Gate
+  recovery on that CPU-side signal instead of the laggy nixl mask -> death-window
+  collapses minutes -> ~1s. (Separate CUDA stream for `query_mask` is weaker;
+  doesn't help while the mask itself is unmarked.)
+- Secondary defect: `_ep_all_reduce` claims a bounded wait (eplb_state.py:
+  1063-1066) but line 1105 `.to("cpu")` is an unbounded CUDA sync before the
+  fail-fast gloo all-reduce -- defeats the fail-fast during the death window.
+
+### Infra notes (fresh pod each time)
+- Image ships `nixl-cu13 1.3.0` (module `nixl_ep_cu13`); code imports `nixl_ep`
+  -> must `pip install --force-reinstall --no-deps nixl-cu13==1.1.0`. Also
+  `pip install ray pytest py-spy`.
+- Death-window stall makes survivors hang in CUDA for tens of seconds to minutes;
+  wait it out (it recovers) rather than assuming a permanent hang.
