@@ -272,6 +272,34 @@ class FaultTolerantGlooGroup:
             return tensor, False
         return tensor, True
 
+    def barrier(self, timeout_ms: int = 300000) -> bool:
+        """Barrier over the current survivor group. Never rebuilds.
+
+        A survivor-scoped replacement for a full-group barrier (e.g. the
+        post-RDMA correctness fence in the EPLB NIXL communicator), so the
+        fence does not block on a dead peer. Bounded via ``Work.wait`` like
+        :meth:`all_reduce`.
+
+        Returns:
+            ``True`` on success; ``False`` if no group is built yet or the
+            barrier timed out / failed.
+        """
+        group = self._current_group
+        if group is None:
+            return False
+        work = dist.barrier(group=group, async_op=True)
+        try:
+            work.wait(timeout=timedelta(milliseconds=timeout_ms))
+        except (TimeoutError, RuntimeError) as e:
+            logger.warning(
+                "FT gloo: barrier failed at gen=%d survivors=%s: %s",
+                self._generation,
+                sorted(self._current_survivors) if self._current_survivors else None,
+                e,
+            )
+            return False
+        return True
+
     def _destroy_current_group(self) -> None:
         if self._current_group is None:
             return

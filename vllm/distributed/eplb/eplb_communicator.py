@@ -534,10 +534,22 @@ class NixlEplbCommunicator(EplbCommunicator):
             # Post-READ barrier.
             # Correctness fence for zero-copy: prevents overwrite-while-
             # remote-read race.
-            torch.distributed.monitored_barrier(
-                group=self._cpu_group,
-                timeout=timedelta(minutes=5),
-            )
+            #
+            # FT NIXL EP: during a survivor-aware degraded rearrange a DP peer
+            # is dead, so a barrier over the full cpu_group would block on it
+            # forever. The dead rank doesn't participate in the transfer, so
+            # fencing over the FT survivor group is sufficient and correct.
+            # Fall back to the full-group monitored_barrier in steady state.
+            from vllm.distributed.elastic_ep.ft_gloo import get_dp_ft_gloo
+
+            ft = get_dp_ft_gloo()
+            if ft is not None and ft.has_group:
+                ft.barrier()
+            else:
+                torch.distributed.monitored_barrier(
+                    group=self._cpu_group,
+                    timeout=timedelta(minutes=5),
+                )
         finally:
             for local_h, remote_h, xfer_h in self._xfer_entries:
                 with contextlib.suppress(Exception):

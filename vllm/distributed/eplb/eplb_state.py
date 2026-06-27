@@ -26,6 +26,7 @@ MoE layer. If we have 32 EP ranks, then each GPU will hold 288 / 32 = 9 local
 physical experts.
 """
 
+import os
 import threading
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -54,6 +55,7 @@ from .eplb_utils import CpuGpuEvent
 from .policy import EPLB_POLICIES, AbstractEplbPolicy, DefaultEplbPolicy
 from .rebalance_execute import (
     AsyncEplbLayerResult,
+    _map_new_expert_indices_with_rank_mapping,
     move_from_buffer,
     rearrange_expert_weights_inplace,
 )
@@ -624,7 +626,14 @@ class EplbState:
                 self._update_layer_should_record(log_stats=log_stats)
                 return
             self.expert_rearrangement_step = 0
-            if self._ft_survivor_group() is not None:
+            # DEBUG (DYN-3293): VLLM_FT_EP_FORCE_DEGRADED_REARRANGE=1 forces the
+            # rearrangement weight-shuffle to run even while a DP peer is dead,
+            # to test whether degraded-state rearrangement is what garbles
+            # output. Off by default (the gate below suppresses it as designed).
+            force_degraded = (
+                os.environ.get("VLLM_FT_EP_FORCE_DEGRADED_REARRANGE", "0") == "1"
+            )
+            if self._ft_survivor_group() is not None and not force_degraded:
                 # Degraded: a DP peer is dead. Load aggregation above already
                 # ran over the survivors (FT-gloo), but the rearrangement
                 # weight shuffle moves expert weights over the full EP NCCL
@@ -638,7 +647,48 @@ class EplbState:
                     "implemented); load aggregation continues over survivors."
                 )
             else:
-                self.rearrange()
+                survivor_mapping = (
+                    self._ft_survivor_rank_mapping()
+                    if self._ft_survivor_group() is not None
+                    else None
+                )
+                if survivor_mapping is not None:
+                    logger.warning_once(
+                        "FT NIXL EP: FORCING survivor-aware EPLB rearrangement "
+                        "while degraded (VLLM_FT_EP_FORCE_DEGRADED_REARRANGE=1) "
+                        "-- debug only."
+                    )
+                    # Force SYNCHRONOUS rearrangement for the degraded reshuffle.
+                    #
+                    # Why we toggle is_async here: the survivor remap is carried
+                    # by ``rank_mapping``, and rank_mapping is ONLY honored on
+                    # the synchronous path. rearrange()'s sync branch passes it
+                    # into rearrange_expert_weights_inplace (the scale-down
+                    # branch that runs _map_new_expert_indices_with_rank_mapping
+                    # to confine the placement/transfer to survivors). The async
+                    # branch drops rank_mapping entirely -- it only snapshots
+                    # EplbStats and signals the worker, and the worker calls
+                    # transfer_layer WITHOUT rank_mapping. Left async, it would
+                    # (a) produce a survivor-sized placement that no longer
+                    # matches the full-width tensor (shape mismatch in
+                    # transfer_layer) and (b) shuffle/commit over the full EP
+                    # group -- hanging on the dead peer. Running sync also means
+                    # there is no in-flight async state to abort.
+                    #
+                    # Restore in finally so steady-state async EPLB resumes
+                    # automatically if the cluster returns to full health, and so
+                    # an exception can't leave async permanently disabled.
+                    is_async_prev = self.is_async
+                    self.is_async = False
+                    try:
+                        self.rearrange(
+                            rank_mapping=survivor_mapping,
+                            inplace_survivor=True,
+                        )
+                    finally:
+                        self.is_async = is_async_prev
+                else:
+                    self.rearrange()
 
         self._update_layer_should_record(log_stats=log_stats)
 
@@ -697,6 +747,7 @@ class EplbState:
         self,
         is_profile: bool = False,
         rank_mapping: dict[int, int] | None = None,
+        inplace_survivor: bool = False,
     ) -> torch.Tensor | None:
         """
         Rearrange the experts according to the current load.
@@ -706,11 +757,46 @@ class EplbState:
                 This is used in `profile_run` to reserve enough memory,
                 no memory movement will be performed. Default is False.
             rank_mapping (dict[int, int] | None): The rank mapping
-                when scaling is done in EEP.
+                when scaling is done in EEP, or the survivor mapping for the
+                FT NIXL EP degraded reshuffle.
+            inplace_survivor (bool): If `True`, this is the FT NIXL EP
+                survivor-aware degraded reshuffle (dead ranks stay as ``-1``
+                columns; the physical topology width is unchanged). Selects
+                survivor sizing/commit instead of the elastic-EP scale-down
+                semantics (which shrink the topology). Default is False.
         """
 
         ep_group = get_ep_group().device_group
         ep_rank = ep_group.rank()
+
+        # FT NIXL EP (Phase 0 safety guard): once a DP peer dies,
+        # ``mark_dead_columns_inplace`` writes ``-1`` into the dead ranks'
+        # columns of ``physical_to_logical_map``. Those ``-1``s would (a) index
+        # the load-aggregation ``scatter_add_`` below out of bounds -> a
+        # device-side assert (ScatterGatherKernel.cu) that poisons the CUDA
+        # context, and (b) if they slipped past, drive a weight shuffle over
+        # the full EP group that blocks on the dead peer. The existing
+        # ``step()`` survivor-gate and the ``_ep_all_reduce_valid`` check below
+        # both sit *after* that scatter, so they don't protect it. Until
+        # survivor-aware rearrangement lands, skip rearrangement entirely
+        # whenever a dead column is present. All survivors share the same
+        # placement table, so they skip in lockstep (collectives stay matched).
+        # Excludes the EEP scale-down path (``rank_mapping`` set) and profile
+        # runs (startup, no deaths).
+        if (
+            rank_mapping is None
+            and not is_profile
+            and any(
+                bool((ms.physical_to_logical_map == -1).any())
+                for ms in self.model_states.values()
+            )
+        ):
+            logger.warning_once(
+                "FT NIXL EP: skipping EPLB expert rearrangement because the "
+                "placement table has dead-rank columns (a DP peer is dead); "
+                "survivor-aware rearrangement is not yet implemented."
+            )
+            return None
 
         start_event = None
         end_event = None
@@ -739,15 +825,25 @@ class EplbState:
                 dtype=eplb_model_state.expert_load_window.dtype,
                 device=eplb_model_state.expert_load_window.device,
             )
+            # Survivor-safe load aggregation. After a peer dies,
+            # physical_to_logical_map carries -1 in the dead ranks' columns
+            # (mark_dead_columns_inplace). A raw scatter_add_ with a -1 index is
+            # out of bounds (ScatterGatherKernel device assert that poisons the
+            # CUDA context). Dead slots carry zero load anyway, so clamp the -1
+            # indices to 0 and zero out their src contribution. This is a no-op
+            # when there are no dead columns (the steady-state path).
+            p2l_idx = eplb_model_state.physical_to_logical_map[
+                :, : self.num_valid_physical_experts
+            ]
+            valid_mask = (p2l_idx >= 0).unsqueeze(0)
+            scatter_index = (
+                p2l_idx.clamp(min=0).unsqueeze(0).expand_as(expert_load_window).long()
+            )
+            scatter_src = expert_load_window * valid_mask.to(expert_load_window.dtype)
             logical_expert_load_window.scatter_add_(
                 dim=-1,
-                index=eplb_model_state.physical_to_logical_map[
-                    :, : self.num_valid_physical_experts
-                ]
-                .unsqueeze(0)
-                .expand_as(expert_load_window)
-                .long(),
-                src=expert_load_window,
+                index=scatter_index,
+                src=scatter_src,
             )
 
             global_expert_load_window = logical_expert_load_window.sum(dim=0)
@@ -777,17 +873,29 @@ class EplbState:
         num_groups = model.num_expert_groups
 
         if rank_mapping is not None and len(rank_mapping) == ep_group.size():
-            # NOTE(yongji): scale down, we need to rebalance the experts on
-            # remaining GPUs, transfer the experts while we haven't shutdown
-            # the GPUs to be released.
-            coordinator = get_ep_group()
-            assert isinstance(coordinator, StatelessGroupCoordinator)
-            tcp_store_group = coordinator.tcp_store_group
-            num_nodes = _node_count_with_rank_mapping(tcp_store_group, rank_mapping)
+            # A reduced-rank reshuffle: either elastic-EP scale-down or the FT
+            # NIXL EP survivor-aware degraded rearrange. Both shrink num_gpus /
+            # num_replicas to the surviving ranks; the node-count source and the
+            # commit semantics differ (see inplace_survivor below).
             num_gpus = sum(new_rank != -1 for new_rank in rank_mapping.values())
             num_replicas = (
                 num_replicas // ep_group.size() * num_gpus
             )  # handle num replicas change
+            if inplace_survivor:
+                # FT NIXL EP survivor-aware reshuffle: no StatelessGroup
+                # coordinator is available (the EP group is a regular
+                # GroupCoordinator), and num_nodes only feeds the policy's
+                # hierarchy hint, not correctness -- fall back to global
+                # (non-hierarchical) balancing over the survivors.
+                num_nodes = 1
+            else:
+                # Elastic EP scale-down: count surviving nodes via the stateless
+                # TCP-store group, then transfer before releasing the GPUs.
+                coordinator = get_ep_group()
+                assert isinstance(coordinator, StatelessGroupCoordinator)
+                num_nodes = _node_count_with_rank_mapping(
+                    coordinator.tcp_store_group, rank_mapping
+                )
         else:
             num_nodes = get_node_count()
             num_gpus = ep_group.size()
@@ -828,9 +936,25 @@ class EplbState:
                 )
 
                 if not is_profile:
+                    committed_map = new_physical_to_logical_map
+                    if inplace_survivor:
+                        # The policy produced a survivor-compact (reduced-width)
+                        # placement. Commit the FULL-WIDTH remap (dead columns =
+                        # -1) so the in-place physical topology width is
+                        # preserved. Committing the compact map would shrink
+                        # physical_to_logical_map (the scale-down semantics in
+                        # _commit_eplb_maps) and renumber survivors onto a
+                        # contiguous rank range -- routing dispatch onto the
+                        # dead ranks' physical ids.
+                        # inplace_survivor is only set together with a
+                        # survivor rank_mapping (see step()).
+                        assert rank_mapping is not None
+                        committed_map = _map_new_expert_indices_with_rank_mapping(
+                            new_physical_to_logical_map, rank_mapping
+                        )
                     _commit_eplb_maps(
                         eplb_model_state,
-                        new_physical_to_logical_map=new_physical_to_logical_map,
+                        new_physical_to_logical_map=committed_map,
                     )
 
                 if is_main_rank:
@@ -894,6 +1018,44 @@ class EplbState:
         if ft is not None and ft.has_group:
             return ft
         return None
+
+    def _ft_survivor_rank_mapping(self) -> dict[int, int] | None:
+        """Build a scale-down-style ``rank_mapping`` for survivor-aware rearrange.
+
+        Derives the dead ranks from ``physical_to_logical_map``: a rank is dead
+        iff all of its physical columns are ``-1`` (written by
+        ``mark_dead_columns_inplace`` during recovery). Survivors are renumbered
+        to a compact ``0..(num_survivors-1)`` index; dead ranks map to ``-1``.
+        This matches the convention consumed by the scale-down path in
+        ``rearrange_expert_weights_inplace``
+        (``_map_new_expert_indices_with_rank_mapping``), which maps the
+        survivor-compact placement back into the full-width in-place tensor with
+        dead columns held at ``-1``.
+
+        Returns ``None`` if no rank is dead (normal full-group path) or if state
+        is unavailable.
+        """
+        if not self.model_states:
+            return None
+        model_state = next(iter(self.model_states.values()))
+        p2l = model_state.physical_to_logical_map
+        num_physical = p2l.shape[1]
+        ep_size = get_ep_group().device_group.size()
+        if ep_size <= 0 or num_physical % ep_size != 0:
+            return None
+        num_local = num_physical // ep_size
+        mapping: dict[int, int] = {}
+        survivor_idx = 0
+        any_dead = False
+        for r in range(ep_size):
+            cols = p2l[:, r * num_local : (r + 1) * num_local]
+            if bool((cols == -1).all()):
+                mapping[r] = -1
+                any_dead = True
+            else:
+                mapping[r] = survivor_idx
+                survivor_idx += 1
+        return mapping if any_dead else None
 
     def _ep_all_reduce(self, tensor: torch.Tensor) -> torch.Tensor:
         """Sum-all-reduce ``tensor`` across the EP group, fault-tolerantly.
