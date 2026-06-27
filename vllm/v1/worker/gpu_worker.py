@@ -114,6 +114,154 @@ class AsyncIntermediateTensors(IntermediateTensors):
         return object.__getattribute__(self, name)
 
 
+def _ft_ep_debug_dump(
+    tag: str,
+    kill_index: int,
+    model: Any,
+    moe_layers: Any,
+    p2l: torch.Tensor,
+    l2p: torch.Tensor,
+    this_reassignments: set[tuple[int, int]],
+    prior_reassignments: set[tuple[int, int]],
+    ep_rank: int,
+    ep_size: int,
+    dead_ep_ranks: list[int],
+) -> None:
+    """One-shot diagnostic dump of EPLB recovery state (env-gated).
+
+    Enabled only when ``VLLM_FT_EP_DEBUG=1``. The garble only appears under
+    EPLB rearrange *and* two sequential kills, so every line is tagged with
+    ``kill=<n>`` (the cumulative recovery index on this worker) and each row's
+    reassignment provenance is labelled ``this`` / ``prior`` / ``no`` to expose
+    cross-kill composition.
+
+    For a small sample of MoE layers it logs, per local buffer row, the three
+    quantities that must agree for nixl_ep dispatch to read the right weights:
+
+    - ``logical``: the logical expert the placement table (p2l) assigns to
+      this row, i.e. ``p2l[layer, local_start + j]``.
+    - ``em_row``: where the rebuilt ``_expert_map`` says that logical lives
+      (``expert_map[logical]``). Single-valued, so if a logical is hosted on
+      two local rows this keeps only the last -- a mismatch vs ``j`` means the
+      disk reload wrote weights to a row dispatch won't (always) read.
+    - ``disp_row``: the *list* of local rows nixl_ep dispatch can land this
+      logical on, derived from ``logical_to_physical_map`` as
+      ``physical_slot % num_local`` for every local replica. ``len > 1`` is a
+      same-rank duplicate replica -- the leading two-kill hypothesis: reassign
+      -only reload fills only ``em_row``, leaving the other replica row stale.
+    - ``ck``: a cheap stable checksum of the row's weights. Comparing this
+      between a reassign-only run (garbled) and a full-resync run (coherent)
+      isolates exactly which rows hold different weights while the maps are
+      identical -- the smoking gun.
+
+    Best-effort: matches the surrounding recovery debug blocks and never
+    raises (a failed diagnostic must not abort a rare recovery).
+    """
+    if os.environ.get("VLLM_FT_EP_DEBUG", "0") != "1":
+        return
+    try:
+        num_moe_layers = int(p2l.shape[0])
+        num_physical = int(p2l.shape[1])
+        num_local = num_physical // ep_size
+        local_start = ep_rank * num_local
+        local_end = local_start + num_local
+
+        p2l_cpu = p2l.detach().cpu()
+        l2p_cpu = l2p.detach().cpu()
+
+        # File-based, ALL layers, self-contained (raw p2l/l2p/expert_map rows +
+        # per-row ck). One file per (kill, rank, tag) so Ray's multi-line log
+        # compression can't eat the per-row data -- kubectl cp it out and diff
+        # before_reload vs after_reload: a non-reassigned row whose ck changes
+        # between them is a row reassign-only would have left stale.
+        path = f"/tmp/ft_ep_dump_kill{kill_index}_dp{ep_rank}_{tag}.txt"
+        total_mismatches = 0
+        total_dup = 0
+        with open(path, "w") as fh:
+            fh.write(
+                f"# FT EP DEBUG tag={tag} kill={kill_index} "
+                f"ep_rank={ep_rank}/{ep_size} dead={sorted(dead_ep_ranks)} "
+                f"num_moe_layers={num_moe_layers} num_local={num_local} "
+                f"local_start={local_start} local_end={local_end}\n"
+                f"# this_reassignments={len(this_reassignments)} "
+                f"prior_reassignments={len(prior_reassignments)}\n"
+            )
+            for layer in range(num_moe_layers):
+                mgr = getattr(moe_layers[layer], "expert_map_manager", None)
+                expert_map = None if mgr is None else mgr.expert_map
+                em_cpu = None if expert_map is None else expert_map.detach().cpu()
+                routing_tables = None if mgr is None else mgr.routing_tables
+                weights = model.expert_weights[layer]
+
+                # Batched per-row checksum: one GPU sync per weight per layer
+                # (not per row) -- w is (num_local, ...) so flatten(1).sum(1)
+                # gives a per-local-row scalar in one kernel.
+                row_ck: list[list[str]] = [[] for _ in range(num_local)]
+                for w in weights:
+                    sums = w.detach().float().abs().flatten(1).sum(1).cpu().tolist()
+                    for j in range(num_local):
+                        row_ck[j].append(f"{sums[j]:.6e}")
+
+                p2l_row = p2l_cpu[layer]
+                fh.write(
+                    f"## layer={layer} routing_tables="
+                    f"{'present' if routing_tables is not None else 'None'} "
+                    f"p2l_local={p2l_row[local_start:local_end].tolist()}\n"
+                )
+                layer_mismatch = 0
+                layer_dup = 0
+                for j in range(num_local):
+                    logical = int(p2l_row[local_start + j].item())
+                    if em_cpu is not None and 0 <= logical < em_cpu.shape[0]:
+                        em_row = int(em_cpu[logical].item())
+                    else:
+                        em_row = -2
+                    l2p_raw = [int(x) for x in l2p_cpu[layer, logical].tolist()]
+                    disp_rows = [
+                        p % num_local for p in l2p_raw if local_start <= p < local_end
+                    ]
+                    if len(disp_rows) > 1:
+                        layer_dup += 1
+                    if (layer, logical) in this_reassignments:
+                        ra = "this"
+                    elif (layer, logical) in prior_reassignments:
+                        ra = "prior"
+                    else:
+                        ra = "no"
+                    consistent = em_row == j and disp_rows == [j]
+                    if not consistent:
+                        layer_mismatch += 1
+                    fh.write(
+                        f"  row={j:>3} logical={logical:>4} em_row={em_row:>4} "
+                        f"disp_row={disp_rows} l2p={l2p_raw} reassigned={ra} "
+                        f"consistent={int(consistent)} ck=[{','.join(row_ck[j])}]\n"
+                    )
+                total_mismatches += layer_mismatch
+                total_dup += layer_dup
+                fh.write(
+                    f"## layer={layer} mismatches={layer_mismatch} "
+                    f"dup_replicas={layer_dup}\n"
+                )
+            fh.write(
+                f"# TOTAL mismatches={total_mismatches} dup_replicas={total_dup}\n"
+            )
+        logger.info(
+            "FT EP DEBUG [%s] kill=%d ep_rank=%d/%d dead=%s -> wrote %s "
+            "(all %d layers; mismatches=%d dup_replicas=%d).",
+            tag,
+            kill_index,
+            ep_rank,
+            ep_size,
+            sorted(dead_ep_ranks),
+            path,
+            num_moe_layers,
+            total_mismatches,
+            total_dup,
+        )
+    except Exception as e:
+        logger.warning("FT EP DEBUG: dump (%s) skipped: %s", tag, e)
+
+
 class Worker(WorkerBase):
     def __init__(
         self,
@@ -454,6 +602,40 @@ class Worker(WorkerBase):
                 f"without corrupting MoE routing."
             )
 
+        # Use the same (ep_rank, ep_size) the _expert_map rebuild above used,
+        # read off any EP-enabled layer's manager, so the dump's local-row
+        # arithmetic matches the recovery's exactly.
+        dbg_ep_rank, dbg_ep_size = 0, 1
+        if moe_layers is not None:
+            for _layer in moe_layers:
+                _mgr = getattr(_layer, "expert_map_manager", None)
+                if _mgr is not None and _mgr.moe_parallel_config.ep_size > 1:
+                    dbg_ep_rank = _mgr.moe_parallel_config.ep_rank
+                    dbg_ep_size = _mgr.moe_parallel_config.ep_size
+                    break
+        # Cumulative kill index + cross-kill reassignment set: the garble is a
+        # two-kill effect, so the dump must distinguish kill 1 from kill 2 and
+        # label rows reassigned in a *prior* kill vs this one.
+        self._ft_ep_recovery_count = getattr(self, "_ft_ep_recovery_count", 0) + 1
+        kill_index = self._ft_ep_recovery_count
+        this_reassignments = set(reassignments)
+        prior_reassignments: set[tuple[int, int]] = getattr(
+            self, "_ft_ep_prior_reassignments", set()
+        )
+        _ft_ep_debug_dump(
+            "before_reload",
+            kill_index,
+            model,
+            moe_layers,
+            p2l,
+            l2p,
+            this_reassignments,
+            prior_reassignments,
+            dbg_ep_rank,
+            dbg_ep_size,
+            dead_ep_ranks,
+        )
+
         if reassignments:
             # Reload from the HF checkpoint so every local slot's weights match
             # the just-rebuilt _expert_map.
@@ -481,16 +663,39 @@ class Worker(WorkerBase):
                 for layer_i in range(p2l.shape[0])
                 for lid in range(num_logical)
             }
+            # Debug toggle: "reassign_only" reproduces the garbled run (reload
+            # only the reassigned slots), "full" (default) is the validated fix.
+            # Toggling from one build keeps seed/prompt identical so the
+            # before/after dumps diff cleanly.
+            reload_mode = os.environ.get("VLLM_FT_EP_RELOAD_MODE", "full").lower()
+            if reload_mode == "reassign_only":
+                reload_set = set(reassignments)
+            else:
+                reload_set = full_reload_set
             try:
                 loaded_count = reload_experts_from_disk(
-                    model, self.vllm_config, full_reload_set
+                    model, self.vllm_config, reload_set
                 )
                 logger.info(
-                    "FT EP: disk-reloaded %d expert tensor(s) (full local "
-                    "resync; %d slot(s) reassigned) after dead peers %s.",
+                    "FT EP: disk-reloaded %d expert tensor(s) (mode=%s; "
+                    "%d slot(s) reassigned) after dead peers %s.",
                     loaded_count,
+                    reload_mode,
                     len(reassignments),
                     sorted(dead_ep_ranks),
+                )
+                _ft_ep_debug_dump(
+                    "after_reload",
+                    kill_index,
+                    model,
+                    moe_layers,
+                    p2l,
+                    l2p,
+                    this_reassignments,
+                    prior_reassignments,
+                    dbg_ep_rank,
+                    dbg_ep_size,
+                    dead_ep_ranks,
                 )
             except Exception as e:
                 # Reloading experts shouldn't be load-bearing for the rest of
@@ -504,6 +709,9 @@ class Worker(WorkerBase):
                     sorted(dead_ep_ranks),
                     e,
                 )
+        # Carry this kill's reassignments forward so the next kill's dump can
+        # label them as "prior" (cross-kill composition is the suspected cause).
+        self._ft_ep_prior_reassignments = prior_reassignments | this_reassignments
         return bool(reassignments)
 
     def query_nixl_ep_mask(self) -> torch.Tensor | None:
