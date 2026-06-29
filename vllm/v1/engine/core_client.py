@@ -36,10 +36,12 @@ from vllm.utils.network_utils import (
 from vllm.v1.engine import (
     EEP_NOTIFICATION_CALL_ID,
     EEPNotificationType,
+    EngineCoreOutput,
     EngineCoreOutputs,
     EngineCoreReadyResponse,
     EngineCoreRequest,
     EngineCoreRequestType,
+    FinishReason,
     PauseMode,
     ReconfigureDistributedRequest,
     ReconfigureRankType,
@@ -1506,15 +1508,15 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         ).start()
 
     def _abort_in_flight_for_dead_engine(self, dead_idx: int) -> None:
-        """Drop client-side bookkeeping for requests on a dead engine.
+        """Error out in-flight requests routed to a dead engine.
 
-        AsyncLLM keeps these request_ids on its tracker; with the engine
-        gone they will never get a final EngineCoreOutput. We log and
-        forget them here so abort routing doesn't try to send messages to
-        a dead identity. A follow-up should synthesize a
-        ``FinishReason.ERROR`` output so callers see a clean failure
-        rather than a hang -- matching the abort-callback path #38862
-        uses during scale-down.
+        With the engine gone, these request_ids will never get a final
+        EngineCoreOutput from the core process, so AsyncLLM would hang on them
+        forever. We synthesize a ``FinishReason.ERROR`` output for each so the
+        caller receives a clean, retryable failure, then drop our routing
+        bookkeeping. This runs on the engine-monitor thread, so the synthetic
+        outputs are handed to the asyncio output queue via
+        ``call_soon_threadsafe``.
         """
         if dead_idx >= len(self.core_engines):
             return
@@ -1527,13 +1529,42 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         if not abandoned:
             return
         logger.warning(
-            "FT NIXL EP: %d in-flight request(s) routed to dead DP %d "
-            "have no final output yet (no abort callback). Sample ids: %s%s",
+            "FT NIXL EP: erroring %d in-flight request(s) routed to dead DP "
+            "%d (the dead engine will never emit their final output). "
+            "Sample ids: %s%s",
             len(abandoned),
             dead_idx,
             abandoned[:5],
             "..." if len(abandoned) > 5 else "",
         )
+
+        # Synthesize a terminal error output per abandoned request so AsyncLLM
+        # finishes them with FinishReason.ERROR instead of hanging.
+        error_outputs = EngineCoreOutputs(
+            engine_index=dead_idx,
+            outputs=[
+                EngineCoreOutput(
+                    request_id=rid,
+                    new_token_ids=[],
+                    finish_reason=FinishReason.ERROR,
+                )
+                for rid in abandoned
+            ],
+            finished_requests=set(abandoned),
+        )
+        queue = self.outputs_queue
+        task = self.resources.output_queue_task
+        loop = task.get_loop() if task is not None else None
+        if queue is not None and loop is not None and not loop.is_closed():
+            loop.call_soon_threadsafe(queue.put_nowait, error_outputs)
+        else:
+            logger.warning(
+                "FT NIXL EP: could not inject error outputs for dead DP %d "
+                "(output queue task not running); %d request(s) may hang.",
+                dead_idx,
+                len(abandoned),
+            )
+
         for rid in abandoned:
             self.reqs_in_flight.pop(rid, None)
 

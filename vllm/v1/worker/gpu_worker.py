@@ -436,6 +436,31 @@ class Worker(WorkerBase):
         if eplb_state is None:
             return False
 
+        # FT NIXL EP: neutralize any in-flight async EPLB rearrange before we
+        # rewrite the placement table. A pending_result carries a *pre-death*
+        # physical_to_logical_map snapshot plus weights staged under that old
+        # placement; committing it after recovery would overwrite the recovered
+        # maps with stale data (-> map/weight mismatch -> garble). Setting
+        # rebalanced=False makes the async worker loop exit at its next check;
+        # clearing pending_result stops step() from consuming a stale result.
+        # expert_buffer is left as-is (reused/overwritten by the next
+        # rearrange). A worker hung inside transfer_layer on the dead peer may
+        # leak until its collective unblocks, but with rebalanced cleared it can
+        # no longer drive a commit; the request-error path is the backstop if a
+        # final stale result still races in.
+        for ms in eplb_state.model_states.values():
+            if getattr(ms, "rebalanced", False) or ms.pending_result is not None:
+                logger.warning(
+                    "FT EP: discarding in-flight async EPLB rearrange state "
+                    "(rebalanced=%s, pending_result_set=%s) during recovery for "
+                    "dead peer(s) %s; its pre-death snapshot is now stale.",
+                    getattr(ms, "rebalanced", False),
+                    ms.pending_result is not None,
+                    sorted(dead_ep_ranks),
+                )
+            ms.rebalanced = False
+            ms.pending_result = None
+
         model_config = self.model_runner.model_config
         eplb_model_state = eplb_state.model_states.get(model_config.compute_hash())
         if eplb_model_state is None:

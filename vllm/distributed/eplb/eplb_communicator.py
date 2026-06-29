@@ -5,6 +5,7 @@ EPLB communicator implementations and factory.
 """
 
 import contextlib
+import os
 import time
 import uuid
 from abc import ABC, abstractmethod
@@ -470,6 +471,24 @@ class NixlEplbCommunicator(EplbCommunicator):
 
     def _wait_for_all_transfers(self, handles: list[int]) -> None:
         pending = set(handles)
+        # FT NIXL EP: bound the completion poll so a transfer targeting a
+        # hard-killed peer cannot spin forever. On a `kill -9` the dead peer's
+        # RDMA QP can linger "valid" for a while, so check_xfer_state keeps
+        # returning "PROC" (never an error state) and this loop would otherwise
+        # hang indefinitely. The deadline mirrors the post-READ
+        # monitored_barrier timeout below (5 min) and is overridable via
+        # VLLM_NIXL_EP_TRANSFER_TIMEOUT_MS.
+        #
+        # NOTE: this is a wall-clock workaround. The proper fix is for NIXL to
+        # surface a dead/unreachable remote as an error transfer state promptly,
+        # so we exit via the ``state != "PROC"`` branch below instead of a timer.
+        # We hope the NIXL team can add fast dead-peer detection / transfer
+        # abort so this timeout becomes a backstop rather than the primary
+        # mechanism.
+        timeout_ms = int(
+            os.getenv("VLLM_NIXL_EP_TRANSFER_TIMEOUT_MS", str(5 * 60 * 1000))
+        )
+        deadline = time.monotonic() + timeout_ms / 1000.0
         while pending:
             completed: list[int] = []
             for handle in pending:
@@ -482,6 +501,13 @@ class NixlEplbCommunicator(EplbCommunicator):
             for handle in completed:
                 pending.remove(handle)
             if pending:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        f"NIXL EPLB transfer timed out after {timeout_ms} ms "
+                        f"with {len(pending)} transfer(s) still pending; a peer "
+                        "is likely dead (QP lingering, no error state). "
+                        "Overridable via VLLM_NIXL_EP_TRANSFER_TIMEOUT_MS."
+                    )
                 time.sleep(0.0005)
 
     def _create_peer_xfer(

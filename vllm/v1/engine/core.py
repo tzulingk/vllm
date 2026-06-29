@@ -1770,6 +1770,15 @@ class EngineCoreProc(EngineCore):
             for client_index, req_ids in by_client.items():
                 self._send_abort_outputs_to_client(list(req_ids), client_index)
 
+    def _send_error_outputs(self, errored_reqs: list[tuple[str, int]]) -> None:
+        if errored_reqs:
+            # Map client_index to list of request_ids that belong to that client.
+            by_client = defaultdict[int, set[str]](set)
+            for req_id, client_index in errored_reqs:
+                by_client[client_index].add(req_id)
+            for client_index, req_ids in by_client.items():
+                self._send_error_outputs_to_client(list(req_ids), client_index)
+
 
 class DPEngineCoreProc(EngineCoreProc):
     """ZMQ-wrapper for running EngineCore in background process
@@ -2447,6 +2456,32 @@ class DPEngineCoreProc(EngineCoreProc):
                     sorted(survivors),
                     e,
                 )
+
+        # FT NIXL EP: error out in-flight requests that were active across the
+        # death-to-recovery window. A survivor forward pass that ran during the
+        # window may have emitted a token computed with the dead rank's expert
+        # contribution masked/zeroed, and there is no output-coherency check, so
+        # we cannot prove those outputs are clean. Mark them FINISHED_ERROR so
+        # callers receive a retryable error rather than silently-degraded output.
+        # Only RUNNING requests are affected; queued requests never executed a
+        # forward pass during the window and will run on the recovered cluster.
+        # SchedulerInterface exposes no running-list accessor; the concrete
+        # Scheduler does (resolved dynamically via get_scheduler_cls()).
+        running_reqs = self.scheduler.running  # type: ignore[attr-defined]
+        running_ids = [req.request_id for req in running_reqs]
+        if running_ids:
+            errored = self.scheduler.finish_requests(
+                running_ids, RequestStatus.FINISHED_ERROR
+            )
+            self._send_error_outputs(errored)
+            logger.warning(
+                "FT EP: errored %d in-flight request(s) active during the "
+                "death-to-recovery window for dead peer(s) %s on dp_rank=%d; "
+                "clients should retry.",
+                len(errored),
+                newly_dead,
+                self.dp_rank,
+            )
 
     def reinitialize_distributed(
         self, reconfig_request: ReconfigureDistributedRequest
