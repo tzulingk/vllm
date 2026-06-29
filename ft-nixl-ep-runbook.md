@@ -4511,3 +4511,60 @@ Root-caused with `py-spy --native` on survivors during the stall + `nvidia-smi`:
   `pip install ray pytest py-spy`.
 - Death-window stall makes survivors hang in CUDA for tens of seconds to minutes;
   wait it out (it recovers) rather than assuming a permanent hang.
+
+## 2026-06-29 — Fail-closed fix (8b1c462d38) + validation campaign (DYN-3293)
+
+### The fix (commit `8b1c462d38`, 4 "halves")
+Harden the death-to-recovery window so a dead-rank dependency can't produce silent
+garble or an unbounded hang:
+- **A** `core.py::DPEngineCoreProc` recovery: error all RUNNING requests with
+  `RequestStatus.FINISHED_ERROR` after recovery (retryable, not silently-degraded).
+- **B** `core_client.py::_abort_in_flight_for_dead_engine`: synthesize
+  `FinishReason.ERROR` for requests stranded on the dead engine (was a TODO; they
+  used to hang).
+- **C** `gpu_worker.py::eplb_redistribute_for_dead_peers`: clear in-flight async EPLB
+  state (`rebalanced=False`, `pending_result=None`) so a stale pre-death map can't be
+  committed. NOTE: moot in practice -- async EPLB is forbidden under elastic-EP.
+- **D** `eplb_communicator.py::_wait_for_all_transfers`: bound the transfer poll
+  (`VLLM_NIXL_EP_TRANSFER_TIMEOUT_MS`, default 5min) so a transfer to a hard-killed
+  peer can't spin forever.
+
+### Two structural findings
+- **async EPLB is forbidden under `--enable-elastic-ep`** (pynccl multi-stream
+  conflict; pydantic ValidationError at startup). All FT runs are therefore **sync**
+  (`use_async=false`). Consequence: Half C and any async test are moot for the FT setup.
+- **`--enable-elastic-ep` is required for FT *survival*, not scaling:** the
+  dead-engine "route-around instead of shutdown" monitor is gated on it
+  (`core_client.py:1442`), and the recovery's reconfigurable EP groups come from
+  `_init_elastic_ep_world` (`parallel_state.py:1660`). With it off, one dead rank
+  shuts down the whole server.
+
+### Test #1 -- localizer (sync rearrange vs sync-no-rearrange, NO kill): CLEAN
+`serve-eplb-noreb.sh` (step_interval=1e8) vs `serve-eplb-deg.sh` (step_interval=20),
+greedy temp=0, 10 fixed prompts, sequential. In-process floor identical; ON fired 34
+rearranges; OFF-vs-ON **byte-identical**. => steady-state rearrange is NOT the bug;
+garble requires the kill (death path). #5 (overlap/DBO) not needed.
+
+### Test #2 -- sync rearrange + two-rank kill, WITH the fix (= Half A/B): PASS
+`FORCE_DEGRADED_REARRANGE=1`, sustained load, kill DP1 (20:49:01) then DP3 (20:50:31).
+- Rearranges fired **every phase**: healthy R0=194, degraded[0,2,3] 226->279,
+  degraded[0,2] 312->345.
+- **Half A** (errored in-flight survivor reqs after recovery) and **Half B** (errored
+  dead-engine reqs) both fired on both kills -> requests fail **retryably, not hang**
+  (vs the 06-27 no-fix hang).
+- Recovery `[0,2,3]`~45s, `[0,2]`~35s; **no crash** (scatter OOB fixed); output
+  **coherent+correct** with both dead.
+- Map-consistency (`analyze_ft_dump.py`, kill2 dp0 & dp2, 832 rows): 0 dead-slot l2p
+  refs, 0 non-reassigned-row ck diffs (smoking gun), 0 inconsistent, 0 dup.
+- Half C moot (sync); Half D not triggered (opportunistic).
+
+### Verdict
+#1 + #2 localize the garble to the death+recovery window and show the fix closes it:
+degraded failures are now **fail-closed (retryable error)**, not silent garble or hang;
+the survivor-aware degraded rearrange runs clean and the placement stays correct.
+
+### Logs / commands
+Per-run artifacts under `ft-test-logs/run-2026-06-29-test{1,2}-*/` (serve logs,
+captures, dumps, mapcheck, notes). New-pod-per-test (no in-pod restart -- pkill
+self-matches; Ray doesn't recover cleanly). `eplb-capture.sh <out>` = deterministic
+greedy capture for the #1 diff. DYN-3293 comments: #1 `f28663ee`, #2 `9987c4fb`.
