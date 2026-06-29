@@ -97,16 +97,6 @@ HANDSHAKE_TIMEOUT_MINS = 5
 # timeout we assume "someone has work" (keep stepping) -- the safe direction.
 _WAVE_SYNC_FAILFAST_MS = 1000
 
-# FT NIXL EP: max age (s) of a peer's published kernel mask for it to count in
-# the consensus check. Once pause/idle is restored a paused survivor stops
-# stepping -> stops publishing fresh masks; with step_counter resetting per
-# wave its stale mask can collide on the same step key as active ranks' fresh
-# masks and trip a false "divergence" crash. A peer whose mask is older than
-# this is paused (not doing the kernel all-to-all), so its mask is irrelevant
-# to current consensus and is ignored. Well above the sub-second active-step
-# publish cadence, well below real pause durations.
-_MASK_STALE_SEC = 5.0
-
 _R = TypeVar("_R")  # Return type for collective_rpc
 
 
@@ -2040,21 +2030,7 @@ class DPEngineCoreProc(EngineCoreProc):
 
         raise SystemExit
 
-    # ----- ft-nixl-ep-kernel-mask-repro helpers (split for readability) ---
-
-    @staticmethod
-    def _parse_dead_dp_ranks_env() -> set[int]:
-        """Parse VLLM_FT_EP_REPRO_DEAD_DP_RANKS into a set of int ranks."""
-        import contextlib
-
-        raw = os.environ.get("VLLM_FT_EP_REPRO_DEAD_DP_RANKS", "")
-        out: set[int] = set()
-        for tok in raw.split(","):
-            tok = tok.strip()
-            if tok:
-                with contextlib.suppress(ValueError):
-                    out.add(int(tok))
-        return out
+    # ----- FT NIXL EP: dead-peer detection via the NIXL kernel mask -----
 
     def _query_local_kernel_mask(self) -> list[int] | None:
         """Return the local NIXL EP kernel mask, truncated to actual EP slots.
@@ -2095,219 +2071,7 @@ class DPEngineCoreProc(EngineCoreProc):
         num_ep_ranks = self.dp_group.size() * tp_size
         return full[:num_ep_ranks]
 
-    @staticmethod
-    def _mask_store_key(dp_rank: int, step: int) -> str:
-        # Step-tagged keys: each forward pass gets its own key, so peers
-        # advancing within the same wave don't overwrite each other's
-        # earlier mask snapshots.
-        return f"nixl_kernel_mask_dp{dp_rank}_step{step}"
-
-    def _publish_my_mask(self, mask: list[int], ts: float, step: int) -> None:
-        import json
-
-        self.dp_store.set(
-            self._mask_store_key(self.dp_rank, step),
-            json.dumps({"mask": mask, "ts": ts, "step": step}).encode(),
-        )
-
-    def _wait_for_peer_masks(self, expected_peers: list[int], step: int) -> None:
-        """Block up to 3s for every expected peer to publish step-`step`.
-
-        Logs a warning on timeout. The MISSING-key path in the caller does
-        the actual bookkeeping; this exists so the timeout is visible in
-        the log instead of silently swallowed.
-        """
-        from datetime import timedelta
-
-        from torch.distributed import DistStoreError
-
-        peer_keys = [self._mask_store_key(r, step) for r in expected_peers]
-        if not peer_keys:
-            return
-        try:
-            self.dp_store.wait(peer_keys, timedelta(seconds=3))
-        except DistStoreError as e:
-            logger.warning(
-                "NIXL EP REPRO: dp_store.wait timed out on dp_rank=%d step=%d: %s",
-                self.dp_rank,
-                step,
-                e,
-            )
-
-    def _collect_peer_payloads(
-        self,
-        expected_peers: list[int],
-        step: int,
-        my_mask: list[int],
-        my_ts: float,
-    ) -> tuple[dict[int, dict[str, Any] | str], set[int]]:
-        """Read each peer's step-`step` payload from the dp_store.
-
-        Returns (peer_payloads, missing). A peer is "missing" if its key
-        isn't there yet (peer hasn't reached this step) or the payload
-        failed to parse.
-        """
-        import json
-
-        payloads: dict[int, dict[str, Any] | str] = {
-            self.dp_rank: {"mask": my_mask, "ts": my_ts, "step": step}
-        }
-        missing: set[int] = set()
-        for r in expected_peers:
-            key = self._mask_store_key(r, step)
-            if not self.dp_store.check([key]):
-                payloads[r] = "MISSING"
-                missing.add(r)
-                continue
-            try:
-                payloads[r] = json.loads(self.dp_store.get(key).decode())
-            except (json.JSONDecodeError, UnicodeDecodeError) as e:
-                logger.warning(
-                    "NIXL EP REPRO: failed to decode step-%d payload for dp%d: %s",
-                    step,
-                    r,
-                    e,
-                )
-                payloads[r] = "PARSE_ERROR"
-                missing.add(r)
-        return payloads, missing
-
-    @staticmethod
-    def _format_per_rank_payloads(
-        payloads: dict[int, dict[str, Any] | str], my_ts: float
-    ) -> str:
-        lines: list[str] = []
-        for r in sorted(payloads):
-            p = payloads[r]
-            if isinstance(p, dict):
-                age = my_ts - float(p["ts"])
-                lines.append(
-                    f"    dp{r}: mask={p['mask']} "
-                    f"ts={p['ts']:.6f} (age={age:+.3f}s) step={p.get('step')}"
-                )
-            else:
-                lines.append(f"    dp{r}: {p}")
-        return "\n".join(lines)
-
-    def _verify_kernel_mask_consensus_or_crash(self) -> None:
-        """Cross-DP NIXL EP kernel-mask consensus check.
-
-        Reads the local kernel mask, publishes it to a step-tagged
-        TCPStore key, and crashes if any pair of surviving DP ranks
-        disagrees on the same step's mask. Tagging by step_counter
-        (forward-pass counter) rather than current_wave gives one
-        snapshot per forward pass, so within-wave publishes don't
-        overwrite each other and peer comparisons stay
-        per-forward-pass aligned. Gated on
-        ``VLLM_FT_EP_KERNEL_MASK_REPRO=1`` -- off by default.
-        """
-        if os.environ.get("VLLM_FT_EP_KERNEL_MASK_REPRO", "0") != "1":
-            return
-        if not hasattr(self, "dp_store"):
-            return
-
-        # Ranks the test plans to kill: skip publishing for them so peers
-        # don't burn the 3s store.wait waiting for a key that won't appear.
-        dead_ranks = self._parse_dead_dp_ranks_env()
-        if self.dp_rank in dead_ranks:
-            return
-
-        my_mask = self._query_local_kernel_mask()
-        if my_mask is None:
-            return
-
-        my_ts = time.time()
-        my_step = self.step_counter
-
-        logger.info(
-            "NIXL EP REPRO: dp_rank=%d step=%d observed kernel mask=%s "
-            "(1=dead, 0=alive)",
-            self.dp_rank,
-            my_step,
-            my_mask,
-        )
-
-        expected_peers = [
-            r
-            for r in range(self.dp_group.size())
-            if r != self.dp_rank and r not in dead_ranks
-        ]
-
-        self._publish_my_mask(my_mask, my_ts, my_step)
-        self._wait_for_peer_masks(expected_peers, my_step)
-        payloads, missing = self._collect_peer_payloads(
-            expected_peers, my_step, my_mask, my_ts
-        )
-
-        per_rank_block = self._format_per_rank_payloads(payloads, my_ts)
-
-        if missing:
-            logger.warning(
-                "NIXL EP REPRO: skipping step-%d check on dp_rank=%d -- "
-                "ranks %s have no step-%d mask yet. Will retry.\n"
-                "  Partial state:\n%s",
-                my_step,
-                self.dp_rank,
-                sorted(missing),
-                my_step,
-                per_rank_block,
-            )
-            return
-
-        # FT NIXL EP: only compare masks published within _MASK_STALE_SEC of
-        # ours. A paused survivor stops stepping (pause/idle), so it stops
-        # refreshing its mask; with step_counter resetting per wave its stale
-        # mask can land on the same step key as active ranks' fresh masks and
-        # trip a false divergence. A stale peer is paused (not in the kernel
-        # all-to-all), so exclude it rather than crash.
-        stale = [
-            r
-            for r, p in payloads.items()
-            if isinstance(p, dict) and (my_ts - float(p["ts"])) > _MASK_STALE_SEC
-        ]
-        if stale:
-            logger.info(
-                "NIXL EP REPRO: ignoring stale (paused) peer mask(s) %s on "
-                "dp_rank=%d step=%d (age > %.1fs); comparing fresh ranks only.",
-                sorted(stale),
-                self.dp_rank,
-                my_step,
-                _MASK_STALE_SEC,
-            )
-        unique_masks = {
-            tuple(p["mask"])
-            for r, p in payloads.items()
-            if isinstance(p, dict) and r not in stale
-        }
-        if len(unique_masks) > 1:
-            logger.error(
-                "NIXL EP KERNEL MASK REPRO -- divergence detected at "
-                "step=%d on dp_rank=%d:\n%s\nCrashing.",
-                my_step,
-                self.dp_rank,
-                per_rank_block,
-            )
-            raise RuntimeError(
-                f"NIXL EP kernel-mask divergence "
-                f"(dp_rank={self.dp_rank}, step={my_step}): "
-                f"unique_masks={len(unique_masks)}"
-            )
-
-        logger.info(
-            "NIXL EP KERNEL MASK REPRO -- match at step=%d on dp_rank=%d:\n%s",
-            my_step,
-            self.dp_rank,
-            per_rank_block,
-        )
-
     def _has_global_unfinished_reqs(self, local_unfinished: bool) -> bool:
-        # ft-nixl-ep-kernel-mask-repro: run the consensus check on EVERY
-        # call (not gated by step_counter % 32). The whole point is to
-        # catch the kernel divergence before the cluster tears down on
-        # a dead-peer all_reduce; gating it to every 32 steps would skip
-        # almost every opportunity in the post-kill ~10s window.
-        self._verify_kernel_mask_consensus_or_crash()
-
         # Inspect the local kernel mask to detect peers the dispatch
         # kernel has just observed as dead. Trigger EPLB redistribute
         # exactly once per newly-dead peer; subsequent ticks see the
@@ -2387,8 +2151,6 @@ class DPEngineCoreProc(EngineCoreProc):
         Best-effort: failures from the underlying ``collective_rpc`` are
         logged but do not crash the engine. The next tick will retry.
         """
-        if os.environ.get("VLLM_FT_EP_KERNEL_MASK_REPRO", "0") != "1":
-            return
         my_mask = self._query_local_kernel_mask()
         if my_mask is None:
             return

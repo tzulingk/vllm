@@ -26,7 +26,6 @@ MoE layer. If we have 32 EP ranks, then each GPU will hold 288 / 32 = 9 local
 physical experts.
 """
 
-import os
 import threading
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -626,69 +625,35 @@ class EplbState:
                 self._update_layer_should_record(log_stats=log_stats)
                 return
             self.expert_rearrangement_step = 0
-            # DEBUG (DYN-3293): VLLM_FT_EP_FORCE_DEGRADED_REARRANGE=1 forces the
-            # rearrangement weight-shuffle to run even while a DP peer is dead,
-            # to test whether degraded-state rearrangement is what garbles
-            # output. Off by default (the gate below suppresses it as designed).
-            force_degraded = (
-                os.environ.get("VLLM_FT_EP_FORCE_DEGRADED_REARRANGE", "0") == "1"
+            survivor_mapping = (
+                self._ft_survivor_rank_mapping()
+                if self._ft_survivor_group() is not None
+                else None
             )
-            if self._ft_survivor_group() is not None and not force_degraded:
-                # Degraded: a DP peer is dead. Load aggregation above already
-                # ran over the survivors (FT-gloo), but the rearrangement
-                # weight shuffle moves expert weights over the full EP NCCL
-                # group and would hang on the dead peer. Survivor-aware weight
-                # movement is a separate effort; suppress rearrangement while
-                # degraded. Recovery-time disk reload already redistributed
-                # the dead rank's experts onto the survivors.
-                logger.warning_once(
-                    "FT NIXL EP: skipping EPLB expert rearrangement while a "
-                    "DP peer is dead (survivor-aware weight shuffle not yet "
-                    "implemented); load aggregation continues over survivors."
-                )
-            else:
-                survivor_mapping = (
-                    self._ft_survivor_rank_mapping()
-                    if self._ft_survivor_group() is not None
-                    else None
-                )
-                if survivor_mapping is not None:
-                    logger.warning_once(
-                        "FT NIXL EP: FORCING survivor-aware EPLB rearrangement "
-                        "while degraded (VLLM_FT_EP_FORCE_DEGRADED_REARRANGE=1) "
-                        "-- debug only."
+            if survivor_mapping is not None:
+                # Degraded: a DP peer is dead -> survivor-aware rearrange over
+                # the surviving ranks. It MUST be synchronous: the survivor remap
+                # is carried by ``rank_mapping``, which is only honored on
+                # rearrange()'s sync path (it feeds
+                # _map_new_expert_indices_with_rank_mapping to confine the
+                # placement/transfer to survivors). The async path drops
+                # rank_mapping -> a survivor-sized placement vs the full-width
+                # tensor (shape mismatch) and a shuffle/commit over the full EP
+                # group (hangs on the dead peer). So toggle is_async off for the
+                # reshuffle and restore it in finally, so steady-state async EPLB
+                # resumes if the cluster returns to full health and an exception
+                # can't leave async permanently disabled.
+                is_async_prev = self.is_async
+                self.is_async = False
+                try:
+                    self.rearrange(
+                        rank_mapping=survivor_mapping,
+                        inplace_survivor=True,
                     )
-                    # Force SYNCHRONOUS rearrangement for the degraded reshuffle.
-                    #
-                    # Why we toggle is_async here: the survivor remap is carried
-                    # by ``rank_mapping``, and rank_mapping is ONLY honored on
-                    # the synchronous path. rearrange()'s sync branch passes it
-                    # into rearrange_expert_weights_inplace (the scale-down
-                    # branch that runs _map_new_expert_indices_with_rank_mapping
-                    # to confine the placement/transfer to survivors). The async
-                    # branch drops rank_mapping entirely -- it only snapshots
-                    # EplbStats and signals the worker, and the worker calls
-                    # transfer_layer WITHOUT rank_mapping. Left async, it would
-                    # (a) produce a survivor-sized placement that no longer
-                    # matches the full-width tensor (shape mismatch in
-                    # transfer_layer) and (b) shuffle/commit over the full EP
-                    # group -- hanging on the dead peer. Running sync also means
-                    # there is no in-flight async state to abort.
-                    #
-                    # Restore in finally so steady-state async EPLB resumes
-                    # automatically if the cluster returns to full health, and so
-                    # an exception can't leave async permanently disabled.
-                    is_async_prev = self.is_async
-                    self.is_async = False
-                    try:
-                        self.rearrange(
-                            rank_mapping=survivor_mapping,
-                            inplace_survivor=True,
-                        )
-                    finally:
-                        self.is_async = is_async_prev
-                else:
-                    self.rearrange()
+                finally:
+                    self.is_async = is_async_prev
+            else:
+                self.rearrange()
 
         self._update_layer_should_record(log_stats=log_stats)
 

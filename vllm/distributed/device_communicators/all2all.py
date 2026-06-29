@@ -504,11 +504,11 @@ class NixlEPAll2AllManager(All2AllManagerBase):
         buffer = NixlEPAll2AllManager._buffer.buffer
         buffer.set_tcp_store_group(None)
 
-    # ft-nixl-ep-kernel-mask-repro: read the NIXL EP kernel's per-rank mask
-    # buffer. The buffer is mutated autonomously by the dispatch / combine
-    # kernels on per-(warp, src_rank) timeout. Used by
-    # DPEngineCoreProc._verify_kernel_mask_consensus_or_crash to detect
-    # cross-rank disagreement on who the kernel thinks is dead.
+    # FT NIXL EP: read the NIXL EP kernel's per-rank mask buffer. The buffer is
+    # mutated autonomously by the dispatch / combine kernels on per-(warp,
+    # src_rank) timeout. Used by
+    # DPEngineCoreProc._maybe_recover_on_newly_dead_peers to detect peers the
+    # kernel has just observed as dead and trigger recovery.
     _mask_read_buf: torch.Tensor | None = None
 
     def query_mask(self) -> torch.Tensor | None:
