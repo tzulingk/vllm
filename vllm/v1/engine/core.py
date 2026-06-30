@@ -2071,6 +2071,56 @@ class DPEngineCoreProc(EngineCoreProc):
         num_ep_ranks = self.dp_group.size() * tp_size
         return full[:num_ep_ranks]
 
+    def _query_local_tp_mask(self) -> list[bool] | None:
+        """Return the FT-NCCL TP collective's active mask for this DP rank's
+        TP group (``True``=alive, in TP-rank order), or ``None`` when FT-NCCL
+        TP is not in use. Mirrors ``_query_local_kernel_mask`` but for the
+        tensor-parallel all-reduce (``query_ft_nccl_tp_mask`` on the worker).
+        """
+        try:
+            masks: list[Any] = self.collective_rpc("query_ft_nccl_tp_mask")
+        except Exception as e:
+            logger.warning("FT NIXL EP: query_ft_nccl_tp_mask RPC raised %s", e)
+            return None
+        raw = next((m for m in masks if m is not None), None)
+        if raw is None:
+            return None
+        return [bool(x) for x in raw]
+
+    def _check_tp_ep_mask_consistency(self) -> None:
+        """Cross-check the NIXL EP active mask against the FT-NCCL TP active
+        mask; fail-fast (crash) on any divergence.
+
+        Both collectives independently track which peers are alive. For this DP
+        rank's TP group they must agree on each peer's liveness: NIXL EP slot
+        ``dp_rank*tp_size + t`` (1=dead) must match FT-NCCL TP rank ``t``
+        (False=dead). A rank that one collective sees dead while the other sees
+        alive is a fault-tolerance bug we must surface immediately rather than
+        serve silently-degraded output -- so we crash. TP-only; no-op when
+        ``VLLM_USE_FT_NCCL_TP`` is unset or either mask is unavailable.
+        """
+        if not envs.VLLM_USE_FT_NCCL_TP:
+            return
+        ep_mask = self._query_local_kernel_mask()  # global EP slots, 1=dead
+        tp_mask = self._query_local_tp_mask()  # this DP rank's TP group, True=alive
+        if ep_mask is None or tp_mask is None:
+            return
+        tp_size = self.vllm_config.parallel_config.tensor_parallel_size
+        base = self.dp_rank * tp_size
+        for t in range(min(tp_size, len(tp_mask))):
+            ep_slot = base + t
+            if ep_slot >= len(ep_mask):
+                break
+            ep_dead = ep_mask[ep_slot] != 0
+            tp_dead = not tp_mask[t]
+            if ep_dead != tp_dead:
+                raise RuntimeError(
+                    f"FT active-mask inconsistency on dp_rank={self.dp_rank}: "
+                    f"EP slot {ep_slot} dead={ep_dead} (nixl_ep) != TP rank {t} "
+                    f"dead={tp_dead} (ft_nccl). Crashing fail-fast per the "
+                    f"EP/TP active-mask consistency policy."
+                )
+
     def _has_global_unfinished_reqs(self, local_unfinished: bool) -> bool:
         # Inspect the local kernel mask to detect peers the dispatch
         # kernel has just observed as dead. Trigger EPLB redistribute
@@ -2086,6 +2136,10 @@ class DPEngineCoreProc(EngineCoreProc):
         self.step_counter += 1
         if self.step_counter % 32 != 0:
             return True
+        # Fail-fast invariant: the NIXL EP kernel mask and the FT-NCCL TP
+        # collective mask must agree on peer liveness for this DP rank's TP
+        # group. Checked on the wave-sync cadence to bound the cost.
+        self._check_tp_ep_mask_consistency()
         return self._ft_has_global_unfinished_reqs(local_unfinished)
 
     def _ft_has_global_unfinished_reqs(self, local_unfinished: bool) -> bool:

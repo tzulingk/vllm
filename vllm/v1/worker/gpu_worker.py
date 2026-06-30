@@ -763,6 +763,32 @@ class Worker(WorkerBase):
             return None
         return mask.clone()
 
+    def query_ft_nccl_tp_mask(self) -> list[bool] | None:
+        """Return the FT-NCCL tensor-parallel collective's active mask, or None.
+
+        Symmetric to ``query_nixl_ep_mask`` but for the TP all-reduce: when
+        ``VLLM_USE_FT_NCCL_TP`` routes the TP all-reduce through the ft_nccl
+        backend, the ``FTProcessGroup`` records which TP peers responded to the
+        last collective. Returns a length ``tensor_parallel_size`` list of
+        bools (``True``=alive, ``False``=timed-out/absent) in TP-rank order, or
+        ``None`` when FT-NCCL TP is not in use / no FTProcessGroup exists yet.
+
+        Read via ``collective_rpc("query_ft_nccl_tp_mask")`` from the engine's
+        ``_check_tp_ep_mask_consistency`` so the TP collective's liveness view
+        can be cross-checked against the NIXL EP kernel mask (fail-fast on
+        divergence). ``get_result_mask()`` is the per-iteration GPU observation
+        (the FT barrier's agreed set is unused here since the TP path does not
+        call ``pre_sync``).
+        """
+        if not envs.VLLM_USE_FT_NCCL_TP:
+            return None
+        import ft_collective
+
+        pg = ft_collective.get_ft_process_group()
+        if pg is None:
+            return None
+        return [bool(x) for x in pg.get_result_mask()]
+
     def sleep(self, level: int = 1) -> None:
         free_bytes_before_sleep = torch.cuda.mem_get_info()[0]
 
