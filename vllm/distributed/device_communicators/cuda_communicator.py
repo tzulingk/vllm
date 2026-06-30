@@ -252,6 +252,20 @@ class CudaCommunicator(DeviceCommunicatorBase):
         )
 
     def all_reduce(self, input_):
+        # FT-NCCL TP: route the tensor-parallel all-reduce through the
+        # fault-tolerant "ft_nccl" backend so a dead TP peer is masked on a
+        # GPU-side timeout instead of hanging the forward. The input must be
+        # staged into a symmetric tensor (from pg.empty()) for FTProcessGroup
+        # to take the FT kernel path; a plain clone silently falls back to
+        # ordinary NCCL. See ft-nccl-tp-integration.md.
+        if envs.VLLM_USE_FT_NCCL_TP and self.unique_name.split(":")[0] == "tp":
+            import ft_collective
+
+            ft_pg = ft_collective.get_ft_process_group()
+            out = ft_pg.empty(*input_.shape, dtype=input_.dtype).reshape_as(input_)
+            out.copy_(input_)
+            torch.distributed.all_reduce(out, group=self.device_group)
+            return out
         # since currently we perform copy input -> symm_input -> out-of-place AR
         # return symm_output, we don't need to check if input is symmetric
         if self.pynccl_comm is not None and should_nccl_symm_mem_allreduce(

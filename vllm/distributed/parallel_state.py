@@ -1783,10 +1783,19 @@ def initialize_model_parallel(
         group_ranks = local_all_ranks.view(-1, tensor_model_parallel_size).unbind(0)
         group_ranks = [x.tolist() for x in group_ranks]
     # message queue broadcaster is only used in tensor model parallel group
+    tp_backend = backend
+    if envs.VLLM_USE_FT_NCCL_TP:
+        # Importing ft_collective registers the "ft_nccl" torch.distributed
+        # backend; it must happen before the TP group is created. Fail fast if
+        # the FT-NCCL libs are missing (see ft-nccl-tp-integration.md). TP is
+        # the only group routed through ft_nccl; world/DP/EP/PP keep `backend`.
+        import ft_collective  # noqa: F401
+
+        tp_backend = "ft_nccl"
     _TP = init_model_parallel_group(
         group_ranks,
         get_world_group().local_rank,
-        backend,
+        tp_backend,
         use_message_queue_broadcaster=True,
         group_name="tp",
     )

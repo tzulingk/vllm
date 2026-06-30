@@ -114,6 +114,7 @@ if TYPE_CHECKING:
     VLLM_DISABLED_KERNELS: list[str] = []
     VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE: bool = True
     VLLM_DISABLE_PYNCCL: bool = False
+    VLLM_USE_FT_NCCL_TP: bool = False
     VLLM_USE_OINK_OPS: bool = False
     VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD: bool = True
     VLLM_ROCM_USE_AITER: bool = False
@@ -1110,6 +1111,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DISABLE_PYNCCL": lambda: (
         os.getenv("VLLM_DISABLE_PYNCCL", "False").lower() in ("true", "1")
     ),
+    # Route the tensor-parallel all-reduce through the fault-tolerant NCCL
+    # ("ft_nccl") backend so a dead TP peer is masked on a GPU-side timeout
+    # instead of hanging the forward. Requires the FT-NCCL libs in the image
+    # (see ft-nccl-tp-integration.md). TP-only; a timeout is fail-fast.
+    "VLLM_USE_FT_NCCL_TP": lambda: bool(int(os.getenv("VLLM_USE_FT_NCCL_TP", "0"))),
     # Optional: enable external Oink custom ops (e.g., Blackwell RMSNorm).
     # Disabled by default.
     "VLLM_USE_OINK_OPS": lambda: (
