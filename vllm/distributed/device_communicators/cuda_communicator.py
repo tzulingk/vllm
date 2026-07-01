@@ -266,6 +266,31 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 "VLLM_USE_FT_NCCL_TP is set but no FTProcessGroup is registered "
                 "(the TP group was not created with the ft_nccl backend)."
             )
+            # One-time diagnostic: is self.device_group the Python FTProcessGroup
+            # or a c10d wrapper, and what would dist.all_reduce(group=device_group)
+            # dispatch to? (Answers whether the old path could have hit plain NCCL.)
+            if not getattr(self, "_ft_tp_dispatch_logged", False):
+                self._ft_tp_dispatch_logged = True
+                dg = self.device_group
+                try:
+                    be = dg._get_backend(self.device)  # type: ignore[union-attr]
+                    be_desc = f"{type(be).__module__}.{type(be).__name__}"
+                except Exception as e:  # diagnostic only; never break the forward
+                    be_desc = f"<introspection failed: {type(e).__name__}: {e}>"
+                logger.info(
+                    "FT NIXL EP TP dispatch [%s]: device_group=%s id=0x%x ; "
+                    "get_ft_process_group()=%s id=0x%x ; same_object=%s ; "
+                    "device_group._get_backend(%s)=%s . Routing via "
+                    "ft_pg.allreduce() directly to guarantee the FT kernel.",
+                    self.unique_name,
+                    f"{type(dg).__module__}.{type(dg).__name__}",
+                    id(dg),
+                    f"{type(ft_pg).__module__}.{type(ft_pg).__name__}",
+                    id(ft_pg),
+                    dg is ft_pg,
+                    self.device,
+                    be_desc,
+                )
             out = ft_pg.empty(*input_.shape, dtype=input_.dtype).reshape_as(input_)
             out.copy_(input_)
             # Guarantee the FT kernel path. `out` is symmetric (from empty()), so
