@@ -381,6 +381,13 @@ class MessageQueue:
         self.n_local_reader = n_local_reader
         n_remote_reader = n_reader - n_local_reader
         self.n_remote_reader = n_remote_reader
+        self.local_reader_ranks = local_reader_ranks
+        # FT NIXL EP: local reader indices marked dead. The writer's
+        # acquire_write "read by all" check excludes them so it does not block
+        # forever waiting for a dead TP worker to ack (which never happens; the
+        # ring fills and the writer would hang). Empty in the normal path, so
+        # zero behavior change unless mark_reader_dead() is called.
+        self._dead_local_readers: set[int] = set()
         self.shutting_down = False
         context = Context()
 
@@ -545,6 +552,14 @@ class MessageQueue:
         if self._spin_condition is not None:
             self._spin_condition.cancel()
 
+    def mark_reader_dead(self, local_reader_idx: int) -> None:
+        """FT NIXL EP: exclude a dead local reader from ``acquire_write``'s
+        "read by all" check so the writer does not block forever waiting for a
+        TP worker that has died. Idempotent; no-op without a local buffer or for
+        an out-of-range index."""
+        if self.buffer is not None and 0 <= local_reader_idx < self.n_local_reader:
+            self._dead_local_readers.add(local_reader_idx)
+
     @contextmanager
     def acquire_write(self, timeout: float | None = None):
         assert self._is_writer, "Only writers can acquire write"
@@ -555,9 +570,22 @@ class MessageQueue:
 
                 def check():
                     memory_fence()
-                    read_count = sum(metadata_buffer[1:])
                     written_flag = metadata_buffer[0]
-                    return not (written_flag and read_count != self.buffer.n_reader)
+                    if self._dead_local_readers:
+                        # FT NIXL EP: a dead TP worker never acks its read flag,
+                        # so count only live readers and compare against the
+                        # live total -- otherwise the writer blocks forever once
+                        # the ring fills.
+                        read_count = sum(
+                            metadata_buffer[1 + i]
+                            for i in range(self.buffer.n_reader)
+                            if i not in self._dead_local_readers
+                        )
+                        n_live = self.buffer.n_reader - len(self._dead_local_readers)
+                    else:
+                        read_count = sum(metadata_buffer[1:])
+                        n_live = self.buffer.n_reader
+                    return not (written_flag and read_count != n_live)
 
                 if SPINLOOP_EXT_ENABLED and not check():
                     spinloop(metadata_buffer, check, timeout=SPINLOOP_TIMEOUT_SECONDS)

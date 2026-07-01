@@ -113,6 +113,14 @@ class MultiprocExecutor(Executor):
         self._finalizer = weakref.finalize(self, self.shutdown)
         self.is_failed = False
         self.failure_callback: FailureCallback | None = None
+        # FT NIXL EP (TP>1): tolerate a single TP-worker death instead of
+        # tearing down the whole DP engine (which would waste the surviving
+        # GPU -- a 1-GPU fault costing the whole TP group). Tracks ranks whose
+        # worker process has died; the monitor marks them dead (broadcast MQ
+        # writer skips them) and collective_rpc skips their response. Only
+        # active under VLLM_USE_FT_NCCL_TP.
+        self._dead_worker_ranks: set[int] = set()
+        self._ft_tolerate_worker_death = envs.VLLM_USE_FT_NCCL_TP
 
         tp_size, pp_size, pcp_size = self._get_parallel_sizes()
         assert self.world_size == tp_size * pp_size * pcp_size, (
@@ -274,21 +282,42 @@ class MultiprocExecutor(Executor):
         # callback to inform the engine.
         def monitor_workers():
             sentinels = [h.proc.sentinel for h in workers]
-            died = multiprocessing.connection.wait(sentinels)
-            _self = self_ref()
-            if not _self or getattr(_self, "shutting_down", False):
-                logger.debug("MultiprocWorkerMonitor: shutdown already initiated")
+            by_sentinel = {h.proc.sentinel: (i, h) for i, h in enumerate(workers)}
+            while sentinels:
+                died = multiprocessing.connection.wait(sentinels)
+                _self = self_ref()
+                if not _self or getattr(_self, "shutting_down", False):
+                    logger.debug("MultiprocWorkerMonitor: shutdown already initiated")
+                    return
+                dead = [by_sentinel[s] for s in died if s in by_sentinel]
+
+                # FT NIXL EP: tolerate a single-TP-worker death -- keep the DP
+                # engine alive (degraded) so the surviving GPU stays in the EP
+                # all-to-all instead of losing the whole TP group. Mark the dead
+                # reader (broadcast writer skips it) and drop it from the
+                # response set; the engine's degraded handler errors in-flight
+                # requests and stops serving on this rank. Only while at least
+                # one worker survives.
+                n_dead_after = len(_self._dead_worker_ranks) + len(dead)
+                if _self._ft_tolerate_worker_death and n_dead_after < len(workers):
+                    for local_idx, h in dead:
+                        _self._mark_worker_dead(local_idx, h)
+                        sentinels.remove(h.proc.sentinel)
+                    continue
+
+                # Fatal: FT tolerance off, or the last worker died.
+                _self.is_failed = True
+                proc_name = dead[0][1].proc.name if dead else "<unknown>"
+                logger.error(
+                    "Worker proc %s died unexpectedly, shutting down executor.",
+                    proc_name,
+                )
+                _self.shutdown()
+                callback = _self.failure_callback
+                if callback is not None:
+                    _self.failure_callback = None
+                    callback()
                 return
-            _self.is_failed = True
-            proc_name = next(h.proc.name for h in workers if h.proc.sentinel == died[0])
-            logger.error(
-                "Worker proc %s died unexpectedly, shutting down executor.", proc_name
-            )
-            _self.shutdown()
-            callback = _self.failure_callback
-            if callback is not None:
-                _self.failure_callback = None
-                callback()
 
         if not inline:
             Thread(
@@ -297,6 +326,24 @@ class MultiprocExecutor(Executor):
             return
 
         monitor_workers()
+
+    def _mark_worker_dead(self, local_idx: int, handle) -> None:
+        """FT NIXL EP: record a dead TP worker (by its index in ``self.workers``,
+        which equals its ``rpc_broadcast_mq`` reader index and its
+        ``response_mqs`` index) and exclude it from the broadcast writer's
+        flow-control, so ``collective_rpc`` keeps working with the survivors --
+        the FT-NCCL TP all-reduce masks the dead peer in the forward."""
+        if local_idx in self._dead_worker_ranks:
+            return
+        self._dead_worker_ranks.add(local_idx)
+        logger.warning(
+            "FT NIXL EP: TP worker (idx %d, %s) died; keeping the DP engine "
+            "alive (degraded); broadcast writer + response collection skip it.",
+            local_idx,
+            handle.proc.name,
+        )
+        if self.rpc_broadcast_mq is not None:
+            self.rpc_broadcast_mq.mark_reader_dead(local_idx)
 
     def register_failure_callback(self, callback: FailureCallback):
         if self.is_failed:
@@ -371,11 +418,27 @@ class MultiprocExecutor(Executor):
             send_method = method
         else:
             send_method = cloudpickle.dumps(method, protocol=pickle.HIGHEST_PROTOCOL)
+        # FT NIXL EP: never route the reply to, or wait on, a dead TP worker.
+        # If the intended reply rank died, pick a surviving one before we tell
+        # the workers who should reply.
+        if output_rank is not None and output_rank in self._dead_worker_ranks:
+            live = [
+                i
+                for i in range(len(self.response_mqs))
+                if i not in self._dead_worker_ranks
+            ]
+            output_rank = live[0] if live else output_rank
         self.rpc_broadcast_mq.enqueue((send_method, args, kwargs, output_rank))
 
         response_mqs: Sequence[MessageQueue] = self.response_mqs
         if output_rank is not None:
             response_mqs = (response_mqs[output_rank],)
+        elif self._dead_worker_ranks:
+            response_mqs = [
+                mq
+                for i, mq in enumerate(response_mqs)
+                if i not in self._dead_worker_ranks
+            ]
 
         def get_response():
             responses = []
