@@ -291,23 +291,40 @@ class CudaCommunicator(DeviceCommunicatorBase):
                     self.device,
                     be_desc,
                 )
-            out = ft_pg.empty(*input_.shape, dtype=input_.dtype).reshape_as(input_)
-            out.copy_(input_)
-            # Guarantee the FT kernel path. `out` is symmetric (from empty()), so
-            # the only way FTProcessGroup would fall back to plain NCCL is
-            # numel > FT_NCCL_MAX_COUNT -- assert so that fails LOUDLY (raise
-            # FT_NCCL_MAX_COUNT) instead of silently using NCCL, which has no
-            # per-collective timeout and would hang the forward on a peer death.
-            assert ft_pg._is_ft_eligible_ar(out), (
-                "TP all-reduce would fall back to plain NCCL: "
-                f"{ft_pg._fallback_reason(out, 'allreduce')}. Raise "
-                "FT_NCCL_MAX_COUNT so the FT kernel path is used."
+            # Reuse ONE symmetric scratch buffer per dtype, allocated once while
+            # all peers are alive. ft_pg.empty() runs a COLLECTIVE
+            # ncclCommWindowRegister; calling it per all-reduce would hang on a
+            # dead peer (that collective has no timeout) BEFORE the FT kernel's
+            # own timeout can fire. Allocating at FT_NCCL_MAX_COUNT once + slicing
+            # avoids any per-call window registration.
+            numel = input_.numel()
+            scratch = getattr(self, "_ft_tp_scratch", None)
+            if scratch is None:
+                scratch = {}
+                self._ft_tp_scratch = scratch
+            buf = scratch.get(input_.dtype)
+            if buf is None:
+                assert numel <= ft_pg._max_count, (
+                    f"TP all-reduce numel {numel} exceeds FT_NCCL_MAX_COUNT "
+                    f"{ft_pg._max_count}; raise FT_NCCL_MAX_COUNT."
+                )
+                # Collective + one-time (all peers alive at first use).
+                buf = ft_pg.empty(ft_pg._max_count, dtype=input_.dtype)
+                scratch[input_.dtype] = buf
+            assert numel <= buf.numel(), (
+                f"TP all-reduce numel {numel} exceeds FT scratch {buf.numel()}; "
+                f"raise FT_NCCL_MAX_COUNT."
             )
-            # Call the FTProcessGroup override DIRECTLY: dist.all_reduce with the
-            # vLLM device_group handle can dispatch to the C++ ProcessGroupNCCL
-            # base (plain NCCL), not the Python FT override. Calling
-            # ft_pg.allreduce() is how the fork's own demo + our 2-GPU smoke test
-            # reach the FT kernel. wait() applies stream ordering.
+            # Slice at offset 0 -> same data_ptr as the registered window, so the
+            # FT kernel path is taken (asserted). Call ft_pg.allreduce() directly
+            # (dist.all_reduce with the vLLM device_group handle can dispatch to
+            # the C++ ProcessGroupNCCL base, not the Python FT override).
+            out = buf[:numel].reshape_as(input_)
+            out.copy_(input_)
+            assert ft_pg._is_ft_eligible_ar(out), (
+                "TP all-reduce not FT-eligible: "
+                f"{ft_pg._fallback_reason(out, 'allreduce')}"
+            )
             ft_pg.allreduce([out]).wait()
             return out
         # since currently we perform copy input -> symm_input -> out-of-place AR
