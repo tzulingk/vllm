@@ -47,7 +47,7 @@ vLLM `nvcr.io/nvidian/dynamo-dev/tzulingk-vllm:ftnccl-tp`.
 | 2-GPU smoke test | ✅ | fork NCCL loads in torch (runtime banner `2.30.0a17`, no ABI break), FT all-reduce correct via FT kernel. |
 | TP=2/DP2/EP4 serve + baseline coherence | ✅ | Paris / cold / 4 — TP all-reduce through the FT kernel is numerically **correct**. |
 | EP/TP active-mask consistency check | ✅ | commit `a879e917ae` — read FT-NCCL TP mask like nixl_ep's, crash on divergence. 60s/80 completions, 0 false crashes. |
-| Single-TP-peer survival (A+B+C executor tolerance) | 🔧 WIP | commit `ab8810598c` (gated). D (degraded + error in-flight) + E (router skip) + kill-test remain. |
+| Single-TP-peer survival (A–E) + kill-test | ✅ core goal met | `ab8810598c`/`2e547fc827`/`d12b074fc6`; guaranteed FT path `667b8fc708`+`84875a0d4e`; **cached-scratch fix `fcb2c2147a`**. Kill `DP0_TP1`: engine stays UP, degraded fires, survivor participates in EP, dp1 serves coherent. Slow — pending per-death mask-drop. |
 
 ### Serve config (TP=2)
 
@@ -93,28 +93,52 @@ down. So a 1-GPU fault costs **2 GPUs**. Single-TP-peer survival prevents that:
 - **E** router: `process_engine_outputs` reads `tp_degraded` → `dead_engine_indices` +
   `_abort_in_flight_for_dead_engine` (`d12b074fc6`).
 
-### Kill-test result (2026-07-01) — plumbing works, deeper blocker found
-Killed `DP0_TP1` at TP=2/DP2/EP4, both CUDA-graph and `--enforce-eager`:
-- ✅ **No teardown**: the RayExecutorV2 monitor tolerated it (`Ray TP worker idx 1 died;
-  keeping the DP engine alive (degraded)`); API server + surviving `DP0_TP0` stay alive.
-- ❌ **Deeper blocker**: the surviving worker pegs **GPU0 at 100%** stuck in the forward's
-  collective (blocked in `query_nixl_ep_mask → query_mask` on the wedged GPU). The FT
-  collective (TP all-reduce and/or the **intra-node** nixl EP all-to-all) **does not
-  fast-fail the mid-collective death of its same-TP-group peer** (>90s, past the 5s
-  timeouts) — so the engine's mask-query RPC blocks on it, the busy loop never reaches the
-  degraded handler (D), the router keeps routing to the stuck rank, nothing new serves, and
-  a cascade appears (dp1 declares the unresponsive survivor dead too).
-- **Same in `--enforce-eager`** → not a CUDA-graph-replay issue; the collective itself does
-  not abort a mid-flight intra-node peer death. Differs from the working **TP=1 DP-kill**
-  where the dead peer is a *separate* DP rank that nixl masks; here the dead peer is
-  intra-node in the *same* TP group, which the current FT-NCCL TP all-reduce + intra-node
-  nixl path do not fast-fail.
+### Kill-test — three iterations to the core goal (2026-07-01)
+Kill `DP0_TP1` at TP=2/DP2/EP4, `--enforce-eager` (also reproduced under CUDA graphs).
+Each run peeled off one blocker; the third meets the core FT goal.
 
-**Remaining (kernel-level, beyond the vLLM plumbing):** make the survivor's in-flight
-collective abort/time-out on a mid-collective peer death — FT-NCCL TP all-reduce timeout
-firing mid-collective for a killed intra-node peer, the nixl EP all-to-all fast-failing an
-intra-node dead EP peer, or an `ncclCommAbort`-style abort on the monitor's death signal —
-and keep EP membership consistent (dp1 must keep the survivor EP0). Then bake into images.
+**Run 1 — GPU0 pegged at 100%, never returns (the all-reduce wasn't on the FT kernel).**
+The surviving worker spun forever in the forward's collective, past the 5s timeout.
+Root cause: the TP all-reduce staged into `pg.empty()` then called
+`dist.all_reduce(out, group=self.device_group)`. The dispatch diagnostic (`84875a0d4e`)
+proved `self.device_group` is the **C++ c10d `ProcessGroup` wrapper**, not the Python
+`FTProcessGroup` (`same_object=False`) — so `dist.all_reduce` could dispatch to the C++
+`ProcessGroupNCCL` base (plain NCCL, **no timeout**) rather than the Python FT override.
+Fix: call `ft_pg.allreduce([out]).wait()` **directly** + assert FT-eligibility so a silent
+NCCL fallback fails loudly (`667b8fc708`). This is why the earlier "collective does not
+fast-fail" symptom appeared — it was plain NCCL, which never had a timeout.
+
+**Run 2 — GPU0 now idle (0%) but engine still CPU-blocked (per-call window registration).**
+With the FT path guaranteed, the 100% peg vanished. But the survivor now hung in
+`ft_pg.empty() → ncclCommWindowRegister` (py-spy: `window_register (ft_wrapper.py:407)` ←
+`empty (ft_process_group.py:571)` ← `cuda_communicator.py`). `empty()` runs a **collective**
+window registration on **every** all-reduce; that collective has no timeout, so it wedged
+on the dead peer *before* the FT all-reduce kernel (which does have the timeout) ever ran.
+Fix (`fcb2c2147a`): allocate **one** `FT_NCCL_MAX_COUNT`-sized symmetric buffer per dtype
+**once** (while all peers are alive) and reuse offset-0 slices — no per-call window
+registration, so a death now reaches `ft_pg.allreduce()` where the timeout lives.
+
+**Run 3 — core goal met.** With the cached scratch buffer, killing `DP0_TP1`:
+- ✅ **Engine does not crash** — API server + surviving `DP0_TP0` stay UP (the whole point:
+  a 1-GPU fault must not cost 2 GPUs). Monitor logs `Ray TP worker (idx 1) died; keeping
+  the DP engine alive (degraded)`.
+- ✅ **Degraded handler (D) fires at ~t+5s** — in-flight errored, `tp_degraded` published.
+- ✅ **Router skips the degraded rank (E)** — post-kill completions route to dp1 and are
+  **coherent** (`Tokyo`, `Paris`); new `200 OK`s keep landing.
+- ✅ **Survivor participates in the MoE/EP forward** — py-spy shows `DP0_TP0` cycling through
+  the forward (rope → MLA attention → …), *not* wedged in a collective. This is the
+  required behavior: stop routing to the dead DP rank, but keep its surviving GPU in the EP
+  all-to-all for the healthy DP rank.
+- ⚠️ **Slow** (first post-kill completions ~30s, then faster): the degraded survivor
+  re-attempts the dead peer on **every** TP all-reduce, eating the 5s FT timeout per layer,
+  because the FT active mask isn't persistently updated to drop the dead peer.
+
+**Remaining (optimization, not a correctness blocker): per-death FT mask-drop.** On the
+monitor's death signal, call `handle_set_mask(survivors)` / `pre_sync()` **once** so
+subsequent TP all-reduces skip the dead peer instead of timing out on it every layer. This
+is per-*death*, not per-layer (a store barrier per layer would wreck throughput) — see
+FT-NCCL author message Q#1/Q#3 (`/tmp/ft-nccl-author-message.md`). Then bake all fixes into
+the images.
 
 ---
 
