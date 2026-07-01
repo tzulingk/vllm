@@ -27,6 +27,75 @@ CR for IMEX channels. `kill -9` of one DP engine actor:
 
 ---
 
+## 2026-06-30 — FT-NCCL TP all-reduce (TP>1) — DYN-3314
+
+Making the **tensor-parallel all-reduce** fault-tolerant so FT NIXL EP can run **TP>1**.
+FT-gloo can't cover it (per-layer, GPU-resident, bandwidth-bound), so the TP all-reduce
+is routed through **FT-NCCL** (a fork of NCCL whose device kernels take a timeout + an
+active mask). Full design: [`ft-nccl-tp-integration.md`](./ft-nccl-tp-integration.md).
+
+**Branch:** `ft-nixl-ep-ftnccl-tp` (`tzulingk/vllm`). **FT-NCCL fork:** `tzulingk/nccl`
+@ `fault-tolerant-allgather`. **Images:** libs `nvcr.io/nvidian/dynamo-dev/tzulingk-ftnccl-libs:cuda13-sm100`,
+vLLM `nvcr.io/nvidian/dynamo-dev/tzulingk-vllm:ftnccl-tp`.
+
+### Status
+
+| Step | Status | Notes |
+|---|---|---|
+| Build FT-NCCL fork libs (arm64/**sm_100**) | ✅ | `libnccl.so.2.30.0a17` (NCCL 2.30 + GPUNetIO 2.0 + FT barrier-timeout) + `libft_collective.so` + `ft_collective` pkg. DOCA vendored in-tree; TP uses LSA/NVLink. |
+| vLLM integration (gated `VLLM_USE_FT_NCCL_TP`) | ✅ | commit `31dbac63a2` — TP group backend `ft_nccl`, stage TP all-reduce into `pg.empty()` in `CudaCommunicator.all_reduce`. |
+| 2-GPU smoke test | ✅ | fork NCCL loads in torch (runtime banner `2.30.0a17`, no ABI break), FT all-reduce correct via FT kernel. |
+| TP=2/DP2/EP4 serve + baseline coherence | ✅ | Paris / cold / 4 — TP all-reduce through the FT kernel is numerically **correct**. |
+| EP/TP active-mask consistency check | ✅ | commit `a879e917ae` — read FT-NCCL TP mask like nixl_ep's, crash on divergence. 60s/80 completions, 0 false crashes. |
+| Single-TP-peer survival (A+B+C executor tolerance) | 🔧 WIP | commit `ab8810598c` (gated). D (degraded + error in-flight) + E (router skip) + kill-test remain. |
+
+### Serve config (TP=2)
+
+Image `tzulingk-vllm:ftnccl-tp`; in the pod install **ray==2.55.1** + **nixl-cu13==1.1.0**
+(`--force-reinstall --no-deps`), then `serve-eplb-tp2.sh`:
+```
+LD_PRELOAD=/ftnccl/nccl/lib/libnccl.so.2  VLLM_USE_FT_NCCL_TP=1  FT_TIMEOUT_US=5000000
+vllm serve deepseek-ai/DeepSeek-V2-Lite --tensor-parallel-size 2 --data-parallel-size 2 \
+  --data-parallel-backend ray --enable-expert-parallel --all2all-backend nixl_ep \
+  --enable-eplb --enable-elastic-ep --disable-custom-all-reduce \
+  --eplb-config '{"num_redundant_experts":64,"use_async":false,"step_interval":100000000,...}' \
+  --attention-config '{"backend":"TRITON_MLA","mla_prefill_backend":"TRTLLM_RAGGED"}' \
+  --gpu-memory-utilization 0.5 --max-num-seqs 16 --max-model-len 4096 --trust-remote-code
+```
+Notes: `LD_PRELOAD` the fork libnccl at **container** level so Ray TP workers inherit it
+(else torch's bundled 2.28.9 co-loads → conflict). **Do NOT set `VLLM_DISABLE_PYNCCL`** —
+it breaks EPLB's pynccl communicator; the TP all-reduce is routed to `ft_nccl` by a
+short-circuit at the top of `all_reduce`, so the "disable other paths" knobs are
+unnecessary. `--enable-elastic-ep` **requires** `--enable-eplb`, so "EPLB off" = quiescent
+(`step_interval=1e8`) — the EPLB expert-rearrange hangs over the fork NCCL at TP=2 (pynccl
+P2P), a separate follow-up.
+
+### Fixes surfaced bringing up TP=2
+- `FTProcessGroup` pinned `rank % device_count` → clobbered the worker's device at TP>1
+  ("embedding two different devices cuda:0/cuda:2"). Fixed to `current_device()` (fork `81924182a`).
+- `No module named ray` / nixl 1.3.0 → install ray 2.55.1 + nixl-cu13 1.1.0 in the pod.
+- `pkill -f "vllm serve"` self-matches the exec shell (exit 137/143) — kill by PID.
+
+### Key finding — a TP-worker death is 2-GPU loss at TP>1
+At TP=1 each DP rank is a single **in-process** worker (UniProcExecutor, no broadcast MQ),
+so a GPU loss = a whole-DP-rank loss the existing dead-engine route-around handles. At
+**TP>1** the DP engine drives separate worker processes over a shared-memory broadcast
+`MessageQueue`; a `kill -9` of one TP worker (a) makes the writer block on the dead
+reader's un-acked flag and (b) trips the worker-monitor → the whole DP engine is torn
+down. So a 1-GPU fault costs **2 GPUs**. Single-TP-peer survival prevents that:
+- **A** `shm_broadcast`: `mark_reader_dead()` + `acquire_write` excludes dead readers.
+- **B** monitor: on one TP-worker death, mark dead + keep the engine (tear down only if last).
+- **C** `collective_rpc`: reassign dead reply-rank + skip dead response queues.
+- **D (todo)** engine → degraded: error in-flight (retryable, **same as the TP=1 nixl_ep
+  case**) + keep `execute_dummy_batch` for EP participation.
+- **E (todo)** router: skip the degraded rank.
+Then kill-test (kill a TP worker → engine survives degraded, in-flight errored, survivor
+stays in EP, other DP rank serves) + bake into images. A clean process-kill is caught by
+the executor RPC before the FT-NCCL mask diverges, so the mask-consistency crash path is
+really for a **GPU-stall** injection (process-alive, GPU-stuck) — the natural next test.
+
+---
+
 ## TL;DR of progress
 
 | Step | Status | Notes |
