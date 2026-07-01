@@ -42,6 +42,14 @@ from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
 
+# Diagnostic (gated by VLLM_USE_FT_NCCL_TP): count the tokens THIS EP rank
+# receives for its local experts after the dispatch all-to-all. Throttled; the
+# Ray worker-name prefix (e.g. Worker_DP0_TP0_EP0) identifies which rank/GPU
+# emitted the line. Used to confirm a degraded DP rank's surviving GPU still
+# receives MoE tokens from the healthy DP ranks.
+_FT_MOE_TOKENS_LOG_CTR = 0
+_FT_MOE_TOKENS_LOG_EVERY = 200
+
 #
 # This file defines a set of base classes used to make MoE kernels more modular.
 # The goal is to be able to utilize different communication mechanisms with
@@ -1407,6 +1415,23 @@ class FusedMoEKernelModularImpl:
             expert_map,
             apply_router_weight_on_input,
         )
+
+        if envs.VLLM_USE_FT_NCCL_TP and expert_tokens_meta is not None:
+            global _FT_MOE_TOKENS_LOG_CTR
+            _FT_MOE_TOKENS_LOG_CTR += 1
+            if _FT_MOE_TOKENS_LOG_CTR % _FT_MOE_TOKENS_LOG_EVERY == 0:
+                ent_cpu = expert_tokens_meta.expert_num_tokens_cpu
+                if ent_cpu is None:
+                    ent_cpu = expert_tokens_meta.expert_num_tokens.cpu()
+                counts = ent_cpu.tolist()
+                logger.info(
+                    "FT NIXL EP MoE: received %d tokens for %d local experts "
+                    "(%d active; per-expert=%s)",
+                    int(sum(counts)),
+                    len(counts),
+                    sum(1 for c in counts if c > 0),
+                    counts,
+                )
 
         # Stash the original unquantized hidden states on the LoRA context
         # so apply_w13_lora sees correct-magnitude activations instead of
