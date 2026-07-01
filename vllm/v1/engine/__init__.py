@@ -242,6 +242,12 @@ class EngineCoreOutputs(
     # In DP case, used to signal that a request was received for an
     # "old" wave, so the next wave needs to be started in other engines.
     start_wave: int | None = None
+    # FT NIXL EP (TP>1): set to this engine's index when one of its TP workers
+    # has died. The engine stays alive (degraded) so its surviving GPU keeps
+    # participating in the EP all-to-all, but its own outputs are unreliable
+    # (missing a TP shard). The dispatcher must stop routing new requests here
+    # and error the in-flight ones (retryable), same as for a dead engine.
+    tp_degraded: int | None = None
 
     def __post_init__(self):
         if self.timestamp == 0.0:

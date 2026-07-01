@@ -1634,6 +1634,23 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             for req_id in outputs.finished_requests:
                 self.reqs_in_flight.pop(req_id, None)
 
+        # FT NIXL EP (TP>1): a degraded engine (one of its TP workers died) stays
+        # alive to keep its surviving GPU in the EP all-to-all, but its own
+        # outputs are unreliable -- route around it and error its in-flight
+        # requests (retryable), exactly like a dead engine. Reuses the
+        # dead-engine skip (get_core_engine_for_request) + abort path.
+        if outputs.tp_degraded is not None:
+            idx = outputs.tp_degraded
+            if idx not in self.dead_engine_indices:
+                self.dead_engine_indices.add(idx)
+                logger.warning(
+                    "FT NIXL EP: DP engine %d reported degraded (a TP worker "
+                    "died); dispatcher will skip it and error its in-flight "
+                    "requests (clients retry). The engine stays alive for EP.",
+                    idx,
+                )
+                self._abort_in_flight_for_dead_engine(idx)
+
     @staticmethod
     async def eep_process_engine_core_notification(
         self: "DPLBAsyncMPClient", notification_data: tuple[str, int]

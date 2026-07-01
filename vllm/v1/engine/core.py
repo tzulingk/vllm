@@ -1978,6 +1978,10 @@ class DPEngineCoreProc(EngineCoreProc):
         while self._handle_shutdown():
             # 1) Poll the input queue until there is work to do.
             self._process_input_queue()
+            # FT NIXL EP (TP>1): if one of our TP workers died, go degraded --
+            # error in-flight requests (retryable) + tell the dispatcher to route
+            # around us; we keep dummy-stepping below to stay in the EP all-to-all.
+            self._maybe_handle_own_tp_degradation()
             # Publish request counts before and after GPU step to ensure freshness.
             self._maybe_publish_request_counts()
 
@@ -1989,7 +1993,13 @@ class DPEngineCoreProc(EngineCoreProc):
                     self.process_input_queue_block = True
                     self.eep_scaling_state = None
 
-            executed = self._process_engine_step()
+            if getattr(self, "_tp_degraded", False):
+                # Degraded: never run real work (TP math is incomplete without
+                # the dead shard); fall through to execute_dummy_batch so the
+                # surviving GPU keeps participating in the EP all-to-all.
+                executed = False
+            else:
+                executed = self._process_engine_step()
             self._maybe_publish_request_counts()
 
             local_unfinished_reqs = self.scheduler.has_unfinished_requests()
@@ -2186,6 +2196,45 @@ class DPEngineCoreProc(EngineCoreProc):
             )
             return True
         return bool(flag.item())
+
+    def _maybe_handle_own_tp_degradation(self) -> None:
+        """FT NIXL EP (TP>1): if one of THIS engine's TP workers died, the engine
+        is degraded -- its TP all-reduce is missing a shard, so its own outputs
+        are unreliable. Signal the dispatcher to route around us (once) and error
+        our in-flight requests (retryable, same as the TP=1 nixl_ep dead-engine
+        case). We keep looping: with no requests to serve, the busy loop's idle
+        path runs execute_dummy_batch, keeping the surviving GPU in the EP
+        all-to-all -- so a 1-GPU fault costs 1 GPU, not the whole TP group.
+
+        The executor keeps the engine alive on a single TP-worker death (see the
+        MultiprocExecutor worker monitor); this is the engine-side reaction.
+        """
+        dead = getattr(self.model_executor, "_dead_worker_ranks", None)
+        if not dead:
+            return
+        if not getattr(self, "_tp_degraded", False):
+            self._tp_degraded = True
+            logger.warning(
+                "FT NIXL EP: dp_rank=%d degraded -- TP worker(s) %s died; "
+                "erroring in-flight requests (retryable) and withdrawing from "
+                "serving; the surviving GPU stays in the EP all-to-all.",
+                self.dp_rank,
+                sorted(dead),
+            )
+            # Tell the dispatcher to route around this engine (once).
+            self.output_queue.put_nowait(
+                (-1, EngineCoreOutputs(tp_degraded=self.dp_rank))
+            )
+        # Error in-flight (RUNNING) requests while degraded: their forward pass
+        # would use the incomplete TP all-reduce, so mark them FINISHED_ERROR
+        # (retryable) rather than return silently-wrong output.
+        running_reqs = self.scheduler.running  # type: ignore[attr-defined]
+        running_ids = [req.request_id for req in running_reqs]
+        if running_ids:
+            errored = self.scheduler.finish_requests(
+                running_ids, RequestStatus.FINISHED_ERROR
+            )
+            self._send_error_outputs(errored)
 
     def _maybe_recover_on_newly_dead_peers(self) -> None:
         """Trigger survivor recovery when the kernel mask reports a new
