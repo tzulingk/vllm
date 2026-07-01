@@ -262,9 +262,28 @@ class CudaCommunicator(DeviceCommunicatorBase):
             import ft_collective
 
             ft_pg = ft_collective.get_ft_process_group()
+            assert ft_pg is not None, (
+                "VLLM_USE_FT_NCCL_TP is set but no FTProcessGroup is registered "
+                "(the TP group was not created with the ft_nccl backend)."
+            )
             out = ft_pg.empty(*input_.shape, dtype=input_.dtype).reshape_as(input_)
             out.copy_(input_)
-            torch.distributed.all_reduce(out, group=self.device_group)
+            # Guarantee the FT kernel path. `out` is symmetric (from empty()), so
+            # the only way FTProcessGroup would fall back to plain NCCL is
+            # numel > FT_NCCL_MAX_COUNT -- assert so that fails LOUDLY (raise
+            # FT_NCCL_MAX_COUNT) instead of silently using NCCL, which has no
+            # per-collective timeout and would hang the forward on a peer death.
+            assert ft_pg._is_ft_eligible_ar(out), (
+                "TP all-reduce would fall back to plain NCCL: "
+                f"{ft_pg._fallback_reason(out, 'allreduce')}. Raise "
+                "FT_NCCL_MAX_COUNT so the FT kernel path is used."
+            )
+            # Call the FTProcessGroup override DIRECTLY: dist.all_reduce with the
+            # vLLM device_group handle can dispatch to the C++ ProcessGroupNCCL
+            # base (plain NCCL), not the Python FT override. Calling
+            # ft_pg.allreduce() is how the fork's own demo + our 2-GPU smoke test
+            # reach the FT kernel. wait() applies stream ordering.
+            ft_pg.allreduce([out]).wait()
             return out
         # since currently we perform copy input -> symm_input -> out-of-place AR
         # return symm_output, we don't need to check if input is symmetric
