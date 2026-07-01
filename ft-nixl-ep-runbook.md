@@ -83,16 +83,38 @@ so a GPU loss = a whole-DP-rank loss the existing dead-engine route-around handl
 `MessageQueue`; a `kill -9` of one TP worker (a) makes the writer block on the dead
 reader's un-acked flag and (b) trips the worker-monitor → the whole DP engine is torn
 down. So a 1-GPU fault costs **2 GPUs**. Single-TP-peer survival prevents that:
-- **A** `shm_broadcast`: `mark_reader_dead()` + `acquire_write` excludes dead readers.
-- **B** monitor: on one TP-worker death, mark dead + keep the engine (tear down only if last).
-- **C** `collective_rpc`: reassign dead reply-rank + skip dead response queues.
-- **D (todo)** engine → degraded: error in-flight (retryable, **same as the TP=1 nixl_ep
-  case**) + keep `execute_dummy_batch` for EP participation.
-- **E (todo)** router: skip the degraded rank.
-Then kill-test (kill a TP worker → engine survives degraded, in-flight errored, survivor
-stays in EP, other DP rank serves) + bake into images. A clean process-kill is caught by
-the executor RPC before the FT-NCCL mask diverges, so the mask-consistency crash path is
-really for a **GPU-stall** injection (process-alive, GPU-stuck) — the natural next test.
+- **A** `shm_broadcast`: `mark_reader_dead()` + `acquire_write` excludes dead readers (`ab8810598c`).
+- **B** monitor: on one TP-worker death, mark dead + keep the engine (tear down only if
+  last) — in **both** `MultiprocExecutor` and `RayExecutorV2` (`ab8810598c`, `2e547fc827`).
+- **C** `collective_rpc`: reassign dead reply-rank + skip dead response queues (`ab8810598c`).
+- **D** engine → degraded: `_maybe_handle_own_tp_degradation` errors in-flight (retryable,
+  **same as the TP=1 nixl_ep case**) + publishes `EngineCoreOutputs.tp_degraded` + dummy-
+  steps for EP (`d12b074fc6`).
+- **E** router: `process_engine_outputs` reads `tp_degraded` → `dead_engine_indices` +
+  `_abort_in_flight_for_dead_engine` (`d12b074fc6`).
+
+### Kill-test result (2026-07-01) — plumbing works, deeper blocker found
+Killed `DP0_TP1` at TP=2/DP2/EP4, both CUDA-graph and `--enforce-eager`:
+- ✅ **No teardown**: the RayExecutorV2 monitor tolerated it (`Ray TP worker idx 1 died;
+  keeping the DP engine alive (degraded)`); API server + surviving `DP0_TP0` stay alive.
+- ❌ **Deeper blocker**: the surviving worker pegs **GPU0 at 100%** stuck in the forward's
+  collective (blocked in `query_nixl_ep_mask → query_mask` on the wedged GPU). The FT
+  collective (TP all-reduce and/or the **intra-node** nixl EP all-to-all) **does not
+  fast-fail the mid-collective death of its same-TP-group peer** (>90s, past the 5s
+  timeouts) — so the engine's mask-query RPC blocks on it, the busy loop never reaches the
+  degraded handler (D), the router keeps routing to the stuck rank, nothing new serves, and
+  a cascade appears (dp1 declares the unresponsive survivor dead too).
+- **Same in `--enforce-eager`** → not a CUDA-graph-replay issue; the collective itself does
+  not abort a mid-flight intra-node peer death. Differs from the working **TP=1 DP-kill**
+  where the dead peer is a *separate* DP rank that nixl masks; here the dead peer is
+  intra-node in the *same* TP group, which the current FT-NCCL TP all-reduce + intra-node
+  nixl path do not fast-fail.
+
+**Remaining (kernel-level, beyond the vLLM plumbing):** make the survivor's in-flight
+collective abort/time-out on a mid-collective peer death — FT-NCCL TP all-reduce timeout
+firing mid-collective for a killed intra-node peer, the nixl EP all-to-all fast-failing an
+intra-node dead EP peer, or an `ncclCommAbort`-style abort on the monitor's death signal —
+and keep EP membership consistent (dp1 must keep the survivor EP0). Then bake into images.
 
 ---
 
