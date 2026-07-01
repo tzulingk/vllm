@@ -266,6 +266,11 @@ class RayExecutorV2(MultiprocExecutor):
         self.failure_callback = None
         self.shutting_down = False
         self.shutdown_lock = threading.Lock()
+        # FT NIXL EP (TP>1): tolerate a single TP-worker death instead of tearing
+        # down the whole DP engine (see start_worker_monitor + collective_rpc,
+        # inherited from MultiprocExecutor). Only active under VLLM_USE_FT_NCCL_TP.
+        self._dead_worker_ranks: set[int] = set()
+        self._ft_tolerate_worker_death = envs.VLLM_USE_FT_NCCL_TP
 
         # Step 1: Initialize Ray cluster and retrieve placement group
         if ray is None:
@@ -458,9 +463,14 @@ class RayExecutorV2(MultiprocExecutor):
             raise RuntimeError("Ray workers have not started successfully.")
 
         self_ref = weakref.ref(self)
-        ref_to_rank = {
-            h.run_ref: h.rank for h in self.ray_worker_handles if h.run_ref is not None
+        # Index by POSITION in ray_worker_handles == response_mqs index ==
+        # rpc_broadcast_mq reader index; FT NIXL EP marks/skips by this index.
+        ref_to_idx = {
+            h.run_ref: i
+            for i, h in enumerate(self.ray_worker_handles)
+            if h.run_ref is not None
         }
+        n_workers = len(run_refs)
 
         def _should_stop() -> bool:
             executor = self_ref()
@@ -481,14 +491,40 @@ class RayExecutorV2(MultiprocExecutor):
                 if not done or _should_stop():
                     continue
 
-                dead_ranks = [ref_to_rank[r] for r in done]
+                dead_idxs = [ref_to_idx[r] for r in done]
                 executor = self_ref()
                 if not executor:
                     return
+
+                # FT NIXL EP: tolerate a single TP-worker death -- keep the DP
+                # engine alive (degraded) so the surviving GPU stays in the EP
+                # all-to-all instead of losing the whole TP group. Mark the dead
+                # reader (broadcast writer + response collection skip it); the
+                # engine's degraded handler errors in-flight requests and
+                # withdraws from serving. Only while at least one worker survives.
+                if (
+                    executor._ft_tolerate_worker_death
+                    and len(executor._dead_worker_ranks | set(dead_idxs)) < n_workers
+                ):
+                    for r in done:
+                        idx = ref_to_idx[r]
+                        if idx not in executor._dead_worker_ranks:
+                            executor._dead_worker_ranks.add(idx)
+                            logger.warning(
+                                "FT NIXL EP: Ray TP worker (idx %d) died; keeping "
+                                "the DP engine alive (degraded); broadcast writer "
+                                "+ response collection skip it.",
+                                idx,
+                            )
+                            if executor.rpc_broadcast_mq is not None:
+                                executor.rpc_broadcast_mq.mark_reader_dead(idx)
+                        run_refs.remove(r)
+                    continue
+
                 executor.is_failed = True
                 logger.error(
-                    "RayWorkerProc rank=%s died unexpectedly, shutting down executor.",
-                    dead_ranks,
+                    "RayWorkerProc idx=%s died unexpectedly, shutting down executor.",
+                    dead_idxs,
                 )
                 executor.shutdown()
                 if executor.failure_callback is not None:
