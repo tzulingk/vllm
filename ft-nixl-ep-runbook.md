@@ -47,7 +47,7 @@ vLLM `nvcr.io/nvidian/dynamo-dev/tzulingk-vllm:ftnccl-tp`.
 | 2-GPU smoke test | ✅ | fork NCCL loads in torch (runtime banner `2.30.0a17`, no ABI break), FT all-reduce correct via FT kernel. |
 | TP=2/DP2/EP4 serve + baseline coherence | ✅ | Paris / cold / 4 — TP all-reduce through the FT kernel is numerically **correct**. |
 | EP/TP active-mask consistency check | ✅ | commit `a879e917ae` — read FT-NCCL TP mask like nixl_ep's, crash on divergence. 60s/80 completions, 0 false crashes. |
-| Single-TP-peer survival (A–E) + kill-test | ✅ core goal met | `ab8810598c`/`2e547fc827`/`d12b074fc6`; guaranteed FT path `667b8fc708`+`84875a0d4e`; **cached-scratch fix `fcb2c2147a`**. Kill `DP0_TP1`: engine stays UP, degraded fires, survivor participates in EP, dp1 serves coherent. Slow — pending per-death mask-drop. |
+| Single-TP-peer survival (A–E) + kill-test | 🔧 WIP — cascade root-caused | `ab8810598c`/`2e547fc827`/`d12b074fc6`; FT path `667b8fc708`+`84875a0d4e`; cached-scratch `fcb2c2147a`; H1/H2 `558db81296`. One kill-test looked good but a later run **cascaded (2-GPU loss)**: a raw TP **all-gather** (not FT-routed) hung 600s → c10d watchdog **SIGABRTs the survivor**. All-gather FT fix in progress — routes it through FT (no more 600s watchdog) but **garbles output** (correctness bug) + 3× warmup. See 2026-07-02 note below. |
 
 ### Serve config (TP=2)
 
@@ -139,6 +139,50 @@ subsequent TP all-reduces skip the dead peer instead of timing out on it every l
 is per-*death*, not per-layer (a store barrier per layer would wreck throughput) — see
 FT-NCCL author message Q#1/Q#3 (`/tmp/ft-nccl-author-message.md`). Then bake all fixes into
 the images.
+
+### 2026-07-02 — "core goal met" was optimistic; a raw TP all-gather cascades (2-GPU loss)
+
+Re-running the kill many times showed Run 3's happy outcome is **not reliable**: the degraded
+survivor's fate depends on where the kill lands, and one run **cascaded to lose the whole DP
+rank (2 GPUs)** — the exact thing FT is meant to prevent.
+
+**H1/H2 plumbing (`558db81296`, gated by `VLLM_USE_FT_NCCL_TP`).**
+- **H2 (unwedge):** `MultiprocExecutor.get_response` made interruptible so a `collective_rpc`
+  whose `output_rank` is the dead worker aborts instead of blocking forever; the busy loop
+  catches it and degrades.
+- **H1 (uncrawl):** on degrade, `collective_rpc("refresh_ft_nccl_tp_membership")` runs
+  `pre_sync()` once to drop the dead peer from the FT mask (targets the per-layer 5s crawl).
+
+**But the kill-test still lost 2 GPUs — root cause verified in the log:**
+```
+16:19:20  Watchdog caught collective timeout: WorkNCCL(OpType=_ALLGATHER_BASE, NumelIn=2048,
+          Timeout(ms)=600000) ran for 600021 ms      # 600s = DEFAULT c10d watchdog, not 5s FT
+16:20:20  ProcessGroupNCCL: "we are taking the entire process down"   # SIGABRTs the survivor
+16:20:21  survivor EP0 dies -> executor teardown -> engine crashes -> whole dp0 down
+```
+The forward does a **TP all-gather** (`_ALLGATHER_BASE`, 2-rank TP group, `NumelIn=2048`=hidden).
+Our integration only routed the all-**reduce** through FT; the all-**gather** went through
+`FTProcessGroup.allgather` with a non-symmetric input → **raw `super().allgather()` (plain
+NCCL, no 5s timeout)** → hung 600s on dead EP1 → the **c10d watchdog aborted the survivor** →
+cascade. So H1/H2 (all-reduce + executor RPC) were aimed at the wrong collective. This also
+explains the run-to-run variance (whether an in-flight raw all-gather straddled the kill).
+
+**Key insight: any TP-group collective that falls back to raw NCCL is a 600s-watchdog death
+trap** — the watchdog aborts the *survivor*, turning a 1-GPU fault into a whole-DP-rank loss.
+`FT_TIMEOUT_US=5s` only applies to collectives actually on the FT kernel.
+
+**All-gather FT fix attempt — routes it through FT, but NOT yet numerically correct.** Added an
+FT short-circuit to `CudaCommunicator.all_gather` (bit-cast → symmetric stage → `ft_pg.allgather`
+→ bit-cast back). Result: FT path taken (0 fallbacks, **no more 600s watchdog**), **but baseline
+output is garbled** — deterministic + partial (`2+2 → "4."` correct then drifts; other prompts
+corrupted with replacement chars) — and **warmup ~3x slower (293s)**. So the all-gather FT path
+has a **data-correctness bug** (prime suspect: the FT 16-byte padded recv stride vs the packed
+`chunk()` output layout, or the `view(float32)`/`movedim` reshape not matching the base
+`all_gather` byte layout). **The kill-test is moot until the forward is numerically correct.**
+
+Also to fix: H1 delivery — `self.collective_rpc(...)` from the engine raises
+`AssertionError: collective_rpc should not be called on follower node` once the executor tears
+down; the mask refresh should be **worker-local**, not an engine-issued RPC.
 
 ---
 
