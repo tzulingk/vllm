@@ -10,7 +10,7 @@ import time
 import traceback
 import weakref
 from collections import deque
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from concurrent.futures import Future, InvalidStateError
 from contextlib import suppress
 from dataclasses import dataclass
@@ -98,6 +98,12 @@ class FutureWrapper(Future):
         except Exception as e:
             with suppress(InvalidStateError):
                 self.set_exception(e)
+
+
+# FT NIXL EP: when tolerating TP-worker death, poll a response queue in short
+# steps so a worker the monitor marks dead mid-wait aborts the wait (rather than
+# blocking the engine forever) within ~this many seconds.
+_FT_DEAD_POLL_S = 1.0
 
 
 class MultiprocExecutor(Executor):
@@ -430,26 +436,60 @@ class MultiprocExecutor(Executor):
             output_rank = live[0] if live else output_rank
         self.rpc_broadcast_mq.enqueue((send_method, args, kwargs, output_rank))
 
-        response_mqs: Sequence[MessageQueue] = self.response_mqs
+        # Track the awaited (rank, mq) pairs so that, with FT worker-death
+        # tolerance on, a TP worker that dies mid-wait aborts the wait instead
+        # of blocking the engine forever. On an in-flight RPC whose output_rank
+        # was the dying worker, the live peer never replied either (it wasn't
+        # the output_rank), so there is nothing to fall back to -- aborting lets
+        # the engine's busy loop go degraded.
         if output_rank is not None:
-            response_mqs = (response_mqs[output_rank],)
+            awaited = [(output_rank, self.response_mqs[output_rank])]
         elif self._dead_worker_ranks:
-            response_mqs = [
-                mq
-                for i, mq in enumerate(response_mqs)
+            awaited = [
+                (i, mq)
+                for i, mq in enumerate(self.response_mqs)
                 if i not in self._dead_worker_ranks
             ]
+        else:
+            awaited = list(enumerate(self.response_mqs))
+
+        tolerate_death = self._ft_tolerate_worker_death
 
         def get_response():
             responses = []
-            for mq in response_mqs:
-                dequeue_timeout = (
-                    None if deadline is None else (deadline - time.monotonic())
-                )
-                try:
-                    status, result = mq.dequeue(timeout=dequeue_timeout)
-                except TimeoutError as e:
-                    raise TimeoutError(f"RPC call to {method} timed out.") from e
+            for rank, mq in awaited:
+                if not tolerate_death:
+                    dequeue_timeout = (
+                        None if deadline is None else (deadline - time.monotonic())
+                    )
+                    try:
+                        status, result = mq.dequeue(timeout=dequeue_timeout)
+                    except TimeoutError as e:
+                        raise TimeoutError(f"RPC call to {method} timed out.") from e
+                else:
+                    while True:
+                        if deadline is None:
+                            step = _FT_DEAD_POLL_S
+                        else:
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0:
+                                raise TimeoutError(f"RPC call to {method} timed out.")
+                            step = min(_FT_DEAD_POLL_S, remaining)
+                        try:
+                            status, result = mq.dequeue(timeout=step)
+                            break
+                        except TimeoutError as e:
+                            if rank in self._dead_worker_ranks:
+                                raise RuntimeError(
+                                    f"FT NIXL EP: awaited TP worker {rank} died "
+                                    f"during RPC '{method}'; aborting so the "
+                                    f"engine can go degraded."
+                                ) from e
+                            if deadline is not None and time.monotonic() >= deadline:
+                                raise TimeoutError(
+                                    f"RPC call to {method} timed out."
+                                ) from e
+                            # not dead, not past deadline -> keep polling
                 if status != WorkerProc.ResponseStatus.SUCCESS:
                     raise RuntimeError(
                         f"Worker failed with error '{result}', please check the"

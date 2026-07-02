@@ -789,6 +789,32 @@ class Worker(WorkerBase):
             return None
         return [bool(x) for x in pg.get_result_mask()]
 
+    def refresh_ft_nccl_tp_membership(self) -> list[bool] | None:
+        """Drop dead TP peers from the FT-NCCL active mask (one-time on death).
+
+        On a TP-peer death the ``FTProcessGroup`` keeps the dead peer in its
+        active mask, so every subsequent TP all-reduce re-polls the dead peer's
+        readywin slot until ``FT_TIMEOUT_US`` -- a ~5s-per-all-reduce tax that
+        makes the degraded survivor crawl. ``pre_sync()`` runs the
+        timeout-bounded store barrier once: the absent peer is agreed dead
+        across all surviving ranks (the store is the single source of truth, so
+        membership stays consistent) and pushed into the kernel via
+        ``handle_set_mask``, so later collectives skip it with no timeout. The
+        engine calls this once via ``collective_rpc`` when it goes degraded; the
+        broadcast reaches every surviving TP worker so they run the barrier
+        together. Returns the agreed active mask, or ``None`` when FT-NCCL TP is
+        not in use / no FTProcessGroup exists yet.
+        """
+        if not envs.VLLM_USE_FT_NCCL_TP:
+            return None
+        import ft_collective
+
+        pg = ft_collective.get_ft_process_group()
+        if pg is None:
+            return None
+        pg.pre_sync()
+        return pg.get_active_mask()
+
     def sleep(self, level: int = 1) -> None:
         free_bytes_before_sleep = torch.cuda.mem_get_info()[0]
 

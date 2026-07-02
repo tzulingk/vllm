@@ -1999,7 +1999,26 @@ class DPEngineCoreProc(EngineCoreProc):
                 # surviving GPU keeps participating in the EP all-to-all.
                 executed = False
             else:
-                executed = self._process_engine_step()
+                try:
+                    executed = self._process_engine_step()
+                except Exception:
+                    # FT NIXL EP (TP>1): a TP worker that died mid-step makes the
+                    # in-flight collective_rpc abort (see MultiprocExecutor
+                    # get_response). Don't crash -- only when a worker is actually
+                    # dead, swallow it and let the next loop's
+                    # _maybe_handle_own_tp_degradation error the in-flight batch
+                    # and withdraw this engine from serving.
+                    if envs.VLLM_USE_FT_NCCL_TP and getattr(
+                        self.model_executor, "_dead_worker_ranks", None
+                    ):
+                        logger.warning(
+                            "FT NIXL EP: dp_rank=%d engine step aborted by a "
+                            "TP-worker death; going degraded.",
+                            self.dp_rank,
+                        )
+                        executed = False
+                    else:
+                        raise
             self._maybe_publish_request_counts()
 
             local_unfinished_reqs = self.scheduler.has_unfinished_requests()
@@ -2225,6 +2244,23 @@ class DPEngineCoreProc(EngineCoreProc):
             self.output_queue.put_nowait(
                 (-1, EngineCoreOutputs(tp_degraded=self.dp_rank))
             )
+            # Drop the dead TP peer from the FT-NCCL active mask (once). Without
+            # this every dummy-step TP all-reduce re-polls the dead peer until
+            # FT_TIMEOUT_US -- a per-layer ~5s tax that makes the survivor (and,
+            # via the EP all-to-all, the healthy DP ranks) crawl. The refresh
+            # runs pre_sync()'s bounded store barrier on the survivors, agreeing
+            # the dead peer out and pushing the mask into the kernel. Best-effort:
+            # the engine stays degraded and functional even if it fails (slower).
+            if envs.VLLM_USE_FT_NCCL_TP:
+                try:
+                    self.collective_rpc("refresh_ft_nccl_tp_membership")
+                except Exception as e:
+                    logger.warning(
+                        "FT NIXL EP: refresh_ft_nccl_tp_membership failed (%s); "
+                        "the degraded survivor will run slow (5s per TP "
+                        "all-reduce) but stays alive.",
+                        e,
+                    )
         # Error in-flight (RUNNING) requests while degraded: their forward pass
         # would use the incomplete TP all-reduce, so mark them FINISHED_ERROR
         # (retryable) rather than return silently-wrong output.
