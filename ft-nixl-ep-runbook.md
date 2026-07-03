@@ -263,6 +263,42 @@ resync (inert here + carries the four issues above); if the FT collectives crawl
 is gone, use a **lockstep** membership update, not per-collective worker-local `pre_sync`.
 (3) Add the `all_gather` FT-eligibility assert + audit `reduce_scatter`.
 
+### 2026-07-03 (cont. 2) — Task 1 result: it RECOVERS (correct + fast); the real problem is recovery LATENCY, not a deadlock
+
+Backed out the get_error resync and kept the engine-orchestrated refresh
+(`collective_rpc("refresh_ft_nccl_tp_membership")` → `pre_sync` → `handle_set_mask`),
+committed as `4f74abb14a`. Re-ran the EP1 kill-test. **This corrects the previous "permanent
+query_mask wedge" framing — it is NOT a deadlock and NOT wrong output.**
+
+What actually happens (marker timeline; kill at t0):
+- **t0 → +241s:** the survivor EP0's degraded forward *crawls*. Every layer's TP all-reduce eats a
+  5s FT timeout on the dead peer, plus per-expert nixl-EP dispatch/combine timeouts (~27 layers ×
+  several collectives ≈ 240s for one degraded forward). The engine blocks in `get_response`
+  waiting for EP0 — **H2 does not help because EP0 is alive-but-slow, not dead.** py-spy during
+  this window catches every worker in `query_nixl_ep_mask → query_mask.cpu()`, which *looks* like a
+  wedge but is really `.cpu()` blocked behind the crawling forward's kernels.
+- **+241s:** engine degrade handler fires (`core.py:2236`, "dp_rank=0 degraded").
+- **+247s:** recovery fires (`core.py:2319`, "kernel reports newly-dead EP peer(s) [1]; triggering
+  recover_from_dead_peers"). The FT mask drops; subsequent forwards no longer re-poll the dead peer.
+- **after recovery:** GPU0/1 (degraded dp0) idle at 0%, GPU2/3 (dp1) serving; **all requests HTTP
+  200 with correct answers** (Tokyo / Rome / Paris); **live curl "Paris." in 0.88s** (sub-second).
+
+So: cascade fixed (WD=0, survivor alive), serving **recovers**, output **correct**, post-recovery
+**fast**. The earlier kill-test watch only ran 130s and ended ~2 min *before* recovery, which is why
+it read as a permanent stall. byor1ymu9 hit the same mechanism (recovered ~96s); the difference is
+crawl-length variance.
+
+**Why get_error could never fire (now in the commit message):** a peer that dies *before* a
+collective fails the FT kernel's readiness poll, which records no error — only a data-flag-stage
+timeout sets `FT_TIMEOUT`. So `get_error()` stays `FT_OK` on a clean kill; the engine-orchestrated
+refresh (driven by process-death detection) is what actually drops the peer.
+
+**The one remaining problem is recovery LATENCY (~240s)** — the survivor crawls a full degraded
+forward before the mask drops. Fix (Task 2 branch): drop the mask **proactively / out-of-band on
+executor death-detection (~+8s)**, not via the error bit (never fires for a clean kill) and not
+after the crawl. This likely also needs to **interrupt the survivor's in-flight crawling forward**
+(extend H2 from "dead worker" to "alive-but-slow degraded step").
+
 ---
 
 ## TL;DR of progress
