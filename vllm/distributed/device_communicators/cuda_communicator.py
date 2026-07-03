@@ -251,6 +251,58 @@ class CudaCommunicator(DeviceCommunicatorBase):
             scope="global",
         )
 
+    def _ft_tp_process_group(self):
+        """Return the registered FTProcessGroup (asserting it exists).
+
+        Only valid when ``VLLM_USE_FT_NCCL_TP`` is set and this is the TP
+        communicator; callers gate on that first.
+        """
+        import ft_collective
+
+        ft_pg = ft_collective.get_ft_process_group()
+        assert ft_pg is not None, (
+            "VLLM_USE_FT_NCCL_TP is set but no FTProcessGroup is registered "
+            "(the TP group was not created with the ft_nccl backend)."
+        )
+        return ft_pg
+
+    def _ft_symmetric_stage(
+        self, ft_pg, input_: torch.Tensor, scratch_attr: str
+    ) -> torch.Tensor:
+        """Copy ``input_`` into a reused per-dtype symmetric scratch buffer and
+        return a view of it (offset 0 -> same ``data_ptr`` as the registered
+        window, so ``FTProcessGroup`` takes the FT kernel path).
+
+        The scratch is allocated once, lazily, while all peers are still alive:
+        ``ft_pg.empty()`` runs a COLLECTIVE ncclCommWindowRegister with no
+        timeout, so a per-call allocation would hang on a dead peer BEFORE the
+        FT kernel's own timeout can fire. Allocating at ``FT_NCCL_MAX_COUNT``
+        once and slicing avoids any per-call window registration. all-reduce and
+        all-gather pass distinct ``scratch_attr`` values so a staged all-gather
+        input never overwrites an all-reduce result a caller still holds.
+        """
+        numel = input_.numel()
+        scratch = getattr(self, scratch_attr, None)
+        if scratch is None:
+            scratch = {}
+            setattr(self, scratch_attr, scratch)
+        buf = scratch.get(input_.dtype)
+        if buf is None:
+            assert numel <= ft_pg._max_count, (
+                f"FT-NCCL TP: numel {numel} exceeds FT_NCCL_MAX_COUNT "
+                f"{ft_pg._max_count}; raise FT_NCCL_MAX_COUNT."
+            )
+            # Collective + one-time (all peers alive at first use).
+            buf = ft_pg.empty(ft_pg._max_count, dtype=input_.dtype)
+            scratch[input_.dtype] = buf
+        assert numel <= buf.numel(), (
+            f"FT-NCCL TP: numel {numel} exceeds FT scratch {buf.numel()}; "
+            f"raise FT_NCCL_MAX_COUNT."
+        )
+        out = buf[:numel].reshape_as(input_)
+        out.copy_(input_)
+        return out
+
     def all_reduce(self, input_):
         # FT-NCCL TP: route the tensor-parallel all-reduce through the
         # fault-tolerant "ft_nccl" backend so a dead TP peer is masked on a
@@ -259,13 +311,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         # to take the FT kernel path; a plain clone silently falls back to
         # ordinary NCCL. See ft-nccl-tp-integration.md.
         if envs.VLLM_USE_FT_NCCL_TP and self.unique_name.split(":")[0] == "tp":
-            import ft_collective
-
-            ft_pg = ft_collective.get_ft_process_group()
-            assert ft_pg is not None, (
-                "VLLM_USE_FT_NCCL_TP is set but no FTProcessGroup is registered "
-                "(the TP group was not created with the ft_nccl backend)."
-            )
+            ft_pg = self._ft_tp_process_group()
             # One-time diagnostic: is self.device_group the Python FTProcessGroup
             # or a c10d wrapper, and what would dist.all_reduce(group=device_group)
             # dispatch to? (Answers whether the old path could have hit plain NCCL.)
@@ -291,36 +337,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
                     self.device,
                     be_desc,
                 )
-            # Reuse ONE symmetric scratch buffer per dtype, allocated once while
-            # all peers are alive. ft_pg.empty() runs a COLLECTIVE
-            # ncclCommWindowRegister; calling it per all-reduce would hang on a
-            # dead peer (that collective has no timeout) BEFORE the FT kernel's
-            # own timeout can fire. Allocating at FT_NCCL_MAX_COUNT once + slicing
-            # avoids any per-call window registration.
-            numel = input_.numel()
-            scratch = getattr(self, "_ft_tp_scratch", None)
-            if scratch is None:
-                scratch = {}
-                self._ft_tp_scratch = scratch
-            buf = scratch.get(input_.dtype)
-            if buf is None:
-                assert numel <= ft_pg._max_count, (
-                    f"TP all-reduce numel {numel} exceeds FT_NCCL_MAX_COUNT "
-                    f"{ft_pg._max_count}; raise FT_NCCL_MAX_COUNT."
-                )
-                # Collective + one-time (all peers alive at first use).
-                buf = ft_pg.empty(ft_pg._max_count, dtype=input_.dtype)
-                scratch[input_.dtype] = buf
-            assert numel <= buf.numel(), (
-                f"TP all-reduce numel {numel} exceeds FT scratch {buf.numel()}; "
-                f"raise FT_NCCL_MAX_COUNT."
-            )
             # Slice at offset 0 -> same data_ptr as the registered window, so the
             # FT kernel path is taken (asserted). Call ft_pg.allreduce() directly
             # (dist.all_reduce with the vLLM device_group handle can dispatch to
             # the C++ ProcessGroupNCCL base, not the Python FT override).
-            out = buf[:numel].reshape_as(input_)
-            out.copy_(input_)
+            out = self._ft_symmetric_stage(ft_pg, input_, "_ft_tp_ar_scratch")
             assert ft_pg._is_ft_eligible_ar(out), (
                 "TP all-reduce not FT-eligible: "
                 f"{ft_pg._fallback_reason(out, 'allreduce')}"
@@ -384,6 +405,60 @@ class CudaCommunicator(DeviceCommunicatorBase):
             out = input_.clone()
             torch.distributed.all_reduce(out, group=self.device_group)
         return out
+
+    def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        # FT-NCCL TP: route the tensor-parallel all-gather through the
+        # fault-tolerant "ft_nccl" backend (same rationale as all_reduce) so a
+        # dead TP peer is masked on a GPU-side timeout instead of hanging the
+        # forward (e.g. the sequence-parallel MoE all-gather in DeepSeek-V2).
+        # All-gather only moves bytes (no reduction) and the FT kernel copies at
+        # float32 granularity, so any dtype whose byte size is a multiple of 4
+        # is transported by bit-casting to float32 -- lossless, since no
+        # arithmetic touches the values. Only the *input* shard must be
+        # symmetric (from pg.empty()); the output is filled by a local copy.
+        # Must use the list-form allgather() -- allgather_into_tensor() is a
+        # non-FT NCCL fallback in FTProcessGroup. See ft-nccl-tp-integration.md.
+        if (
+            envs.VLLM_USE_FT_NCCL_TP
+            and self.unique_name.split(":")[0] == "tp"
+            and self.world_size > 1
+            and (input_.numel() * input_.element_size()) % 4 == 0
+        ):
+            ft_pg = self._ft_tp_process_group()
+            if dim < 0:
+                dim += input_.dim()
+            input_size = input_.size()
+            # Bit-cast the shard to float32 for transport, then stage into a
+            # symmetric buffer so the FT kernel path is taken; assert
+            # eligibility to avoid a silent NCCL fallback.
+            input_f32 = input_.reshape(-1).view(torch.float32)
+            staged = self._ft_symmetric_stage(ft_pg, input_f32, "_ft_tp_ag_scratch")
+            assert ft_pg._is_ft_eligible_ag(staged), (
+                "TP all-gather not FT-eligible: "
+                f"{ft_pg._fallback_reason(staged, 'allgather')}"
+            )
+            # Concat-style gather along dim 0 into a contiguous (non-symmetric)
+            # float32 output, sliced into world_size equal blocks so
+            # FTProcessGroup takes its single strided-copy fast path.
+            n_f32 = staged.numel()
+            out_f32 = torch.empty(
+                self.world_size * n_f32, dtype=torch.float32, device=input_.device
+            )
+            outputs = list(out_f32.chunk(self.world_size, dim=0))
+            ft_pg.allgather([outputs], [staged]).wait()
+            # Bit-cast back and reshape/movedim exactly like the base
+            # communicator so the result is identical for any `dim`.
+            output_tensor = out_f32.view(input_.dtype).reshape(
+                (self.world_size,) + input_size
+            )
+            output_tensor = output_tensor.movedim(0, dim)
+            output_tensor = output_tensor.reshape(
+                input_size[:dim]
+                + (self.world_size * input_size[dim],)
+                + input_size[dim + 1 :]
+            )
+            return output_tensor
+        return super().all_gather(input_, dim)
 
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1):
         world_size = self.world_size

@@ -2251,6 +2251,11 @@ class DPEngineCoreProc(EngineCoreProc):
             # runs pre_sync()'s bounded store barrier on the survivors, agreeing
             # the dead peer out and pushing the mask into the kernel. Best-effort:
             # the engine stays degraded and functional even if it fails (slower).
+            # NOTE: this engine-orchestrated refresh (not a worker-local
+            # get_error() resync) is what actually drops the peer -- the sticky
+            # error bit is never set for a peer that died *before* the collective
+            # (it fails the readiness poll, which records no error), so a
+            # get_error()-gated resync never fires for a clean kill.
             if envs.VLLM_USE_FT_NCCL_TP:
                 try:
                     self.collective_rpc("refresh_ft_nccl_tp_membership")
