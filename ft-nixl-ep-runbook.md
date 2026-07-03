@@ -47,7 +47,7 @@ vLLM `nvcr.io/nvidian/dynamo-dev/tzulingk-vllm:ftnccl-tp`.
 | 2-GPU smoke test | ✅ | fork NCCL loads in torch (runtime banner `2.30.0a17`, no ABI break), FT all-reduce correct via FT kernel. |
 | TP=2/DP2/EP4 serve + baseline coherence | ✅ | Paris / cold / 4 — TP all-reduce through the FT kernel is numerically **correct**. |
 | EP/TP active-mask consistency check | ✅ | commit `a879e917ae` — read FT-NCCL TP mask like nixl_ep's, crash on divergence. 60s/80 completions, 0 false crashes. |
-| Single-TP-peer survival (A–E) + kill-test | 🔧 WIP — cascade root-caused | `ab8810598c`/`2e547fc827`/`d12b074fc6`; FT path `667b8fc708`+`84875a0d4e`; cached-scratch `fcb2c2147a`; H1/H2 `558db81296`. One kill-test looked good but a later run **cascaded (2-GPU loss)**: a raw TP **all-gather** (not FT-routed) hung 600s → c10d watchdog **SIGABRTs the survivor**. All-gather FT fix in progress — routes it through FT (no more 600s watchdog) but **garbles output** (correctness bug) + 3× warmup. See 2026-07-02 note below. |
+| Single-TP-peer survival (A–E) + kill-test | ✅ cascade fixed (serving-speed WIP) | `ab8810598c`/`2e547fc827`/`d12b074fc6`; FT path `667b8fc708`+`84875a0d4e`; cached-scratch `fcb2c2147a`; H1/H2 `558db81296`. The 2-GPU cascade was a raw TP **all-gather** (not FT-routed) hitting the **600s c10d watchdog** → SIGABRT of the survivor. Fixed by FT-routing the all-gather + a targeted `_fence_ft_stream_on_current()` stream fence in the fork (the garble was a cross-stream *ordering* bug, not layout). Kill-test now: **survivor alive, 0 watchdog, dp1 coherent — 1-GPU fault = 1 GPU.** Remaining: degraded serving slow (H1 mask-drop delivery bug). See 2026-07-03 note. |
 
 ### Serve config (TP=2)
 
@@ -183,6 +183,43 @@ has a **data-correctness bug** (prime suspect: the FT 16-byte padded recv stride
 Also to fix: H1 delivery — `self.collective_rpc(...)` from the engine raises
 `AssertionError: collective_rpc should not be called on follower node` once the executor tears
 down; the mask refresh should be **worker-local**, not an engine-issued RPC.
+
+### 2026-07-03 — cascade FIXED: all-gather ordering bug root-caused + fenced
+
+The garble was **not** a layout/data bug. Localized it with an in-situ diff probe (FT
+`all_gather` vs `super().all_gather`, logging `max_abs_diff`/`allclose`, returning base so the
+forward stayed coherent):
+- Shapes always matched; **first call byte-exact (`diff=0`), later calls diverged and grew**
+  (0.2 → 4.6). Deterministic, in eager (`--enforce-eager`, so **not** CUDA-graph capture).
+- A full `torch.cuda.synchronize()` around the FT gather → `max_abs_diff=0` on **every** call.
+
+→ Confirmed a **cross-stream ordering bug**: the FT gather runs on `self._stream` but the input
+is staged with a `copy_` on the compute stream; `.wait()` only fences the output, so the kernel
+read the staging buffer before the copy landed (first call won the race, later calls lost it as
+the buffer was reused).
+
+**Fix (fork `ft_process_group.py`): `_fence_ft_stream_on_current()`** — record an event on the
+current (compute) stream and `stream_wait_event(self._stream, event)` at the entry of both
+`allreduce` and `allgather`, so the FT kernel waits for the caller's staging copy. Targeted
+GPU-side fence, no host stall, no `.cu` recompile.
+
+**Validated (targeted fence only, no full sync):** baseline coherent; FT `all_gather`
+`max_abs_diff=0 / allclose=True` on every call (0 `allclose=False`).
+
+**Kill-test (kill `EP1` at TP=2/DP2/EP4) — cascade eliminated:**
+- ✅ **Survivor `EP0` stays ALIVE**; **0 watchdog/SIGABRT markers** in the whole log (the
+  all-gather now hits the 5s FT timeout, not the 600s c10d watchdog).
+- ✅ Engine degraded (D fired); dp1 serves **coherently** post-kill (`Tokyo`).
+- ✅ **A 1-GPU fault costs 1 GPU, not 2** — no whole-DP-rank cascade. Core FT goal met.
+- ⚠️ Degraded serving still **slow to resume** (per-layer 5s crawl): the H1 mask-drop refresh
+  never lands because `self.collective_rpc(...)` from the engine hits the follower-node assert
+  on executor teardown. Next: deliver the mask refresh **worker-local**, not via engine RPC.
+
+Reference: the FT-NCCL author's vLLM integration (`tstamler/vllm@ft-nccl-tp`) avoids this race
+entirely by allocating TP-collective **inputs in symmetric memory at the producer**
+(`RowParallelLinear`/`VocabParallelEmbedding`) + in-place reduce — no staging copy. His branch
+is TP all-reduce only (all-gather + partial-rank recovery are out of scope) and benchmarks
+throughput (Qwen-72B TP8), not fault tolerance.
 
 ---
 
