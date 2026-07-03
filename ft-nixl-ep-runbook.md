@@ -221,6 +221,48 @@ entirely by allocating TP-collective **inputs in symmetric memory at the produce
 is TP all-reduce only (all-gather + partial-rank recovery are out of scope) and benchmarks
 throughput (Qwen-72B TP8), not fault tolerance.
 
+### 2026-07-03 (cont.) — degraded-serving slowness is the NIXL-EP query_mask, not the FT mask
+
+After the cascade fix, degraded serving was still slow to resume. Tried the FT-NCCL author's
+suggested pattern — check the FT error bit, call `pre_sync()` only on `FT_TIMEOUT` — as a
+worker-local resync in `CudaCommunicator._ft_resync_if_timed_out` (after each FT collective):
+- **v1 `check_and_clear_error()` — WRONG.** It clears the flag on *every* call, and the kernel
+  sets `FT_TIMEOUT` asynchronously, so a clear racing the set **erases** the signal → `pre_sync`
+  never fires → mask never drops → survivor keeps 5s-timing-out the dead peer. (Caught in review.)
+- **v2 `get_error()` (sticky read) + `clear_error()` only after `pre_sync` — correct for the
+  erase, but** the kill-test showed **`FT-RESYNC` never fired at all (count=0 over 80s)**.
+
+**Root cause (py-spy, decisive):** the survivor wedges *upstream* in the **NIXL-EP
+mask-consistency check** — `query_nixl_ep_mask → query_mask → query_mask_buffer(...).cpu()`
+(our diagnostic `a879e917ae`), GPU0 100% — so it never reaches the FT all-reduce/all-gather where
+the resync lives. **The degraded-serving slowness is a NIXL-EP `query_mask` wedge, not the
+FT-NCCL collectives** (the same "deeper blocker" from the first kill-tests). The FT-NCCL cascade
+fix (fence + FT all-gather) is done and solid; the resync was aimed at the wrong layer.
+
+**Design review of the per-collective resync (all valid → do NOT ship it as-is):**
+- **TP>2 agreement lost.** `_ft_barrier`'s epoch is a per-rank `pre_sync` count; worker-local
+  triggering lets counts diverge across survivors (multiple deaths / skewed detection) →
+  epoch-namespace mismatch → a survivor times out a *live* survivor (Scenario B). TP=2 (single
+  survivor) is safe; TP>2 needs a lockstep trigger or a shared/agreed epoch (raise with author).
+- **CUDA-graph incompatible.** The host-side `if get_error(): pre_sync()` (host sync + TCPStore)
+  isn't capturable — safe today only because the path runs `--enforce-eager` (confirmed:
+  `enforce_eager=True`, `CUDAGraphMode.NONE`; author's bench also `ENFORCE_EAGER=1`). Graph mode
+  would need it outside the captured region.
+- **Unbounded in-flight drain.** `get_error()` after `.wait()` reads `FT_OK` (kernel still
+  spinning); the host enqueues the forward's remaining collectives (old mask) before the sticky
+  bit is observed, and `pre_sync`'s `stream_synchronize` then drains that backlog serially
+  (K × timeout) — not a bounded one-time stall.
+- **Residual non-FT fallbacks.** `all_gather` falls back to raw NCCL when
+  `(numel*itemsize) % 4 != 0` or `world_size == 1` (unguarded → re-opens the watchdog cascade);
+  `reduce_scatter`/`all_gatherv`/`reduce_scatterv` aren't FT-routed at all. Need an FT-eligibility
+  assert + an audit of which TP collectives the model actually uses.
+
+**Plan:** (1) remove/gate the mask-consistency check (`query_nixl_ep_mask`) — a diagnostic whose
+`.cpu()` sync is the actual wedge — and re-test degraded serving. (2) Back out the per-collective
+resync (inert here + carries the four issues above); if the FT collectives crawl once the wedge
+is gone, use a **lockstep** membership update, not per-collective worker-local `pre_sync`.
+(3) Add the `all_gather` FT-eligibility assert + audit `reduce_scatter`.
+
 ---
 
 ## TL;DR of progress
