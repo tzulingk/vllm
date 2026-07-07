@@ -60,8 +60,13 @@ vllm serve deepseek-ai/DeepSeek-V2-Lite --tensor-parallel-size 2 --data-parallel
   --enable-eplb --enable-elastic-ep --disable-custom-all-reduce \
   --eplb-config '{"num_redundant_experts":64,"use_async":false,"step_interval":100000000,...}' \
   --attention-config '{"backend":"TRITON_MLA","mla_prefill_backend":"TRTLLM_RAGGED"}' \
-  --gpu-memory-utilization 0.5 --max-num-seqs 16 --max-model-len 4096 --trust-remote-code
+  --gpu-memory-utilization 0.5 --max-num-seqs 16 --max-model-len 4096 --enforce-eager \
+  --cpu-distributed-timeout-seconds 10 --trust-remote-code
 ```
+**`--cpu-distributed-timeout-seconds 10` is REQUIRED** (not the env var): it sets
+`parallel_config.cpu_distributed_timeout_seconds`, which bounds the FT-gloo *rebuild*
+(`create_tcp_store`/`init_gloo`) on recovery. Without it the rebuild uses gloo's 1800s default and a
+TP-peer kill looks like a permanent hang (30-min block). See the 2026-07-07 (cont.) kill-test note.
 Notes: `LD_PRELOAD` the fork libnccl at **container** level so Ray TP workers inherit it
 (else torch's bundled 2.28.9 co-loads → conflict). **Do NOT set `VLLM_DISABLE_PYNCCL`** —
 it breaks EPLB's pynccl communicator; the TP all-reduce is routed to `ft_nccl` by a
