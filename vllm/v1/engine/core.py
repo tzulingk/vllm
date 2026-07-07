@@ -2278,8 +2278,9 @@ class DPEngineCoreProc(EngineCoreProc):
             self._send_error_outputs(errored)
 
     def _maybe_recover_on_newly_dead_peers(self) -> None:
-        """Trigger survivor recovery when the kernel mask reports a new
-        dead peer.
+        """Trigger survivor recovery from the authoritative cross-DP dead-EP
+        set (each engine publishes its own process-dead TP workers to the DP
+        store; every DP rank recovers for the union -- not the noisy mask).
 
         Recovery (the ``recover_from_dead_peers`` RPC) rebuilds the DP
         FT-gloo survivor group *and* runs the EPLB redistribute + disk
@@ -2296,31 +2297,56 @@ class DPEngineCoreProc(EngineCoreProc):
         logged but do not crash the engine. The next tick will retry.
         """
         my_mask = self._query_local_kernel_mask()
-        if my_mask is None:
-            return
 
         already = getattr(self, "_recovered_for_peers", None)
         if already is None:
             already = set()
             self._recovered_for_peers = already
 
-        # Mask convention: 1 = dead per nixl_ep_ll.cu:47-55. Drop our
-        # own slot defensively; the kernel writes 0 there but we don't
-        # want to ever "redistribute for ourselves" if that invariant
-        # flips.
-        newly_dead = sorted(
-            r
-            for r, v in enumerate(my_mask)
-            if v != 0 and r != self.dp_rank and r not in already
-        )
+        # Cheap happy-path gate: only engage the cross-DP store protocol when
+        # this rank actually sees a possible death -- its kernel mask flags a
+        # slot, its own executor reports a process death, or we are already
+        # mid-recovery. Keeps the per-step cost at one mask read (as before) and
+        # avoids per-step store round-trips when nothing is wrong.
+        tp_size = self.vllm_config.parallel_config.tensor_parallel_size
+        local_dead = getattr(self.model_executor, "_dead_worker_ranks", None) or ()
+        mask_flags_death = my_mask is not None and any(v != 0 for v in my_mask)
+        if not mask_flags_death and not local_dead and not already:
+            return
+
+        # Authoritative, cross-DP-agreed dead-EP set -- do NOT derive it from
+        # the kernel mask (used only as the cheap gate above). The mask is a
+        # per-rank *observation* that is noisy for ranks this DP rank does not
+        # own: during the death window a degraded DP rank stalls, so BOTH of its
+        # EP slots (including its live survivor) briefly time out in peers'
+        # all-to-all, and a peer would mis-flag the survivor as dead. The old
+        # "drop our own slot" guard also compared the EP-rank slot index against
+        # ``self.dp_rank`` (correct only at tp=1), so at tp>1 it dropped a *real*
+        # dead peer whose EP index equalled our DP rank -- e.g. dp_rank 1
+        # reported EP0 instead of EP1 (DYN-3314). Instead: each engine knows
+        # exactly which of ITS OWN TP workers died (process death, from the
+        # executor monitor), publishes those global EP ranks to the shared DP
+        # store (set-once/monotonic), and every DP rank recovers for the store
+        # union -- exact, and free of the EP/DP slot confusion.
+        ep_size = self.vllm_config.parallel_config.data_parallel_size * tp_size
+        for t in local_dead:
+            self.dp_store.set(f"ft_dead_ep/{self.dp_rank * tp_size + t}", b"1")
+
+        global_dead = {
+            ep for ep in range(ep_size) if self.dp_store.check([f"ft_dead_ep/{ep}"])
+        }
+        newly_dead = sorted(global_dead - already)
         if not newly_dead:
             return
 
         logger.warning(
-            "FT EP: kernel reports newly-dead EP peer(s) %s on dp_rank=%d; "
-            "triggering recover_from_dead_peers via collective_rpc.",
-            newly_dead,
+            "FT EP: authoritative dead-EP set %s (this rank's process-dead "
+            "workers %s) on dp_rank=%d; triggering recover_from_dead_peers for "
+            "newly-dead %s.",
+            sorted(global_dead),
+            sorted(self.dp_rank * tp_size + t for t in local_dead),
             self.dp_rank,
+            newly_dead,
         )
         try:
             self.collective_rpc("recover_from_dead_peers", args=(newly_dead,))
