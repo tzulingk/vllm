@@ -329,10 +329,41 @@ GPUs); the serve then crashes at `init_device` (`device=3, num_gpus=3`) BEFORE a
 reset is "Not Supported" in-container. Recreated the bare pod from a saved clean manifest
 (`vllm-ftnccl-tp-pod-clean.yaml`); all volumes are emptyDir -> the model re-downloads and every
 deployed file (the .so, the FT Python, the FT vLLM files, the serve script) must be re-applied.
-**self_adapt kill-test result PENDING** (awaiting fresh pod + re-deploy).
-
 Note: the vLLM repo checkout drifted to detached `ee473ca7ad` (Cursor) mid-session; the FT branch
 `ft-nixl-ep-ftnccl-tp` (`47625dc636`) holds all this work.
+
+### 2026-07-07 (cont.) — self_adapt kill-test result + the gloo-timeout fix (RECOVERY WORKS at TP>1)
+
+Two kill-tests on the fresh pod (kill dp0's TP1 peer, TP2xDP2, 4xGB200):
+
+**Kill-test #1 (self_adapt, but serve missing `--cpu-distributed-timeout-seconds`):** self_adapt did
+its job — **degrade at t+24s vs +241s** without it (the kernel drops the dead peer mid-forward, so
+the survivor's forward no longer grinds ~50x5s), GPU0 100%->0%, WD=0. **But serving hung**
+(`200OK=0`, all GPUs idle): dp0's survivor stuck in `recover_from_dead_peers ->
+rebuild_dp_ft_gloo_for_survivors -> create_tcp_store`, dp1 never joining the rendezvous.
+
+**Root cause of the hang:** the gloo rebuild used gloo's **1800s** default, not a fast-fail.
+`get_cpu_distributed_timeout_or_none()` (utils.py:508-515) reads
+`parallel_config.cpu_distributed_timeout_seconds` — set by the **CLI flag
+`--cpu-distributed-timeout-seconds`, NOT the env var** `VLLM_CPU_DISTRIBUTED_TIMEOUT_SECONDS` (which
+only feeds the FT-gloo wrapper's per-collective timeout). The serve command was missing the flag.
+Added `--cpu-distributed-timeout-seconds 10` (runbook Serve-config already documents it; the flag
+had silently dropped out of `serve-eplb-tp2.sh`).
+
+**Kill-test #2 (self_adapt + `--cpu-distributed-timeout-seconds 10`): RECOVERY WORKS.**
+- Rebuild **fast-fails at ~10s** (`rebuildfail` climbs), no 1800s block.
+- dp0 drains (GPU0->0%); dp1 **unblocks and runs forwards** (no longer idle) but **crawls** on the
+  nixl-EP all-to-all (still includes dead EP1, 5s per-expert nixl timeout) -- self_adapt fixes the
+  FT-NCCL *TP* collective, not the nixl-EP all-to-all; EP1 leaves the EP group only when recovery
+  completes.
+- dp1's own nixl-EP mask marks EP1, dp1 co-enters recovery, the rebuild rendezvous succeeds on a
+  retry, EPLB redistributes -> **serving resumes at ~t+54s**. Sustained + **correct**
+  (Tokyo/Rome/Paris), **0.74s/req** post-recovery. WD=0, EP0 alive throughout.
+
+**Net:** self_adapt (fast TP degrade) + the 10s gloo timeout (fast-fail the rebuild so dp1 unblocks
+and co-rendezvous) together give a **bounded ~54s correct recovery** at TP>1 -- vs the permanent
+hang without the flag and the ~247s crawl without self_adapt. Residual ~54s = dp1 nixl-EP detection
+(5s) + a couple of gloo rebuild rendezvous retries + EPLB redistribute/reload (improvable next).
 
 ---
 
