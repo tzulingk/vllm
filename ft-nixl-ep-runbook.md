@@ -299,6 +299,41 @@ executor death-detection (~+8s)**, not via the error bit (never fires for a clea
 after the crawl. This likely also needs to **interrupt the survivor's in-flight crawling forward**
 (extend H2 from "dead worker" to "alive-but-slow degraded step").
 
+### 2026-07-07 — self_adapt: mid-forward mask drop (the fix for the ~247s crawl)
+
+Root of the ~247s latency (confirmed with the user): the mask drop (pre_sync / engine refresh) only
+runs BETWEEN forwards, so the FIRST degraded forward re-polls the dead peer to `FT_TIMEOUT_US` on
+EVERY TP collective -- ~(layers × ~2) collectives × 5s ≈ 250s. Dropping the mask "before the
+forward" can't help: the death isn't known until layer 1's collective times out, mid-forward.
+
+The FT-NCCL author shipped the mechanism for exactly this: **self_adapt** (commit `9ce985cc3`,
+"self-adapting handle masks, default on, opt-out") -- the kernel drops a peer from its active mask
+the moment a collective observes it absent, so the REST of the forward skips it. Cost collapses from
+~50×5s to ~1×5s (only the first collective that discovers the death pays). Companion commit
+`1f3558e07` ("raise FT_TIMEOUT on LSA readiness-barrier failure") also closes the clean-kill
+detection gap (a peer dead *before* the collective now sets FT_TIMEOUT).
+
+FTProcessGroup had OPTED OUT of self_adapt (`handle_set_self_adapt(handle, False)`) because
+self_adapt adopts each rank's *local* observation, which can diverge across >1 survivor and compete
+with pre_sync's agreed set. **Enabled it for the vLLM TP path** (set `True`): at TP=2 there is a
+single survivor, so its local view is authoritative and coexists with pre_sync safely. Revisit
+(lockstep reconciliation) before TP>2.
+
+Deploy: the changes are in `ft_collective.cu` (+ `.h`), so the FT lib must be rebuilt. Rebuilt
+`libft_collective.so` in-pod (nvcc, sm_100, linked against `/ftnccl/nccl`) -- verified it exports
+`ftHandleSetSelfAdapt` -- and deployed it + the newest `ft_process_group.py` (self_adapt=True + the
+cascade fence) + `ft_wrapper.py` (the binding).
+
+**Infra casualty:** the repeated SIGKILL kill-tests left GPU1 wedged (`[N/A]`, CUDA sees only 3
+GPUs); the serve then crashes at `init_device` (`device=3, num_gpus=3`) BEFORE any FT code runs. GPU
+reset is "Not Supported" in-container. Recreated the bare pod from a saved clean manifest
+(`vllm-ftnccl-tp-pod-clean.yaml`); all volumes are emptyDir -> the model re-downloads and every
+deployed file (the .so, the FT Python, the FT vLLM files, the serve script) must be re-applied.
+**self_adapt kill-test result PENDING** (awaiting fresh pod + re-deploy).
+
+Note: the vLLM repo checkout drifted to detached `ee473ca7ad` (Cursor) mid-session; the FT branch
+`ft-nixl-ep-ftnccl-tp` (`47625dc636`) holds all this work.
+
 ---
 
 ## TL;DR of progress
