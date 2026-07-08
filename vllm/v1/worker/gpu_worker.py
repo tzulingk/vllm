@@ -337,13 +337,14 @@ class Worker(WorkerBase):
         group must reflect *every* dead peer so far -- a later death must not
         re-include an earlier-dead rank. So we derive the cumulative dead set
         from the live NIXL-EP kernel mask (``1=dead``), union the passed
-        newly-dead list, and fold EP slots down to DP ranks (a DP rank is dead
-        only if all its TP siblings are; for TP=1 the EP index is the DP
-        index).
+        newly-dead list, and fold EP slots down to DP ranks for the DP
+        wave-sync group. A DP rank is a survivor only if *all* its TP workers
+        are alive (still fully serving); a degraded rank (one dead TP sibling)
+        is excluded even though its surviving GPU stays in the EP all-to-all.
 
         No-op (returns False) when the FT-gloo holder isn't initialized
-        (non-NIXL-EP deployments), this rank is itself masked dead, or the
-        survivor set is unchanged.
+        (non-NIXL-EP deployments), this rank is not in the survivor set, or
+        the survivor set is unchanged.
         """
         from vllm.distributed.elastic_ep.ft_gloo import get_dp_ft_gloo
 
@@ -365,7 +366,7 @@ class Worker(WorkerBase):
         survivors = frozenset(
             d
             for d in range(dp_size)
-            if not all((d * tp_size + t) in dead for t in range(tp_size))
+            if not any((d * tp_size + t) in dead for t in range(tp_size))
         )
         if self.parallel_config.data_parallel_rank not in survivors:
             return False

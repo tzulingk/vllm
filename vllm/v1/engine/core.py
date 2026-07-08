@@ -2367,10 +2367,22 @@ class DPEngineCoreProc(EngineCoreProc):
         # of blocking on the dead peer. rebuild_for_survivors is a rendezvous
         # barrier among the survivor actors, so they all switch to the survivor
         # group on the same beat (no split where some reduce over 3 ranks and
-        # others over 4). Survivor set = all ranks minus everyone recovered-for
-        # so far (cumulative across multi-rank deaths).
-        if self._dp_ft_gloo is not None:
-            survivors = frozenset(r for r in range(self.dp_size) if r not in already)
+        # others over 4).
+        # ``already`` holds global EP-slot indices; fold to the *serving*
+        # survivor set -- a DP rank is included only if all its TP workers are
+        # alive. A degraded rank (one dead TP sibling) is excluded from the
+        # wave-sync even though its surviving GPU stays in the EP all-to-all.
+        # Degraded actors skip the rebuild (``dp_rank not in survivors``).
+        survivors = frozenset(
+            d
+            for d in range(self.dp_size)
+            if not any((d * tp_size + t) in already for t in range(tp_size))
+        )
+        if (
+            self._dp_ft_gloo is not None
+            and self.dp_rank in survivors
+            and self._dp_ft_gloo.current_survivors != survivors
+        ):
             try:
                 self._dp_ft_gloo.rebuild_for_survivors(survivors)
                 logger.info(
