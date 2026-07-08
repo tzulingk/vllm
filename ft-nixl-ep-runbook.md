@@ -434,13 +434,32 @@ the dead peer, so `reassign_missing_experts_inplace` returns **`reassignments=0`
 survivor) and `eplb_redistribute_for_dead_peers` **skips `reload_experts_from_disk`** entirely (it
 is gated on `if reassignments:`). No disk reload happens.
 
-**Residual (open):** so the ~150s intermittent-serving window is NOT the disk reload -- it is a
-*post-recovery settling* effect that begins AFTER the mechanism finishes (~+43s). Most likely the EP
-all-to-all coupling: dp1 (serving) still dispatches into the all-to-all where dp0's EP0 is
-dummy-running but not in lockstep, so some cross-DP dispatches hit the 5s NIXL timeout -> slow
-requests -> the intermittent load-loop `000`s, declining as the two find a rhythm. Needs its own
-diagnosis (re-run + py-spy dp1 during +48->+120s + see which dispatch times out); do NOT attribute
-it to the reload.
+### 2026-07-08 (cont.) — RESOLVED the ~50% 000 alternation: relay TP-degradation to the LB (commit `7cdce45ae8`)
+
+The intermittent window was **not** the disk reload (that's skipped, `reassignments=0`) and **not**
+the EP all-to-all coupling I first guessed -- it was the **load balancer**. A degraded DP engine
+emits `EngineCoreOutputs.tp_degraded` via `client_index=-1`, but that **dead-ended at the DP
+coordinator**: the front-end LB never learned, so it kept round-robining **~half the requests to the
+withdrawn dp0**, which dead-ended -> a persistent ~50% HTTP-000 alternation.
+
+**Fix:** the coordinator now tracks a `degraded_engines` set and, on the `-1` `tp_degraded` path,
+publishes it to front-ends immediately (level-triggered as a 4th element on both the stats tuple and
+the wave-state message -> converges even if a message is dropped, and works for
+`api_server_count > 1`). `DPLBAsyncMPClient` consumes the set into the same `dead_engine_indices`
+(and in-flight abort) it uses for a truly-dead engine -- so a *degraded* engine is routed around
+identically. (Consumption guarded by `isinstance(self, DPLBAsyncMPClient)`: the stats loop is on the
+parent, the LB state on the subclass.)
+
+**Kill-test (kill EP1):** coordinator logs `engine 0 reported degraded; relaying to front-end
+clients`; client logs `DP engine 0 reported degraded (relayed via coordinator)`; the LB stops
+routing to dp0. **The ~50% alternation is gone** -- the load-loop `200OK/total` gap stays fixed at
+**2** (7/9 -> 13/15 -> 20/22 -> ... -> 81/83), i.e. only the 2 death-window requests time out and
+**every request succeeds from ~+48s**; 8/8 spot curls 200 (~0.6s). dp0's EP0 still dummy-running,
+both engines `[1]`, rebuild fires to `{dp1}`, WD=0.
+
+**Net TP>1 recovery (kill 1 TP worker):** ~2 requests lost in the ~48s detection+recovery window,
+then clean 100% serving on the healthy DP rank; the degraded DP rank stays in the EP all-to-all via
+dummy batches.
 
 ---
 
