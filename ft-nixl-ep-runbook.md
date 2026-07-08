@@ -370,6 +370,43 @@ and co-rendezvous) together give a **bounded ~54s correct recovery** at TP>1 -- 
 hang without the flag and the ~247s crawl without self_adapt. Residual ~54s = dp1 nixl-EP detection
 (5s) + a couple of gloo rebuild rendezvous retries + EPLB redistribute/reload (improvable next).
 
+### 2026-07-07 (cont. 3) — dead=[0] fixed (authoritative dead set); survivor-fold + skip-rebuild REGRESSED recovery
+
+**dead=[0] root cause + fix (commit `cde7dd2d65`, shipped).** `_maybe_recover_on_newly_dead_peers`
+derived the dead-EP set from the per-rank NIXL-EP kernel mask and dropped slot `r == self.dp_rank`.
+At tp>1 that conflates the EP-rank slot index with the DP rank, so **dp_rank 1 dropped the *real*
+dead EP1** (slot 1) and kept the **false-positive EP0** -- a degraded rank's *live* survivor briefly
+times out in peers' all-to-all -- reporting `dead=[0]` and redistributing for the survivor
+(harmless only because `num_redundant_experts` made the redistribute a no-op). Fix: derive the dead
+set **authoritatively** -- each engine publishes its OWN process-dead TP workers (executor
+`_dead_worker_ranks`, mapped `dp_rank*tp_size+t`) to the shared DP store (`self.dp_store`,
+set-once/monotonic); every DP rank recovers for the store union. A cheap mask/executor/`already`
+gate keeps the happy path at one mask read. Kill-test: **both engines log `[1]`** (dp0 via its
+executor, dp1 via the store), redistribute marks EP1, ~64s clean recovery, correct output, WD=0.
+(Bug caught in test: engine uses `self.vllm_config.parallel_config`, not `self.parallel_config`.)
+
+**Survivor-fold + skip-rebuild (uncommitted -- REGRESSED, do NOT ship as-is).** Follow-up edits
+folded EP slots -> DP ranks on BOTH sides (`rebuild_dp_ft_gloo_for_survivors` worker-side +
+`_maybe_recover_on_newly_dead_peers` actor-side: a DP rank survives unless *all* its TP workers are
+dead) AND **skipped the DP-gloo rebuild when `survivors == frozenset(range(dp_size))`** (TP-only
+death = unchanged DP membership). The fold LOGIC is correct (no more spurious `survivor group [1]`
+excluding dp0). But recovery **regressed badly**: first served request at **+482s** (vs ~64s), still
+intermittent ~8min post-kill, **30 NIXL dispatch timeouts to dead EP1 (`src_rank 1`)**.
+
+**Why:** the rebuild's rendezvous doubled as the **cross-survivor BARRIER** before the EPLB disk
+reload ("avoids the step-skew that reopens the kernel cascade"). Skipping it removed *both* the
+(unneeded) membership change *and* the (needed) barrier -> survivors mark EP1 dead / reload on
+different beats -> tokens keep routing to dead EP1 -> the crawl. **dp0's dummy runs are UNAFFECTED**
+(py-spy: EP0 mid-forward `sequence_parallel_chunk -> deepseek_v2.forward`) -- they're driven by the
+degrade-handler busy loop, NOT by wave-sync/survivor membership.
+
+**Fix direction (keep dp0 in the dummy runs):** skip only the *membership change*, NOT the barrier.
+For a TP-only death `rebuild_for_survivors` is correctly a no-op, but `recover_from_dead_peers`
+should still run a cross-survivor **barrier** (plain DP-group monitored-barrier / all-reduce over the
+survivors, incl. the dummy-running dp0) **before** `eplb_redistribute_for_dead_peers`, so everyone
+enters mark-dead/reload on the same beat. Small change in `recover_from_dead_peers`; leaves the
+survivor-fold + skip logic intact.
+
 ---
 
 ## TL;DR of progress
