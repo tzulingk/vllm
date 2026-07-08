@@ -1339,9 +1339,35 @@ class DPAsyncMPClient(AsyncMPClient):
                         continue
 
                     # Update local load-balancing state.
-                    counts, wave, running = msgspec.msgpack.decode(buf)
+                    decoded_msg = msgspec.msgpack.decode(buf)
+                    counts, wave, running = decoded_msg[:3]
                     self.current_wave = wave
                     self.engines_running = running
+
+                    # FT NIXL EP: the coordinator relays the set of DP engines
+                    # that reported degraded (a TP worker died; the engine
+                    # withdrew from serving but stays alive for the EP
+                    # all-to-all, so the Ray-actor-death monitor never fires).
+                    # Union them into dead_engine_indices so the dispatcher
+                    # routes around them, and error any in-flight requests we
+                    # already sent there (retryable). Level-triggered, so this
+                    # converges even if an individual relay message is missed.
+                    degraded = decoded_msg[3] if len(decoded_msg) > 3 else ()
+                    # ``dead_engine_indices`` + the in-flight abort live on the
+                    # load-balancing subclass; only that client routes around a
+                    # degraded engine (a plain DP client owns a single core).
+                    if degraded and isinstance(self, DPLBAsyncMPClient):
+                        for idx in degraded:
+                            if idx not in self.dead_engine_indices:
+                                self.dead_engine_indices.add(idx)
+                                logger.warning(
+                                    "FT NIXL EP: DP engine %d reported degraded "
+                                    "(relayed via coordinator); dispatcher will "
+                                    "skip it and error its in-flight requests "
+                                    "(clients retry).",
+                                    idx,
+                                )
+                                self._abort_in_flight_for_dead_engine(idx)
                     if counts is not None:
                         # Running and waiting counts are global from the
                         # Coordinator including all EngineCores. Slice to get

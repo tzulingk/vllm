@@ -198,6 +198,15 @@ class DPCoordinatorProc:
         current_wave = 0
         engines_running = False
 
+        # FT NIXL EP: DP engines that reported themselves degraded (a TP worker
+        # died so the engine withdrew from serving but stays alive for the EP
+        # all-to-all). Relayed to every front-end client so their load balancer
+        # routes around the withdrawn engine -- the actor is still alive, so the
+        # client's Ray-actor-death monitor never fires for this case. Level-
+        # triggered: the set is included in every stats publish so late-
+        # subscribing clients converge.
+        degraded_engines: set[int] = set()
+
         # For tracking request counts for internal load-balancing.
         stats_changed = False
         last_stats_step = -1
@@ -273,7 +282,12 @@ class DPCoordinatorProc:
                         engine_req_counts_list = self._get_engine_counts()
                         stats_changed = False
 
-                    to_publish = (engine_req_counts_list, current_wave, engines_running)
+                    to_publish = (
+                        engine_req_counts_list,
+                        current_wave,
+                        engines_running,
+                        sorted(degraded_engines),
+                    )
                     publish_front.send(msgspec.msgpack.encode(to_publish))
                     last_publish_time = int(time.time() * 1000)
                     continue
@@ -369,6 +383,31 @@ class DPCoordinatorProc:
                     assert outputs.utility_output is None
 
                     eng_index = outputs.engine_index
+
+                    # FT NIXL EP: an engine reported itself degraded. Remember
+                    # it and relay to front-ends immediately so the LB stops
+                    # routing to it (don't wait for the next stats tick).
+                    if outputs.tp_degraded is not None:
+                        degraded_idx = outputs.tp_degraded
+                        if degraded_idx not in degraded_engines:
+                            degraded_engines.add(degraded_idx)
+                            logger.warning(
+                                "DP Coordinator: engine %d reported degraded; "
+                                "relaying to front-end clients to route "
+                                "around it.",
+                                degraded_idx,
+                            )
+                            publish_front.send(
+                                msgspec.msgpack.encode(
+                                    (
+                                        None,
+                                        current_wave,
+                                        engines_running,
+                                        sorted(degraded_engines),
+                                    )
+                                )
+                            )
+
                     scheduler_stats = outputs.scheduler_stats
                     if scheduler_stats:
                         # 1. Updated request load stats - update our local
@@ -437,7 +476,12 @@ class DPCoordinatorProc:
                             self._send_start_wave(publish_back, wave, eng_index)
 
                 if wave_state_changed:
-                    message = (None, current_wave, engines_running)
+                    message = (
+                        None,
+                        current_wave,
+                        engines_running,
+                        sorted(degraded_engines),
+                    )
                     publish_front.send(msgspec.msgpack.encode(message))
 
     @staticmethod
