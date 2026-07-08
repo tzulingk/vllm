@@ -424,13 +424,23 @@ all-to-all; degrade-handler driven).
 EP1 dispatch timeouts **bounded at 25** (death-window burst then stop -- vs kill-test #4 where they
 never stopped); **dp0's EP0 stays dummy-running** (py-spy: `mla_attention.forward`); serving
 recovers. Recovery timeline: **no completions 0->~+48s** (NIXL detection + rebuild/redistribute
-landing), **first 200 at ~+48s**, **intermittent ~+48->~+145s** (EPLB disk reload + gloo/degrade
-settling), **fully clean (10/10 curls, ~0.4s) by ~+200s**. WD=0. Fixes the kill-test #4 regression
-(skip-rebuild -> never recovered, +482s).
+landing), **first 200 at ~+48s**, **intermittent ~+48->~+145s**, **fully clean (10/10 curls, ~0.4s)
+by ~+200s**. WD=0. Fixes the kill-test #4 regression (skip-rebuild -> never recovered, +482s).
 
-**Residual:** the ~150s intermittent-serving window during recovery is dominated by the EPLB **disk
-reload** of the dead peer's experts (+ gloo/degrade settling) -- bounded and recovers; shrinking it
-(faster/async expert reload) is the next optimization.
+**The recovery *mechanism* is fast and does NOT disk-reload.** Log timeline (kill t0): detection
++36s, redistribute + `rebuilt _expert_map` + `dp_rank=0 degraded` +37s, DP FT-gloo rebuilt (worker +
+actor) +42-43s -- all done by ~+43s. And with `num_redundant_experts` the redundant replicas cover
+the dead peer, so `reassign_missing_experts_inplace` returns **`reassignments=0`** (log: 3x, one per
+survivor) and `eplb_redistribute_for_dead_peers` **skips `reload_experts_from_disk`** entirely (it
+is gated on `if reassignments:`). No disk reload happens.
+
+**Residual (open):** so the ~150s intermittent-serving window is NOT the disk reload -- it is a
+*post-recovery settling* effect that begins AFTER the mechanism finishes (~+43s). Most likely the EP
+all-to-all coupling: dp1 (serving) still dispatches into the all-to-all where dp0's EP0 is
+dummy-running but not in lockstep, so some cross-DP dispatches hit the 5s NIXL timeout -> slow
+requests -> the intermittent load-loop `000`s, declining as the two find a rhythm. Needs its own
+diagnosis (re-run + py-spy dp1 during +48->+120s + see which dispatch times out); do NOT attribute
+it to the reload.
 
 ---
 
