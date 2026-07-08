@@ -407,6 +407,31 @@ survivors, incl. the dummy-running dp0) **before** `eplb_redistribute_for_dead_p
 enters mark-dead/reload on the same beat. Small change in `recover_from_dead_peers`; leaves the
 survivor-fold + skip logic intact.
 
+### 2026-07-08 — RESOLVED: drop the degraded DP rank (rebuild fires -> decouple + barrier), commit `d50de83368`
+
+The separate-barrier idea above is **superseded by a simpler fix: drop the *degraded* DP rank from
+the wave-sync survivor set**, not just fully-dead ranks. Fold EP slots -> DP ranks with an
+**all-TP-alive** predicate (`not any((d*tp_size+t) in dead ...)`) on BOTH sides (worker
+`rebuild_dp_ft_gloo_for_survivors` + actor `_maybe_recover_on_newly_dead_peers`); each side skips
+when it is not itself a survivor. For a TP-only death this gives `survivors = {dp1}` (not the full
+set), so the **rebuild FIRES** -- restoring *both* the wave-sync **decoupling** (dp1 no longer waits
+on the withdrawn dp0) *and* the rebuild's built-in **cross-survivor barrier** (no separate barrier
+needed). Robust to the kernel-mask false-positive (EP0 *or* EP1 in `dead` -> the degraded dp0 is
+excluded either way). dp0 stays in the dummy runs (dropped from the DP *wave-sync* gloo, NOT the EP
+all-to-all; degrade-handler driven).
+
+**Kill-test (kill EP1, TP2xDP2):** both engines log `[1]`; rebuild fires to `survivor group [1]`;
+EP1 dispatch timeouts **bounded at 25** (death-window burst then stop -- vs kill-test #4 where they
+never stopped); **dp0's EP0 stays dummy-running** (py-spy: `mla_attention.forward`); serving
+recovers. Recovery timeline: **no completions 0->~+48s** (NIXL detection + rebuild/redistribute
+landing), **first 200 at ~+48s**, **intermittent ~+48->~+145s** (EPLB disk reload + gloo/degrade
+settling), **fully clean (10/10 curls, ~0.4s) by ~+200s**. WD=0. Fixes the kill-test #4 regression
+(skip-rebuild -> never recovered, +482s).
+
+**Residual:** the ~150s intermittent-serving window during recovery is dominated by the EPLB **disk
+reload** of the dead peer's experts (+ gloo/degrade settling) -- bounded and recovers; shrinking it
+(faster/async expert reload) is the next optimization.
+
 ---
 
 ## TL;DR of progress
