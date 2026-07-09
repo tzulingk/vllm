@@ -3,6 +3,7 @@
 import copy
 import os
 import threading
+import time
 import weakref
 from collections import defaultdict, deque
 from dataclasses import dataclass
@@ -271,6 +272,9 @@ class RayExecutorV2(MultiprocExecutor):
         # inherited from MultiprocExecutor). Only active under VLLM_USE_FT_NCCL_TP.
         self._dead_worker_ranks: set[int] = set()
         self._ft_tolerate_worker_death = envs.VLLM_USE_FT_NCCL_TP
+        # FT TIMING (DYN-3441): monotonic stamp of the first observed TP-worker
+        # death, so the engine can report every recovery phase as elapsed-since.
+        self._ft_dead_at: float | None = None
 
         # Step 1: Initialize Ray cluster and retrieve placement group
         if ray is None:
@@ -510,10 +514,15 @@ class RayExecutorV2(MultiprocExecutor):
                         idx = ref_to_idx[r]
                         if idx not in executor._dead_worker_ranks:
                             executor._dead_worker_ranks.add(idx)
+                            # FT TIMING: stamp t0 (first observed death) so the
+                            # engine can report every recovery phase as elapsed
+                            # since the death (see DYN-3441).
+                            if executor._ft_dead_at is None:
+                                executor._ft_dead_at = time.monotonic()
                             logger.warning(
                                 "FT NIXL EP: Ray TP worker (idx %d) died; keeping "
                                 "the DP engine alive (degraded); broadcast writer "
-                                "+ response collection skip it.",
+                                "+ response collection skip it. [FT TIMING t0]",
                                 idx,
                             )
                             if executor.rpc_broadcast_mq is not None:

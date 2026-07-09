@@ -1999,6 +1999,7 @@ class DPEngineCoreProc(EngineCoreProc):
                 # surviving GPU keeps participating in the EP all-to-all.
                 executed = False
             else:
+                _step_t0 = time.monotonic()
                 try:
                     executed = self._process_engine_step()
                 except Exception:
@@ -2011,14 +2012,31 @@ class DPEngineCoreProc(EngineCoreProc):
                     if envs.VLLM_USE_FT_NCCL_TP and getattr(
                         self.model_executor, "_dead_worker_ranks", None
                     ):
+                        # FT TIMING (DYN-3441): how long the in-flight step blocked
+                        # before the dead peer aborted it -- the survivor's forward
+                        # crawling on the dead peer's NIXL-EP all-to-all.
                         logger.warning(
                             "FT NIXL EP: dp_rank=%d engine step aborted by a "
-                            "TP-worker death; going degraded.",
+                            "TP-worker death; going degraded. "
+                            "[FT TIMING step blocked %.1fs]",
                             self.dp_rank,
+                            time.monotonic() - _step_t0,
                         )
                         executed = False
                     else:
                         raise
+                else:
+                    _step_dt = time.monotonic() - _step_t0
+                    if _step_dt > 2.0 and getattr(
+                        self.model_executor, "_dead_worker_ranks", None
+                    ):
+                        logger.warning(
+                            "FT TIMING: dp_rank=%d _process_engine_step returned in "
+                            "%.1fs while a TP worker was dead (degraded forward "
+                            "crawl).",
+                            self.dp_rank,
+                            _step_dt,
+                        )
             self._maybe_publish_request_counts()
 
             local_unfinished_reqs = self.scheduler.has_unfinished_requests()
@@ -2070,11 +2088,30 @@ class DPEngineCoreProc(EngineCoreProc):
         ranks (some `-1`, some `0`), which would produce false-positive
         divergences (see DYN-3138). Truncate before comparing.
         """
+        _mq_t0 = time.monotonic()
         try:
             masks: list[Any] = self.collective_rpc("query_nixl_ep_mask")
         except Exception as e:
-            logger.warning("NIXL EP REPRO: query_nixl_ep_mask RPC raised %s", e)
+            # FT TIMING (DYN-3441): how long the mask-query gate itself blocked,
+            # and how far into the recovery window we are.
+            _dead_at = getattr(self.model_executor, "_ft_dead_at", None)
+            _since = (
+                f"; +{time.monotonic() - _dead_at:.1f}s since death"
+                if _dead_at is not None
+                else ""
+            )
+            logger.warning(
+                "NIXL EP REPRO: query_nixl_ep_mask RPC raised %s (blocked %.1fs%s)",
+                e,
+                time.monotonic() - _mq_t0,
+                _since,
+            )
             return None
+        _mq_dt = time.monotonic() - _mq_t0
+        if _mq_dt > 2.0:
+            logger.warning(
+                "FT TIMING: query_nixl_ep_mask RPC took %.1fs (slow)", _mq_dt
+            )
 
         raw = next((m for m in masks if m is not None), None)
         if raw is None:
@@ -2339,15 +2376,26 @@ class DPEngineCoreProc(EngineCoreProc):
         if not newly_dead:
             return
 
+        # FT TIMING (DYN-3441): how far into the recovery window the trigger
+        # actually fires -- the gap from t0 to here is dominated by the survivor's
+        # degraded forward crawling (see the get_response rank-reply timing).
+        _dead_at = getattr(self.model_executor, "_ft_dead_at", None)
+        _since = (
+            f" [FT TIMING +{time.monotonic() - _dead_at:.1f}s since death]"
+            if _dead_at is not None
+            else ""
+        )
         logger.warning(
             "FT EP: authoritative dead-EP set %s (this rank's process-dead "
             "workers %s) on dp_rank=%d; triggering recover_from_dead_peers for "
-            "newly-dead %s.",
+            "newly-dead %s.%s",
             sorted(global_dead),
             sorted(self.dp_rank * tp_size + t for t in local_dead),
             self.dp_rank,
             newly_dead,
+            _since,
         )
+        _rec_t0 = time.monotonic()
         try:
             self.collective_rpc("recover_from_dead_peers", args=(newly_dead,))
         except Exception as e:
@@ -2358,6 +2406,15 @@ class DPEngineCoreProc(EngineCoreProc):
                 e,
             )
             return
+        logger.warning(
+            "FT TIMING: recover_from_dead_peers RPC took %.1fs%s",
+            time.monotonic() - _rec_t0,
+            (
+                f" (+{time.monotonic() - _dead_at:.1f}s since death)"
+                if _dead_at is not None
+                else ""
+            ),
+        )
         already.update(newly_dead)
 
         # FT NIXL EP: rebuild the actor-side wave-sync survivor group. The

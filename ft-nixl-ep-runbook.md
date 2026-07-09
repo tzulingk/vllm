@@ -5016,3 +5016,66 @@ Per-run artifacts under `ft-test-logs/run-2026-06-29-test{1,2}-*/` (serve logs,
 captures, dumps, mapcheck, notes). New-pod-per-test (no in-pod restart -- pkill
 self-matches; Ray doesn't recover cleanly). `eplb-capture.sh <out>` = deterministic
 greedy capture for the #1 diff. DYN-3293 comments: #1 `f28663ee`, #2 `9987c4fb`.
+
+## 2026-07-09 — DYN-3441: where the ~40s TP-recovery window goes (instrumented)
+
+Added `FT TIMING` instrumentation (5 points), redeployed, re-ran the kill-test.
+**Answer: ~35 of the ~40s is the survivor's `execute_model` forward crawling on the
+dead peer's NIXL-EP all-to-all** — NOT detection (instant) and NOT the recovery
+machinery (`recover_from_dead_peers` = 0.7s).
+
+### Instrumentation (branch `ft-nixl-ep-ftnccl-tp`, `grep "FT TIMING"`)
+- `ray_executor_v2.py` — stamp `executor._ft_dead_at = time.monotonic()` on the first
+  observed death (t0) so every phase is reported as elapsed-since-death.
+- `multiproc_executor.py` `get_response` — per-rank dequeue timing: log a SURVIVOR
+  rank's reply time when a peer is dead (>2s) + the abort duration on a dead rank.
+- `core.py` `_query_local_kernel_mask` — mask-query RPC duration + elapsed on raise.
+- `core.py` `_maybe_recover_on_newly_dead_peers` — elapsed-since-death at the trigger
+  + `recover_from_dead_peers` RPC duration.
+- `core.py` `run_busy_loop` — `_process_engine_step` blocked/returned duration while a
+  worker is dead.
+
+### Per-phase breakdown (kill `Worker_DP1_TP1_EP3` GPU1 @ t0 = 01:22:26.35)
+| phase | elapsed | duration | evidence |
+|---|---|---|---|
+| executor detects death | +<1s | <1s (≤5s bound) | `Ray TP worker (idx 1) died [t0]` |
+| **survivor forward crawl** | **0 → +35s** | **35.1s** | `get_response rank 0 replied after 35.1s during 'execute_model'` |
+| mask-query dead-detect | +35 → +36s | 1.0s | `get_response ABORTED on dead rank 1 after 1.0s` |
+| trigger fires (degraded dp1) | +36.0s | — | `authoritative dead-EP set [3] on dp_rank=1` |
+| recover_from_dead_peers RPC | +36.7s | 0.7s | `recover_from_dead_peers RPC took 0.7s` |
+| survivor DP recovery lands | +42s | — | `rebuilt DP FT-gloo survivor group [0]` |
+| first HTTP 200 | +52s | — | `req=8067 code=200` (correct output) |
+
+### Root cause: ONE 30s nixl_ep Buffer default timeout (NOT ~7×5s)
+The raw log shows the survivor goes **silent for the whole ~35s** — last forward log is a
+single `modular_kernel: FT NIXL EP MoE: received 14 tokens` at t0, then nothing until the
+abort at +35s. It is **one blocking op**, not a per-layer loop. The survivor's forward
+blocks in a single nixl_ep dispatch/combine `recv_hook` (`prepare_finalize/nixl_ep.py:271`
+dispatch → `hook()` at :337) waiting on the dead peer's RDMA receive, and waits out the
+**nixl_ep Buffer timeout**:
+- `nixl_ep.Buffer.__init__` default is **`timeout_ms: int = 30000`** (confirmed on the pod
+  via `inspect.signature`).
+- vLLM builds the Buffer at `all2all.py:374` as `Buffer(rank=..., tcp_store_group=...)` —
+  **no `timeout_ms`** → runs on the **30s default**. 30s + ~5s to reach/unwind ≈ ~35s
+  (consistent across runs = a fixed timeout, not a variable crawl).
+- **`VLLM_NIXL_EP_TIMEOUT_MS=5000` is inert**: comment-only (`dp_utils.py:21`), never read
+  in `envs.py`, never passed to `Buffer()`. `self_adapt` handles the FT-NCCL TP all-reduce
+  fast, but the nixl_ep all-to-all has no equivalent and simply waits out the 30s.
+
+Everything downstream (trigger, gloo rebuild, redistribute, LB relay) is serialized *behind*
+this block on the worker's broadcast MQ — which is why the mask-query gate also reads 35.1s.
+
+### Fix directions
+1. **Pass `timeout_ms` into `Buffer(...)`** (all2all.py:374) — wire `VLLM_NIXL_EP_TIMEOUT_MS`
+   through, or set a few seconds. Caps the dominant 30s → recovery ~40s → ~10s. Near-trivial.
+   (Just exporting `VLLM_NIXL_EP_TIMEOUT_MS` does nothing today — it must be plumbed into the
+   ctor.)
+2. **Proactively mark the dead peer inactive in the nixl_ep active mask** on death detection
+   (self_adapt-equivalent for the EP all-to-all) so the `recv_hook` never waits for it. Deeper
+   fix; the Buffer already has `active_ep_size` / `connect_ranks` machinery
+   (`all2all.py:_connect_to_ep_size`).
+3. Interrupt the in-flight `execute_model` on `_dead_worker_ranks` populate (harder; #1/#2
+   subsume it).
+
+Local evidence: `dyn3441-logs/dyn3441_timing.txt`, `dyn3441-logs/killinfo.txt`.
+Linear: DYN-3441 comment `0a987691`.

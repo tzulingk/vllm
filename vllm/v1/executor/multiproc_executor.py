@@ -467,6 +467,12 @@ class MultiprocExecutor(Executor):
                     except TimeoutError as e:
                         raise TimeoutError(f"RPC call to {method} timed out.") from e
                 else:
+                    m_name = (
+                        method
+                        if isinstance(method, str)
+                        else getattr(method, "__name__", "callable")
+                    )
+                    rank_start = time.monotonic()
                     while True:
                         if deadline is None:
                             step = _FT_DEAD_POLL_S
@@ -477,9 +483,30 @@ class MultiprocExecutor(Executor):
                             step = min(_FT_DEAD_POLL_S, remaining)
                         try:
                             status, result = mq.dequeue(timeout=step)
+                            # FT TIMING (DYN-3441): when a peer is dead, surface how
+                            # long a SURVIVOR rank's reply took -- this is the
+                            # degraded forward crawling on the dead peer's NIXL-EP
+                            # all-to-all, the dominant slice of the recovery window.
+                            waited = time.monotonic() - rank_start
+                            if self._dead_worker_ranks and waited > 2.0:
+                                logger.warning(
+                                    "FT TIMING: get_response rank %d replied after "
+                                    "%.1fs during RPC '%s' (dead=%s)",
+                                    rank,
+                                    waited,
+                                    m_name,
+                                    sorted(self._dead_worker_ranks),
+                                )
                             break
                         except TimeoutError as e:
                             if rank in self._dead_worker_ranks:
+                                logger.warning(
+                                    "FT TIMING: get_response ABORTED on dead rank "
+                                    "%d after %.1fs during RPC '%s'",
+                                    rank,
+                                    time.monotonic() - rank_start,
+                                    m_name,
+                                )
                                 raise RuntimeError(
                                     f"FT NIXL EP: awaited TP worker {rank} died "
                                     f"during RPC '{method}'; aborting so the "
