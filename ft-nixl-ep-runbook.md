@@ -457,9 +457,21 @@ routing to dp0. **The ~50% alternation is gone** -- the load-loop `200OK/total` 
 **every request succeeds from ~+48s**; 8/8 spot curls 200 (~0.6s). dp0's EP0 still dummy-running,
 both engines `[1]`, rebuild fires to `{dp1}`, WD=0.
 
-**Net TP>1 recovery (kill 1 TP worker):** ~2 requests lost in the ~48s detection+recovery window,
+**Net TP>1 recovery (kill 1 TP worker):** ~2 requests lost in the ~40s detection+recovery window,
 then clean 100% serving on the healthy DP rank; the degraded DP rank stays in the EP all-to-all via
 dummy batches.
+
+**Recovery timeline (kill EP1, LB-relay build) -- compare against the pre-relay run above:**
+
+| window | what serving did |
+|---|---|
+| **0 -> ~+40s** | **Detection + recovery window -- nothing completes (~2 requests time out).** Neither DP rank serves yet: dp1's forward still crawls on dead EP1 (before redistribute marks it dead + rebuild decouples dp1), dp0 is degraded. In this window: ~5s NIXL-EP timeout notices EP1 gone -> both engines report dead-set `[1]` -> DP-gloo rebuilds to `{dp1}` -> EPLB redistribute runs (`reassignments=0`, no disk reload) -> coordinator **relays dp0's degradation to the LB** (~+32s). |
+| **~+40s** | **First HTTP 200** -- recovery landed; the LB now routes only to dp1 (skips the withdrawn dp0). |
+| **~+40s onward** | **Fully clean -- 100%.** Every request succeeds; 200OK climbs at the same rate as total (gap pinned at **2** = the death-window requests): 7/9 -> 13/15 -> 20/22 -> ... -> 81/83. 8/8 spot curls 200 (~0.6s). |
+
+The pre-relay middle row (`~+48 -> ~+145s intermittent ~50%`) is **gone**: once the LB learns dp0 is
+degraded and dp1's recovery lands, serving jumps straight to 100%. Recovery collapsed from "clean by
+~+200s" to "clean from ~+40s".
 
 ---
 
