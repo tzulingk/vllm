@@ -374,6 +374,10 @@ class NixlEPAll2AllManager(All2AllManagerBase):
         buffer = Buffer(
             rank=self.rank,
             tcp_store_group=self.tcp_store_group.store,
+            # Wire the vLLM env through: without it the nixl_ep library default
+            # (30000ms) applies and a dead peer stalls the survivor's forward for
+            # ~30s before the kernel masks it (DYN-3441).
+            timeout_ms=envs.VLLM_NIXL_EP_TIMEOUT_MS,
         )
         buffer.update_memory_buffers(
             num_ranks=self.max_num_ep_ranks,

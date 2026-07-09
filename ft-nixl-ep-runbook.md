@@ -5079,3 +5079,26 @@ this block on the worker's broadcast MQ — which is why the mask-query gate als
 
 Local evidence: `dyn3441-logs/dyn3441_timing.txt`, `dyn3441-logs/killinfo.txt`.
 Linear: DYN-3441 comment `0a987691`.
+
+### Fix #1 applied + validated — wire `VLLM_NIXL_EP_TIMEOUT_MS` into the Buffer
+Plumbed the env through (`envs.py` typed decl + lambda, default **5000**) and passed it to
+the ctor: `all2all.py:374` now `Buffer(rank=..., tcp_store_group=..., timeout_ms=envs.VLLM_NIXL_EP_TIMEOUT_MS)`.
+Re-ran the kill-test (kill `EP1`/GPU1 @ t0=20:56:38.66):
+
+| metric | 30s default (before) | **5s wired (after)** |
+|---|---|---|
+| survivor forward block | 35.1s | **10.0s** (2×5s: dispatch + combine each pay one 5s timeout before the kernel masks) |
+| trigger fires | +36s | **+11s** |
+| `recover_from_dead_peers` | 0.7s | 0.7s |
+| survivor DP recovery lands | +42s | **+16s** |
+| first HTTP 200 | +52s | **+18s** |
+| failed reqs | ~2–5 retryable | 5 retryable (code 500/000), outputs correct |
+
+Net: the ~40s window is roughly **halved to ~16–18s**. The residual is now the *configured*
+5s timeout paid a few times (dispatch+combine on the survivor forward = 2×5s, plus the mask
+query + `refresh_ft_nccl_tp_membership` draining at ~5s each). Lower `VLLM_NIXL_EP_TIMEOUT_MS`
+further to shrink it, or apply fix #2 (proactive `update_mask_buffer` on death) to skip the
+timeout entirely. **NOTE:** `VLLM_NIXL_EP_TIMEOUT_MS` doubles as the FT design's assumed
+all-to-all window (`dp_utils.py:21`; cascade guard tuned "well under 5s") — keep them
+consistent if you retune it.
+Local evidence: `dyn3441-logs/dyn3441_fix_timing.txt`.
