@@ -37,7 +37,6 @@ from torch.distributed import ProcessGroup, all_reduce
 
 from vllm.config import ModelConfig, ParallelConfig
 from vllm.distributed.parallel_state import (
-    get_dp_group,
     get_ep_group,
     get_eplb_group,
     get_node_count,
@@ -1034,7 +1033,7 @@ class EplbState:
           survivors only. A dead rank's physical slots carry zero load on every
           survivor (nothing routes to a dead rank), so the survivor sum needs no
           dead-column backfill.
-        * Steady state (all peers alive): full DP gloo group, completes in well
+        * Steady state (all peers alive): full EP gloo group, completes in well
           under the fail-fast bound.
         * Death window (peer dead, recovery not yet done): the full-group
           all-reduce includes the dead peer and times out at the fail-fast bound;
@@ -1045,8 +1044,15 @@ class EplbState:
         degraded -- the per-rank load views diverge then, and a shuffle would
         both be inconsistent and block on the dead peer.
 
-        Note: the gloo group is the DP group (== EP group for TP=1, the current
-        FT deployment); TP>1 would need an EP-indexed gloo group (future work).
+        The steady-state / death-window path reduces over
+        ``get_ep_group().cpu_group`` -- the EP-wide gloo group (all dp*tp ranks) --
+        so every EP rank agrees on the global load and computes an identical
+        rearrangement map. A DP-scoped reduce is only the full EP set at TP=1; at
+        TP>1 it splits the load across the two TP halves, so the halves computed
+        divergent maps and the (full-EP) weight shuffle deadlocked on mismatched
+        P2P (DYN-3541). The post-recovery survivor path below is still DP-indexed,
+        but rearrangement is gated off while degraded, so it is not yet exercised
+        at TP>1 (tracked as future work).
         """
         ft = self._ft_survivor_group()
         if ft is not None and ft.has_group:
@@ -1062,7 +1068,7 @@ class EplbState:
             self._ep_all_reduce_valid = valid
             return tensor
 
-        cpu_group = get_dp_group().cpu_group
+        cpu_group = get_ep_group().cpu_group
         if cpu_group is None or cpu_group.size() <= 1:
             self._ep_all_reduce_valid = True
             return tensor
@@ -1074,7 +1080,7 @@ class EplbState:
         except (RuntimeError, ValueError, TimeoutError) as e:
             logger.warning_once(
                 "FT NIXL EP: EPLB load all_reduce failed/timed out after %dms "
-                "(%s: %s); a DP peer is likely dead. Proceeding with local-only "
+                "(%s: %s); an EP peer is likely dead. Proceeding with local-only "
                 "expert load this pass; rearrangement is skipped until recovery.",
                 _EPLB_ALLREDUCE_FAILFAST_MS,
                 type(e).__name__,

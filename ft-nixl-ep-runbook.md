@@ -5102,3 +5102,124 @@ timeout entirely. **NOTE:** `VLLM_NIXL_EP_TIMEOUT_MS` doubles as the FT design's
 all-to-all window (`dp_utils.py:21`; cascade guard tuned "well under 5s") — keep them
 consistent if you retune it.
 Local evidence: `dyn3441-logs/dyn3441_fix_timing.txt`.
+
+## Test scripts + how to run (DYN-3441 / DYN-3460)
+
+Scripts live locally in `/Users/tzulingk/Work/workspace_vllm/` and are deployed to the pod's
+`/tmp/` via `kubectl cp`. Pod `vllm-ftnccl-tp`, ns `tzulingk-ft-tests`, container `vllm`.
+vLLM install on the pod: `/usr/local/lib/python3.12/dist-packages/vllm`.
+
+### Deploy a code change + restart the serve
+```bash
+P=/usr/local/lib/python3.12/dist-packages/vllm
+kubectl cp vllm/<path>.py tzulingk-ft-tests/vllm-ftnccl-tp:$P/<path>.py -c vllm
+kubectl -n tzulingk-ft-tests exec vllm-ftnccl-tp -c vllm -- bash -lc '
+  MAIN=$(ps -eo pid,cmd --no-headers | grep "[v]llm serve" | awk "{print \$1}" | head -1)
+  kill -TERM $MAIN; sleep 5; ray stop --force; sleep 3      # full teardown (ray leaves zombies otherwise)
+  cd /tmp; nohup bash /tmp/serve-eplb-tp2.sh > /tmp/serve.log 2>&1 &'
+# wait for ready: curl -s -o /dev/null -w "%{http_code}" http://localhost:8000/health  == 200
+```
+
+### Serve variants (pod `/tmp/`, local `workspace_vllm/`)
+- `serve-eplb-tp2.sh` — EPLB **quiescent** (`step_interval=1e8`). The validated recovery config;
+  every passing kill-test used this.
+- `serve-eplb-active.sh` — EPLB **active** (`step_interval=20`), rearrange fires. Was
+  **deadlocking** (DYN-3460); **FIXED** by DYN-3541 (EP-indexed gloo in `_ep_all_reduce`).
+
+### Kill-tests
+- **Timing kill-test (DYN-3441):** `bash /tmp/killtest_timing.sh` — 4 load streams, kills the
+  GPU1 worker, records `/tmp/killinfo.txt`. Analyze: `grep "FT TIMING" /tmp/serve.log`.
+- **EPLB-active coherence kill-test (DYN-3460):** `python3 /tmp/eplb_killtest.py` — varied
+  prompts with known answers, kills mid-load; coherence in `/tmp/eplb_load.log`
+  (`[OK]`/`[MISS]`/`[FAIL]`), kill info in `/tmp/eplb_killinfo.txt`.
+
+### Diagnostics
+- **Hang py-spy:** `bash /tmp/eplb_hang_diag.sh` — one request + py-spy the 4 workers + 2
+  engine actors (captures the deadlock stack).
+- **Heavy-load probe:** `bash /tmp/probe_heavy.sh` — 12 concurrent streams; prints response
+  codes + rearrange count.
+
+### Analyze log lines
+```bash
+grep "FT TIMING" /tmp/serve.log         # recovery-phase timings (DYN-3441)
+grep "Rearranged experts" /tmp/serve.log # EPLB rearrange events (eplb_state.py:931)
+grep "FT EPLB DEBUG" /tmp/serve.log      # per-rank placement-map checksums (DYN-3460 deadlock)
+grep "Ray TP worker .* died" /tmp/serve.log  # executor death detection (t0)
+```
+
+### Linear posters (local, `/Users/tzulingk/Work/`)
+`post_dyn3441_*.py`, `create_dyn*_*.py`, `post_dyn3460_blocker.py`, `update_dyn3441.py` — each
+posts/updates a Linear issue via the GraphQL API (`python3 <file>`).
+
+## 2026-07-09 — DYN-3460: EPLB-active rearrange DEADLOCKS at TP>1 (root cause)
+
+Set up `serve-eplb-active.sh` (`step_interval=20`) to run the EPLB-active kill-test. **Serving
+deadlocks on the first load-driven rearrange, before any kill** (single req + 12 concurrent
+both -> HTTP 000). py-spy: all 4 workers stuck in `rearrange_expert_weights_inplace`
+(`move_to_buffer`/`move_from_buffer`). So the kill-test is blocked.
+
+### Root cause
+`EplbState._ep_all_reduce` (`eplb_state.py:1060`) all-reduces the expert load over the **DP
+group** (`get_dp_group().cpu_group`, line 1100), not the full EP group. Its own docstring
+(1083-1084): *"the gloo group is the DP group (== EP group for TP=1 ...); TP>1 would need an
+EP-indexed gloo group (future work)."*
+- TP=1: DP group == EP group -> correct (why every prior FT test passed).
+- TP=2: the DP group only spans dp-ranks sharing a tp-rank, so the load is summed **within
+  each TP half** (tp0={ep0,ep2}, tp1={ep1,ep3}), not across TP. The halves get different
+  load vectors -> `rebalance_experts` yields different `new_physical_to_logical_map` per TP
+  half -> the shuffle's `add_send`/`add_recv` (derived from `new_indices`,
+  `rebalance_execute.py:280`) mismatch -> `communicator.execute()` NCCL P2P deadlocks.
+
+### Evidence (per-rank `FT EPLB DEBUG` checksums)
+| ep_rank | (dp,tp) | new_ck |
+|---|---|---|
+| 0 dp0/tp0 | | **177166761** |
+| 1 dp0/tp1 | | **176336860** |
+| 2 dp1/tp0 | | **177166761** |
+| 3 dp1/tp1 | | **176336860** |
+
+new_ck splits **exactly by tp-rank**; old_ck + load_sum (42276.0) identical. Instrumentation
+(uncommitted debug) in `eplb_state.py` writes `/tmp/eplb_ck_{0..3}.txt` per rank (the deadlocked
+workers' stdout never flushes through Ray, so the file write is how we compared).
+
+### Fix
+Make the EPLB load all-reduce span the **full EP group** (all dp x tp) at TP>1 — the
+"EP-indexed gloo group (future work)" the docstring names — with the same fail-fast wait. Then
+all ranks compute the same map and the shuffle matches. Re-run `eplb_killtest.py` after.
+Linear: DYN-3460 comment `7962601d`. Evidence: `dyn3441-logs/dyn3460_rearrange_deadlock_pyspy.txt`.
+
+## 2026-07-10 — DYN-3541: EP-indexed gloo fix — VALIDATED
+
+Implemented the fix the DYN-3460 root cause named. `_ep_all_reduce` now reduces the EPLB
+expert load over the **full EP group** instead of the DP group:
+- `eplb_state.py`: `cpu_group = get_ep_group().cpu_group` (was `get_dp_group().cpu_group`) —
+  the EP-wide gloo group (all dp×tp ranks), already used by `_all_ranks_result_ready`. Same
+  bounded fail-fast wait; degrade-to-local unchanged. Dropped the now-unused `get_dp_group`
+  import and the `FT EPLB DEBUG` checksum instrumentation.
+- The post-recovery survivor path (`ft.all_reduce`, DP-indexed) is unchanged — rearrangement
+  is gated off while degraded (dead columns present), so it is not yet exercised at TP>1
+  (future work; note in the `_ep_all_reduce` docstring).
+
+### Validation — EPLB-active, `serve-eplb-active.sh` (step_interval=20), no kill
+| check | pre-fix | post-fix |
+|---|---|---|
+| 12 concurrent streams (35 s) | 12/12 HTTP 000 (deadlock) | **108/108 HTTP 200** |
+| correctness (5 capitals, temp=0) | — | **5/5 correct** (Paris/Tokyo/Rome/Berlin/Madrid) |
+| load-driven rearranges | deadlocked on 1st | **17 fired, serving stayed up** |
+| EPLB load all_reduce timeouts | — | **0** (EP-group gloo completes cleanly) |
+
+DYN-3460's blocker is resolved by this fix. Linear: DYN-3541.
+
+### Validation — EPLB-active + KILL (DYN-3460 acceptance, `eplb_killtest.py`)
+25 s warmup (rearranges fire) → kill GPU1 worker mid-load → 50 s post-kill. All acceptance
+criteria pass:
+- **Rearranges before the kill:** 3. **After:** 143. EPLB active throughout, no deadlock.
+- **Coherence:** 64 `[OK]`, **0 `[MISS]` (no garble)**, 8 retryable death-window failures
+  (7 curl-timeout + 1×500).
+- **Recovery ~19 s:** death detected `20:09:06` → dead-EP set `[1]` +11 s → DP FT-gloo rebuilt
+  +16 s → `recover_from_dead_peers` +19 s (with EPLB active the recover RPC is ~8 s vs 0.7 s
+  quiescent — it now also drives the survivor redistribute under load). Consistent with the
+  DYN-3441 timeout fix; no corruption.
+
+Net: the EP-indexed gloo fix makes EPLB-active serving work at TP>1 both in steady state and
+across a TP-worker death + recovery.
