@@ -5223,3 +5223,40 @@ criteria pass:
 
 Net: the EP-indexed gloo fix makes EPLB-active serving work at TP>1 both in steady state and
 across a TP-worker death + recovery.
+
+## 2026-07-16 — DYN-3541/3460: survivor-path (Path B) EP-indexed gloo (implemented, validation infra-blocked)
+
+The DYN-3541 fix above only fixed `_ep_all_reduce` **Path A** (steady state,
+`get_ep_group().cpu_group`). **Path B** — the post-recovery survivor reduce (`ft.all_reduce`
+over the FT survivor gloo) — was still **DP-keyed**. At TP>1 the DP-keyed survivor gloo
+(`get_dp_ft_gloo`, `my_global_rank = data_parallel_rank`) collapses both TP ranks of a DP onto
+one identity, so once **>=2 DP ranks survive** its `rebuild_for_survivors` rendezvous has
+duplicate ranks (two rank-0 masters, two rank-1) → hangs / mixes ranks → divergent maps →
+weight-shuffle deadlock. Latent today only because rearrange is gated off while degraded, and
+because a single-node TP2×DP2 kill collapses survivors to one DP (world_size=1, no rendezvous).
+
+### Fix (this change) — add a second, EP-keyed survivor gloo
+- `distributed/elastic_ep/ft_gloo.py`: `get/init/reset_ep_ft_gloo` holder (reuses
+  `FaultTolerantGlooGroup`, keyed on EP rank so every process has a unique identity).
+- `v1/worker/gpu_worker.py`: init the EP holder at **TP>1** (`ep_rank = dp_rank*tp_size +
+  tp_rank`, `ep_size`); `rebuild_ep_ft_gloo_for_survivors` rebuilds over the EP ranks of the
+  fully-surviving DPs; called from `recover_from_dead_peers` alongside the DP rebuild.
+- `distributed/eplb/eplb_state.py`: `_ft_survivor_group` prefers `get_ep_ft_gloo()` (falls back
+  to the DP holder at TP=1, where DP == EP and the EP holder is not initialized).
+- Consumers `_run_ar` (DP wave-sync) and the EPLB communicator barrier keep the DP holder
+  (they are genuinely cross-DP); only EPLB's load reduce moves to the EP holder.
+
+### Validation status — **implemented, but the full kill-test is INFRA-BLOCKED**
+- Syntax-clean (local + on-pod `py_compile`); the EP holder init **runs cleanly at boot** (the
+  `initialized EP FT-gloo holder (ep_rank=…, ep_size=4)` log fires on both engines, no error).
+- **Could not run the kill-test.** The prior test pod was evicted; recreating the pod on
+  gcp-dev-02 hits a **systemic DP GPU-placement bug at boot** — `RuntimeError: Expected all
+  tensors to be on the same device, but got index is on cuda:2, different from other tensors on
+  cuda:0` in `vocab_parallel_embedding` during `profile_run` (`determine_available_memory`).
+  Reproduced on **two nodes** (`w0e-…-mb4d`, `o7v-…-60xv`) and **with HEAD code** (reverted my
+  3 files) — so it is **not this change**; it is an environment/cluster regression (the same
+  image+config served fine earlier this session on node `tj86`, which is now busy).
+- Net: fix is landed on the branch; the single-DP-survivor no-regression + the 2-member EP
+  rendezvous ({EP0,EP1}) still need a clean 4-GPU boot to validate, and the true >=2-surviving-DP
+  case needs >=6 GPUs. Retest on a healthy node (e.g. `tj86` when free) or once the cluster
+  device-placement bug is resolved.

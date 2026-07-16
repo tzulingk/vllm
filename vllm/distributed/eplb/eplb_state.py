@@ -971,14 +971,18 @@ class EplbState:
         steady state (no death), so the normal full-group NCCL path runs with
         zero overhead.
 
-        Note: the FT-gloo group is indexed by DP rank. For TP=1 (current FT
-        deployments) the EP group equals the DP group, so the survivor set
-        lines up with the EP ranks. TP>1 would need an EP-indexed survivor
-        group; tracked as future work.
+        At TP>1 this uses the **EP-keyed** survivor group (``get_ep_ft_gloo``):
+        the DP-keyed group collapses both TP ranks of a DP onto one identity, so
+        its survivor rendezvous breaks once >=2 DP ranks survive and the load
+        reduce can't sum over the surviving EP ranks (DYN-3541). At TP=1 DP == EP
+        and the EP holder is not initialized, so we fall back to the DP group.
         """
-        from vllm.distributed.elastic_ep.ft_gloo import get_dp_ft_gloo
+        from vllm.distributed.elastic_ep.ft_gloo import (
+            get_dp_ft_gloo,
+            get_ep_ft_gloo,
+        )
 
-        ft = get_dp_ft_gloo()
+        ft = get_ep_ft_gloo() or get_dp_ft_gloo()
         if ft is not None and ft.has_group:
             return ft
         return None

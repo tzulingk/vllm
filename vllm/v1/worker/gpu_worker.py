@@ -321,13 +321,18 @@ class Worker(WorkerBase):
            DP FT-gloo group. Its rendezvous doubles as the cross-survivor
            barrier, so every survivor enters the slow disk reload on the same
            beat (avoids the step-skew that reopens the kernel cascade).
-        2. ``eplb_redistribute_for_dead_peers`` -- deterministic local EPLB
+        2. ``rebuild_ep_ft_gloo_for_survivors`` -- (re)build the EP-keyed
+           survivor group EPLB's load all-reduce reduces over at TP>1 (no-op at
+           TP=1). Keeps the survivor-scoped rearrange consistent across the
+           surviving EP ranks (DYN-3541).
+        3. ``eplb_redistribute_for_dead_peers`` -- deterministic local EPLB
            placement update + disk reload.
 
         Returns whatever the redistribute step returns (True if any expert
         was reassigned).
         """
         self.rebuild_dp_ft_gloo_for_survivors(dead_ep_ranks)
+        self.rebuild_ep_ft_gloo_for_survivors(dead_ep_ranks)
         return self.eplb_redistribute_for_dead_peers(dead_ep_ranks)
 
     def rebuild_dp_ft_gloo_for_survivors(self, dead_ep_ranks: list[int]) -> bool:
@@ -378,6 +383,68 @@ class Worker(WorkerBase):
             "FT NIXL EP: rebuilt DP FT-gloo survivor group %s (gen=%d) after "
             "dead EP peers %s.",
             sorted(survivors),
+            ft.generation,
+            sorted(dead),
+        )
+        return True
+
+    def rebuild_ep_ft_gloo_for_survivors(self, dead_ep_ranks: list[int]) -> bool:
+        """Rebuild the EP FT-gloo group to exclude dead peers (TP>1 only).
+
+        Companion to :meth:`rebuild_dp_ft_gloo_for_survivors`, but keyed on EP
+        rank so EPLB's survivor-scoped load all-reduce (``_ep_all_reduce`` Path
+        B) reduces over the surviving EP ranks with a well-formed rendezvous at
+        TP>1. The DP-keyed group collapses both TP ranks of a DP onto one
+        identity, so once >=2 DP ranks survive its rendezvous has duplicate
+        ranks and either hangs or mixes the TP ranks -> divergent placement maps
+        -> weight-shuffle deadlock (DYN-3541).
+
+        Survivor set = the EP ranks of the fully-surviving DPs (the same DP
+        survivor predicate as the DP rebuild, expanded to EP granularity). The
+        degraded DP's still-alive EP rank is excluded -- it dummy-steps and
+        contributes no real load -- matching the DP-side semantics.
+
+        No-op (returns False) when the EP holder isn't initialized (TP=1 /
+        non-NIXL-EP), this EP rank is not a survivor, or the set is unchanged.
+        """
+        from vllm.distributed import get_tensor_model_parallel_rank
+        from vllm.distributed.elastic_ep.ft_gloo import get_ep_ft_gloo
+
+        ft = get_ep_ft_gloo()
+        if ft is None:
+            return False
+
+        dp_size = self.parallel_config.data_parallel_size
+        tp_size = self.parallel_config.tensor_parallel_size
+        ep_size = dp_size * tp_size
+
+        dead: set[int] = set(dead_ep_ranks)
+        mask = self.query_nixl_ep_mask()
+        if mask is not None:
+            dead |= {i for i, v in enumerate(mask.tolist()[:ep_size]) if v != 0}
+
+        dp_survivors = [
+            d
+            for d in range(dp_size)
+            if not any((d * tp_size + t) in dead for t in range(tp_size))
+        ]
+        ep_survivors = frozenset(
+            d * tp_size + t for d in dp_survivors for t in range(tp_size)
+        )
+        my_ep_rank = (
+            self.parallel_config.data_parallel_rank * tp_size
+            + get_tensor_model_parallel_rank()
+        )
+        if my_ep_rank not in ep_survivors:
+            return False
+        if ft.current_survivors == ep_survivors:
+            return False
+
+        ft.rebuild_for_survivors(ep_survivors)
+        logger.info(
+            "FT NIXL EP: rebuilt EP FT-gloo survivor group %s (gen=%d) after "
+            "dead EP peers %s.",
+            sorted(ep_survivors),
             ft.generation,
             sorted(dead),
         )
@@ -1013,6 +1080,37 @@ class Worker(WorkerBase):
                     parallel_config.data_parallel_rank,
                     parallel_config.data_parallel_size,
                 )
+
+                # FT NIXL EP (TP>1): EPLB's survivor-scoped load all-reduce
+                # (_ep_all_reduce Path B) must reduce over the surviving EP
+                # ranks, not DP ranks. The DP-keyed holder above collapses both
+                # TP ranks of a DP onto one identity, so its survivor rendezvous
+                # breaks once >=2 DP ranks survive (DYN-3541). Build a second,
+                # EP-keyed holder where every process has a unique identity. At
+                # TP=1 DP == EP, so the DP holder already suffices (and a
+                # same-identity second group would collide on the rdzv key).
+                tp_size = parallel_config.tensor_parallel_size
+                if tp_size > 1:
+                    from vllm.distributed import get_tensor_model_parallel_rank
+                    from vllm.distributed.elastic_ep.ft_gloo import init_ep_ft_gloo
+
+                    ep_rank = (
+                        parallel_config.data_parallel_rank * tp_size
+                        + get_tensor_model_parallel_rank()
+                    )
+                    ep_size = parallel_config.data_parallel_size * tp_size
+                    init_ep_ft_gloo(
+                        store=coord_store,
+                        master_addr=parallel_config.data_parallel_master_ip,
+                        my_global_rank=ep_rank,
+                        total_world_size=ep_size,
+                    )
+                    logger.info(
+                        "FT NIXL EP: initialized EP FT-gloo holder "
+                        "(ep_rank=%d, ep_size=%d).",
+                        ep_rank,
+                        ep_size,
+                    )
 
             if self.use_v2_model_runner:
                 logger.info_once("Using V2 Model Runner")

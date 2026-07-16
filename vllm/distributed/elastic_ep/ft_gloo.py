@@ -365,3 +365,56 @@ def reset_dp_ft_gloo() -> None:
     if _DP_FT_GLOO is not None:
         _DP_FT_GLOO.destroy()
     _DP_FT_GLOO = None
+
+
+# --------------------------------------------------------------------------- #
+# EP-indexed survivor group (separate holder).
+#
+# The DP holder above is keyed on DP rank -- correct for the cross-DP wave-sync
+# (`_run_ar`), but at TP>1 both TP ranks of a DP share a DP rank, so the
+# survivor rendezvous collapses two processes onto one identity once >=2 DP
+# ranks survive (malformed group). EPLB's survivor-scoped load all-reduce needs
+# to sum over the surviving *EP* ranks, so it uses this second holder keyed on
+# EP rank (``dp_rank * tp_size + tp_rank``), where every process has a unique
+# identity. Only initialized at TP>1 (at TP=1 DP == EP, so the DP holder already
+# suffices and a second same-identity group would collide on the rdzv key).
+# See DYN-3541.
+# --------------------------------------------------------------------------- #
+
+_EP_FT_GLOO: FaultTolerantGlooGroup | None = None
+
+
+def get_ep_ft_gloo() -> FaultTolerantGlooGroup | None:
+    """Return the worker's EP FT-gloo group, or None if not initialized."""
+    return _EP_FT_GLOO
+
+
+def init_ep_ft_gloo(
+    store: Store,
+    master_addr: str,
+    my_global_rank: int,
+    total_world_size: int,
+) -> FaultTolerantGlooGroup:
+    """Initialize the process-local EP FT-gloo holder (idempotent)."""
+    global _EP_FT_GLOO
+    if _EP_FT_GLOO is not None:
+        logger.warning(
+            "init_ep_ft_gloo() called but an instance already exists; "
+            "returning existing."
+        )
+        return _EP_FT_GLOO
+    _EP_FT_GLOO = FaultTolerantGlooGroup(
+        store=store,
+        master_addr=master_addr,
+        my_global_rank=my_global_rank,
+        total_world_size=total_world_size,
+    )
+    return _EP_FT_GLOO
+
+
+def reset_ep_ft_gloo() -> None:
+    """Tear down and clear the process-local EP holder (used by tests)."""
+    global _EP_FT_GLOO
+    if _EP_FT_GLOO is not None:
+        _EP_FT_GLOO.destroy()
+    _EP_FT_GLOO = None
